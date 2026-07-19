@@ -175,6 +175,11 @@ namespace MidiToKeyApp
             else
             {
                 baseKey = ParseKey(keyName, isJis);
+                // 大文字のアルファベットの場合、Shiftキーが必要
+                if (keyName.Length == 1 && char.IsUpper(keyName[0]))
+                {
+                    shiftRequired = true;
+                }
             }
 
             if (baseKey != VirtualKeyCode.NONAME)
