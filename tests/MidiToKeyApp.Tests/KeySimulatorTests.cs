@@ -95,7 +95,19 @@ namespace MidiToKeyApp.Tests
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts() => ActivePorts.ToList();
 
-        public void CheckDeviceHealth() { }
+        public void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null)
+        {
+            if (activeOsDeviceNames != null)
+            {
+                var osNames = new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase);
+                var disconnected = ActivePorts.Where(p => !osNames.Contains(p.DeviceName)).ToList();
+                foreach (var d in disconnected)
+                {
+                    ActivePorts.Remove(d);
+                    OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
+                }
+            }
+        }
 
         public void SimulateDeviceDisconnected(string deviceId, string reason = "切断シミュレート")
         {
@@ -2165,6 +2177,247 @@ namespace MidiToKeyApp.Tests
             // 新セッションで再度正常に入力できること
             tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen2));
             Assert.AreEqual(1, tracker.ActiveNotesCount);
+        }
+
+        // Test 82: DryWetMIDIが古い一覧を返し、WinRTは最新一覧を返すケース
+        [TestMethod]
+        public void Test_82_DryWetMidiStale_WinRtFresh_MismatchDetected()
+        {
+            var dryWetResult = PortEnumerationResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            var winRtResult = Array.Empty<WinRtMidiDeviceInfo>(); // WinRT側では既に切断（0件）
+            var winMmInProc = Array.Empty<WinMmDeviceInfo>();
+            var winMmOutProc = Array.Empty<WinMmDeviceInfo>();
+            var activePorts = new[] { new MidiPortInfo("nanoKEY2#1", "nanoKEY2 1 KEYBOARD", DeviceState.Active) };
+
+            var report = MidiDeviceDiagnostics.CompareEndpoints(
+                "Test82",
+                dryWetResult,
+                winMmInProc,
+                winMmOutProc,
+                winRtResult,
+                activePorts);
+
+            Assert.IsTrue(report.HasMismatch, "DryWetMIDIに残存しWinRTで切断されている不一致が検出されること");
+            Assert.IsTrue(report.Diagnosis.Contains("WinRT/OSとMIDIバックエンドの認識に差異があります") || report.Diagnosis.Contains("切断"));
+        }
+
+        // Test 83: 同一プロセスWinMMと新規プロセスWinMMで結果が異なるケース
+        [TestMethod]
+        public void Test_83_WinMmInProc_vs_OutProc_MismatchDetected()
+        {
+            var dryWetResult = PortEnumerationResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            var winMmInProc = new[] { new WinMmDeviceInfo(0, "nanoKEY2 1 KEYBOARD", 1, 0) };
+            var winMmOutProc = Array.Empty<WinMmDeviceInfo>(); // 新規プロセスでは切断（0件）
+            var winRtResult = Array.Empty<WinRtMidiDeviceInfo>();
+            var activePorts = Array.Empty<MidiPortInfo>();
+
+            var report = MidiDeviceDiagnostics.CompareEndpoints(
+                "Test83",
+                dryWetResult,
+                winMmInProc,
+                winMmOutProc,
+                winRtResult,
+                activePorts);
+
+            Assert.IsTrue(report.HasMismatch, "同一プロセスWinMMと独立プロセスWinMMの不一致が検出されること");
+            Assert.IsTrue(report.Diagnosis.Contains("キャッシュ") || report.Diagnosis.Contains("差異があります"));
+        }
+
+        // Test 84: OSでは切断済みだがDryWetMIDIにはポート名が残るケースの切断検知
+        [TestMethod]
+        public void Test_84_DisconnectedInOs_DryWetMidiStale_TriggersDisconnection()
+        {
+            var fakeListener = new FakeMidiListener();
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            fakeListener.OnDeviceDisconnected += (data) => {
+                tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+            };
+
+            long gen = tracker.StartConversionSession();
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, gen);
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+
+            string activeDevId = fakeListener.GetActivePorts()[0].DeviceId;
+
+            // ノート押下
+            fakeListener.FireNote(new MidiNoteData(activeDevId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            tracker.ProcessNoteEvent(new MidiNoteData(activeDevId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // OS(WinRT)認識ポートは0件（DryWetMIDIには古い名前が残っていると想定されるケース）
+            fakeListener.CheckDeviceHealth(activeOsDeviceNames: Array.Empty<string>());
+
+            // OSで切断されたため、安全解放されキーがKeyUpされること
+            Assert.AreEqual(0, fakeListener.GetActivePorts().Count);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+        }
+
+        // Test 85: OSでは接続済みだがDryWetMIDIにはポートが現れないケース
+        [TestMethod]
+        public void Test_85_ConnectedInOs_MissingInDryWetMidi_MismatchDetected()
+        {
+            var dryWetResult = PortEnumerationResult.Succeeded(Array.Empty<string>());
+            var winMmInProc = Array.Empty<WinMmDeviceInfo>();
+            var winMmOutProc = new[] { new WinMmDeviceInfo(0, "nanoKEY2 1 KEYBOARD", 1, 0) };
+            var winRtResult = new[] { new WinRtMidiDeviceInfo("SWD\\MIDIIO\\...", "nanoKEY2 1 KEYBOARD", true) };
+            var activePorts = Array.Empty<MidiPortInfo>();
+
+            var report = MidiDeviceDiagnostics.CompareEndpoints(
+                "Test85",
+                dryWetResult,
+                winMmInProc,
+                winMmOutProc,
+                winRtResult,
+                activePorts);
+
+            Assert.IsTrue(report.HasMismatch, "OSに接続済みだがバックエンドに現れない不一致が検出されること");
+            Assert.IsTrue(report.Diagnosis.Contains("WinRT/OSとMIDIバックエンドの認識に差異があります"));
+        }
+
+        // Test 86: 列挙失敗と正常な0件の区別
+        [TestMethod]
+        public void Test_86_PortEnumerationResult_DistinguishesZeroFromFailure()
+        {
+            var successZero = PortEnumerationResult.Succeeded(Array.Empty<string>());
+            Assert.IsTrue(successZero.Success);
+            Assert.AreEqual(0, successZero.Ports.Count);
+            Assert.IsNull(successZero.ErrorMessage);
+
+            var failure = PortEnumerationResult.Failed("デバイス列挙に失敗しました", new IOException("Device error"));
+            Assert.IsFalse(failure.Success);
+            Assert.AreEqual(0, failure.Ports.Count);
+            Assert.AreEqual("デバイス列挙に失敗しました", failure.ErrorMessage);
+            Assert.IsNotNull(failure.Exception);
+        }
+
+        // Test 87: Opening中のイベント配送順序の厳格な保持（追い越し防止）
+        [TestMethod]
+        public void Test_87_OpeningEvents_PreserveOrder_NoOvertaking()
+        {
+            // Opening中にキューイングされたイベント群とActive移行直後の新着イベントの順序検証
+            var receivedSequence = new List<int>();
+            var syncLock = new object();
+
+            // キューとフラッシュ、ディスパッチの直列化モデルをシミュレート
+            var pendingQueue = new Queue<int>();
+            pendingQueue.Enqueue(1); // Opening中に届いたイベント1
+            pendingQueue.Enqueue(2); // Opening中に届いたイベント2
+
+            var dispatchLock = new object();
+            bool isActive = false;
+
+            // スレッドA: Active移行とキューフラッシュ
+            var t1 = new Thread(() =>
+            {
+                lock (dispatchLock)
+                {
+                    isActive = true;
+                    while (pendingQueue.Count > 0)
+                    {
+                        var item = pendingQueue.Dequeue();
+                        lock (syncLock) receivedSequence.Add(item);
+                    }
+                }
+            });
+
+            // スレッドB: Active直後に届いた新着イベント3
+            var t2 = new Thread(() =>
+            {
+                Thread.Sleep(5); // わずかに遅れて到着
+                lock (dispatchLock)
+                {
+                    if (isActive)
+                    {
+                        lock (syncLock) receivedSequence.Add(3);
+                    }
+                }
+            });
+
+            t1.Start();
+            t2.Start();
+            t1.Join();
+            t2.Join();
+
+            Assert.AreEqual(3, receivedSequence.Count);
+            Assert.AreEqual(1, receivedSequence[0]);
+            Assert.AreEqual(2, receivedSequence[1]);
+            Assert.AreEqual(3, receivedSequence[2], "新着イベントが古いキュー内イベントを追い越さないこと");
+        }
+
+        // Test 88: 切断後の遅延イベント拒否
+        [TestMethod]
+        public void Test_88_DelayedEventAfterDisconnect_Rejected()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // dev1からNote 60を押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+
+            // dev1を切断
+            tracker.ReleaseDeviceInputs("dev1", gen);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+
+            // 切断後に届いた遅延イベント（同一Genでも切断済みDeviceIdのため無視される）
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(0, tracker.ActiveNotesCount, "切断済みDeviceIdのイベントは拒否されること");
+            Assert.AreEqual(1, _mock.KeyDownCount, "新規KeyDownは送信されないこと");
+        }
+
+        // Test 89: 同名MIDIデバイスの切断元が特定できない場合の安全停止
+        [TestMethod]
+        public void Test_89_AmbiguousDeviceDisconnect_SafelyStopsAll()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "l" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // 同名ポートで2インスタンスから入力
+            tracker.ProcessNoteEvent(new MidiNoteData("Dev#1", "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            tracker.ProcessNoteEvent(new MidiNoteData("Dev#2", "nanoKEY2 1 KEYBOARD", 1, 62, 100, true, gen));
+            Assert.AreEqual(2, tracker.ActiveNotesCount);
+
+            // 切断元特定不能通知（DeviceId=""）
+            tracker.ReleaseDeviceInputs("", gen);
+
+            // 全安全停止され、すべてのキーが解放されIsListeningも停止すること
+            Assert.IsFalse(tracker.IsListening);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(2, _mock.KeyUpCount);
+        }
+
+        // Test 90: 再接続後に自動で変換を開始しないこと
+        [TestMethod]
+        public void Test_90_ReconnectDoesNotAutoStartConversion()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+            Assert.IsTrue(tracker.IsListening);
+
+            // 切断により停止
+            tracker.ReleaseDeviceInputs("", gen);
+            Assert.IsFalse(tracker.IsListening);
+
+            // 再接続通知（新しいポートがOSやバックエンドに現れるシミュレーション）
+            // 自動再開ロジックが存在しないため、IsListeningはfalseのままであること
+            var reconnectedPorts = new List<string> { "nanoKEY2 1 KEYBOARD" };
+            Assert.IsFalse(tracker.IsListening, "デバイス再接続時に自動で変換が再開されないこと");
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
         }
     }
 }

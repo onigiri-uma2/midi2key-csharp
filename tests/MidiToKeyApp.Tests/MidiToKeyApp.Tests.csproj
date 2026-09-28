@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -27,6 +28,8 @@
     <Compile Include="..\..\HotkeyManager.cs" Link="HotkeyManager.cs" />
     <Compile Include="..\..\HotkeyConfigDialog.cs" Link="HotkeyConfigDialog.cs" />
     <Compile Include="..\..\DiagnosticLogger.cs" Link="DiagnosticLogger.cs" />
+    <Compile Include="..\..\MidiDeviceDiagnostics.cs" Link="MidiDeviceDiagnostics.cs" />
+    <Compile Include="..\..\WinRtMidiWatcher.cs" Link="WinRtMidiWatcher.cs" />
   </ItemGroup>
 
 </Project>

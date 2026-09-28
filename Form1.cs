@@ -38,6 +38,8 @@ namespace MidiToKeyApp
         private InputTracker inputTracker = null!;
         private readonly HotkeyManager hotkeyManager = new();
         private System.Windows.Forms.Timer? deviceDebounceTimer;
+        private WinRtMidiWatcher? _winRtWatcher;
+        private Label lblPortSummary = null!;
         private volatile bool _isTransitioning = false;
 
         // キー送信エラーの通知集約用
@@ -51,6 +53,7 @@ namespace MidiToKeyApp
             InitializeComponentProgrammatically();
             LoadInitialSettings();
             SetupDependencies(output, listener);
+            InitWinRtWatcher();
         }
         
         private void SetupDependencies(IKeyboardOutput? output = null, IMidiListener? listener = null)
@@ -145,21 +148,72 @@ namespace MidiToKeyApp
             UpdateHotkeyUi();
         }
 
+        private void InitWinRtWatcher()
+        {
+            try
+            {
+                _winRtWatcher = new WinRtMidiWatcher();
+                _winRtWatcher.OnDeviceAdded += (device) => {
+                    DiagnosticLogger.Log($"[WinRT] Device Added: {device.Name} (Id={device.Id})");
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        try { BeginInvoke(new Action(() => TriggerDeviceDebounce("WinRT-Added"))); } catch { }
+                    }
+                };
+                _winRtWatcher.OnDeviceRemoved += (device) => {
+                    DiagnosticLogger.Log($"[WinRT] Device Removed: {device.Name} (Id={device.Id})");
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        try { BeginInvoke(new Action(() => TriggerDeviceDebounce("WinRT-Removed"))); } catch { }
+                    }
+                };
+                _winRtWatcher.OnEnumerationCompleted += () => {
+                    DiagnosticLogger.Log($"[WinRT] Initial enumeration completed. Devices count={_winRtWatcher.Devices.Count}");
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        try { BeginInvoke(new Action(() => UpdatePortSummaryUi())); } catch { }
+                    }
+                };
+                _winRtWatcher.Start();
+                DiagnosticLogger.Log("[WinRT] WinRtMidiWatcher started successfully.");
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Log($"[WinRT] Failed to start WinRtMidiWatcher: {ex.Message}");
+            }
+        }
+
+        private void TriggerDeviceDebounce(string triggerSource)
+        {
+            DiagnosticLogger.Log($"[Form1] TriggerDeviceDebounce called from {triggerSource}");
+            deviceDebounceTimer?.Stop();
+            deviceDebounceTimer?.Start();
+        }
+
+        private void UpdatePortSummaryUi()
+        {
+            if (lblPortSummary == null) return;
+            int osCount = _winRtWatcher?.Devices.Count ?? -1;
+            int backendCount = chkPorts?.Items.Count ?? 0;
+            string osText = osCount >= 0 ? $"{osCount}件" : "非対応/未取得";
+            lblPortSummary.Text = $"OS認識: {osText} | バックエンド: {backendCount}件";
+        }
+
         private void RefreshPorts(bool isInitialLoad = false)
         {
             if (chkPorts == null) return;
             var checkedPorts = isInitialLoad ? settings.SelectedPorts : GetSelectedPorts();
-            List<string> availablePorts;
-            try
+            var enumResult = MidiListener.GetPortNames();
+
+            if (!enumResult.Success)
             {
-                availablePorts = MidiListener.GetPortNames().ToList();
-            }
-            catch (Exception ex)
-            {
-                DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {ex.Message}");
+                DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
+                chkPorts.Items.Clear();
+                UpdatePortSummaryUi();
                 return;
             }
-            
+
+            var availablePorts = enumResult.Ports;
             chkPorts.Items.Clear();
             foreach (var port in availablePorts)
             {
@@ -169,6 +223,7 @@ namespace MidiToKeyApp
                     chkPorts.SetItemChecked(index, true);
                 }
             }
+            UpdatePortSummaryUi();
         }
 
         /// <summary>
@@ -187,23 +242,23 @@ namespace MidiToKeyApp
             }
 
             var previousSelected = GetSelectedPorts();
-            List<string> availablePorts;
+            var enumResult = MidiListener.GetPortNames();
 
-            try
+            if (!enumResult.Success)
             {
-                availablePorts = MidiListener.GetPortNames().ToList();
-                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration result: Count={availablePorts.Count}, Ports=[{string.Join(", ", availablePorts)}]");
-            }
-            catch (Exception ex)
-            {
-                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration failed: {ex.Message}");
+                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration failed: {enumResult.ErrorMessage}");
+                lblStatus.Text = "ステータス: 停止中 (ポート一覧更新失敗)";
+                lblStatus.ForeColor = Color.Red;
                 MessageBox.Show(
-                    $"MIDIポート一覧の再読み込みに失敗しました。\n\n詳細: {ex.Message}\n\nMIDIポートの接続状態を更新できませんでした。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                    $"MIDIポート一覧の再読み込みに失敗しました。\n\n詳細: {enumResult.ErrorMessage}\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
                     "ポート再読み込みエラー",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
                 return;
             }
+
+            var availablePorts = enumResult.Ports;
+            DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration result: Count={availablePorts.Count}, Ports=[{string.Join(", ", availablePorts)}]");
 
             chkPorts.Items.Clear();
             int restoredCount = 0;
@@ -216,17 +271,42 @@ namespace MidiToKeyApp
                     restoredCount++;
                 }
             }
+            UpdatePortSummaryUi();
 
+            // 5系統比較診断をバックグラウンド実行してログ記録
+            _ = System.Threading.Tasks.Task.Run(async () => {
+                try
+                {
+                    var activePorts = midiListener.GetActivePorts();
+                    await MidiDeviceDiagnostics.RunComparisonAsync("ManualReload", activePorts);
+                }
+                catch { }
+            });
+
+            int osCount = _winRtWatcher?.Devices.Count ?? 0;
             if (availablePorts.Count == 0)
             {
-                DiagnosticLogger.Log("[Form1] ReloadPortsManually: No MIDI ports detected.");
-                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-                MessageBox.Show(
-                    "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                    "MIDIポートなし",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                DiagnosticLogger.Log($"[Form1] ReloadPortsManually: No MIDI ports detected in backend. OS count={osCount}");
+                if (osCount > 0)
+                {
+                    lblStatus.Text = $"ステータス: 停止中 (OS認識中: {osCount}件 / MIDIバックエンド未反映)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    MessageBox.Show(
+                        $"OS上では {osCount} 件のMIDIデバイスが認識されていますが、MIDIバックエンド(WinMM)に反映されていません。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                        "MIDIポート更新未反映",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                else
+                {
+                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    MessageBox.Show(
+                        "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                        "MIDIポートなし",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
             }
             else
             {
@@ -305,12 +385,15 @@ namespace MidiToKeyApp
             grpLayout.Controls.Add(rbJIS);
             this.Controls.Add(grpLayout);
 
-            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 115, Top = 10, Left = 10 };
-            chkPorts = new CheckedListBox { Top = 20, Left = 10, Width = 255, Height = 65, BorderStyle = BorderStyle.None, CheckOnClick = true };
+            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 120, Top = 10, Left = 10 };
+            chkPorts = new CheckedListBox { Top = 18, Left = 10, Width = 255, Height = 58, BorderStyle = BorderStyle.None, CheckOnClick = true };
             chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
             grpPorts.Controls.Add(chkPorts);
 
-            var lblPortWarn = new Label { Text = "※機器の抜き差し時は自動検知または再起動してください", ForeColor = Color.DarkSlateGray, Top = 88, Left = 5, AutoSize = true };
+            lblPortSummary = new Label { Text = "OS認識: 取得中... | バックエンド: 0件", ForeColor = Color.Navy, Top = 78, Left = 10, AutoSize = true, Font = new Font(this.Font.FontFamily, 8f) };
+            grpPorts.Controls.Add(lblPortSummary);
+
+            var lblPortWarn = new Label { Text = "※機器の抜き差し時は自動検知または再起動してください", ForeColor = Color.DarkSlateGray, Top = 98, Left = 5, AutoSize = true, Font = new Font(this.Font.FontFamily, 7.5f) };
             grpPorts.Controls.Add(lblPortWarn);
             this.Controls.Add(grpPorts);
 
@@ -690,8 +773,27 @@ namespace MidiToKeyApp
             deviceDebounceTimer.Tick += (s, e) => {
                 deviceDebounceTimer.Stop();
                 DiagnosticLogger.Log($"[DebounceTimer] Tick fired. Invoking CheckDeviceHealth(). Gen={inputTracker.CurrentSessionId}");
-                midiListener.CheckDeviceHealth();
+                
+                // WinRTが認識している最新のデバイス名一覧を取得
+                List<string>? osDeviceNames = null;
+                if (_winRtWatcher != null && _winRtWatcher.IsWatcherRunning)
+                {
+                    osDeviceNames = _winRtWatcher.Devices.Select(d => d.Name).ToList();
+                }
+
+                // MIDIリスナーの健全性チェック（DryWetMIDIに残存していてもOS(WinRT)に無ければ切断判定）
+                midiListener.CheckDeviceHealth(osDeviceNames);
                 RefreshPorts(false);
+
+                // バックグラウンドで5系統比較診断を実行してログ記録
+                _ = System.Threading.Tasks.Task.Run(async () => {
+                    try
+                    {
+                        var activePorts = midiListener.GetActivePorts();
+                        await MidiDeviceDiagnostics.RunComparisonAsync("DeviceChangeDebounce", activePorts);
+                    }
+                    catch { }
+                });
             };
         }
 
@@ -873,7 +975,7 @@ namespace MidiToKeyApp
                     // 一部ポート失敗時の正常ポート継続
                     string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
                     string openedNames = string.Join(", ", startResult.OpenedPorts.Select(o => o.DeviceName));
-                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中, 失敗: {failedNames})";
+                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート 監視開始成功, 失敗: {failedNames})";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     MessageBox.Show(
                         $"一部のポートの開始に失敗しました:\n・{failedNames}\n\n次の正常なポートで監視を開始しました:\n・{openedNames}",
@@ -883,7 +985,7 @@ namespace MidiToKeyApp
                 }
                 else
                 {
-                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中)";
+                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート 監視開始成功)";
                     lblStatus.ForeColor = Color.Green;
                 }
             }
@@ -1037,9 +1139,7 @@ namespace MidiToKeyApp
                     wParam == DBT_DEVICEREMOVECOMPLETE)
                 {
                     DiagnosticLogger.Log($"[WndProc] Matched device change notification (0x{wParam:X4}). Scheduling CheckDeviceHealth debounce.");
-                    // デバイス変更通知をデバウンスして処理
-                    deviceDebounceTimer?.Stop();
-                    deviceDebounceTimer?.Start();
+                    TriggerDeviceDebounce($"WM_DEVICECHANGE (0x{wParam:X4})");
                 }
                 else
                 {
@@ -1160,6 +1260,7 @@ namespace MidiToKeyApp
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             hotkeyManager.Unregister();
+            _winRtWatcher?.Dispose();
             deviceDebounceTimer?.Stop();
             deviceDebounceTimer?.Dispose();
             StopConversion();

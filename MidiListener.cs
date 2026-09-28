@@ -8,6 +8,24 @@ using Melanchall.DryWetMidi.Core;
 namespace MidiToKeyApp
 {
     /// <summary>
+    /// MIDIポート列挙の結果。
+    /// 正常な0件と列挙失敗（例外やアクセス拒否）を明確に区別します。
+    /// </summary>
+    public readonly record struct PortEnumerationResult(
+        bool Success,
+        IReadOnlyList<string> Ports,
+        string? ErrorMessage = null,
+        Exception? Exception = null
+    )
+    {
+        public static PortEnumerationResult Succeeded(IReadOnlyList<string> ports) =>
+            new(true, ports);
+
+        public static PortEnumerationResult Failed(string error, Exception? ex = null) =>
+            new(false, Array.Empty<string>(), error, ex);
+    }
+
+    /// <summary>
     /// MIDIデバイスの接続状態。
     /// </summary>
     public enum DeviceState
@@ -76,7 +94,7 @@ namespace MidiToKeyApp
         MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null);
         void Stop();
         IReadOnlyList<MidiPortInfo> GetActivePorts();
-        void CheckDeviceHealth();
+        void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null);
         void SimulateDeviceDisconnected(string deviceId, string reason = "テストシミュレート");
     }
 
@@ -96,6 +114,7 @@ namespace MidiToKeyApp
             public required long Generation { get; init; }
             public DeviceState State { get; set; } = DeviceState.Opening;
             public Queue<QueuedMidiEvent> PendingEvents { get; } = new(256);
+            public object EventDispatchLock { get; } = new();
         }
 
         private readonly List<OpenDeviceInfo> _devices = new();
@@ -128,7 +147,11 @@ namespace MidiToKeyApp
         public event Action<int, bool>? OnNoteChange;
         public event Action<int, int>? OnControlChange;
 
-        public static IEnumerable<string> GetPortNames()
+        /// <summary>
+        /// 利用可能なMIDI入力ポートを列挙します。
+        /// 正常な0件と列挙失敗を明瞭に区別した結果型を返します。
+        /// </summary>
+        public static PortEnumerationResult GetPortNames()
         {
             var names = new List<string>();
             try
@@ -145,12 +168,13 @@ namespace MidiToKeyApp
                         device.Dispose();
                     }
                 }
+                return PortEnumerationResult.Succeeded(names);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error enumerating MIDI ports: {ex.Message}");
+                DiagnosticLogger.Log("GetPortNames", $"MIDIポート列挙失敗: {ex.Message}");
+                return PortEnumerationResult.Failed($"MIDIポート列挙例外: {ex.Message}", ex);
             }
-            return names;
         }
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts()
@@ -223,7 +247,6 @@ namespace MidiToKeyApp
                         State = DeviceState.Opening
                     };
 
-                    bool success = false;
                     List<QueuedMidiEvent> flushedEvents = new();
                     try
                     {
@@ -239,28 +262,50 @@ namespace MidiToKeyApp
                         // 3. 監視開始
                         device.StartEventsListening();
 
-                        // 4. 成功時にActiveへ遷移し、Opening中に溜まったイベントを取り出し
-                        lock (_lock)
+                        // 4. 成功時にActiveへ遷移し、Opening中に溜まったイベントを EventDispatchLock のもとで順次フラッシュ
+                        lock (info.EventDispatchLock)
                         {
-                            info.State = DeviceState.Active;
-                            while (info.PendingEvents.Count > 0)
+                            lock (_lock)
                             {
-                                flushedEvents.Add(info.PendingEvents.Dequeue());
+                                info.State = DeviceState.Active;
+                                while (info.PendingEvents.Count > 0)
+                                {
+                                    flushedEvents.Add(info.PendingEvents.Dequeue());
+                                }
+                            }
+
+                            // EventDispatchLock 内でフラッシュイベントをディスパッチすることで、
+                            // Active直後に届いた新着イベントが古いキューイベントを追い越すのを防止
+                            foreach (var qe in flushedEvents)
+                            {
+                                if (info.State != DeviceState.Active) break;
+                                if (qe.Note.HasValue)
+                                {
+                                    OnNoteReceived?.Invoke(qe.Note.Value);
+                                    OnNoteChange?.Invoke(qe.Note.Value.NoteNumber, qe.Note.Value.IsDown);
+                                }
+                                else if (qe.Control.HasValue)
+                                {
+                                    OnControlReceived?.Invoke(qe.Control.Value);
+                                    OnControlChange?.Invoke(qe.Control.Value.ControlNumber, qe.Control.Value.ControlValue);
+                                }
                             }
                         }
 
                         openedPorts.Add(new MidiPortInfo(deviceId, device.Name, DeviceState.Active));
-                        success = true;
                     }
                     catch (Exception ex)
                     {
                         DiagnosticLogger.Log("Start", $"ポート {targetPortName} 開始失敗: {ex.Message}");
 
                         // 失敗時のロールバック
-                        lock (_lock)
+                        lock (info.EventDispatchLock)
                         {
-                            _devices.Remove(info);
-                            info.PendingEvents.Clear();
+                            lock (_lock)
+                            {
+                                _devices.Remove(info);
+                                info.PendingEvents.Clear();
+                            }
                         }
 
                         try
@@ -276,24 +321,6 @@ namespace MidiToKeyApp
                         catch { }
 
                         failedPorts.Add(new MidiPortError(targetPortName, ex.Message, ex));
-                    }
-
-                    if (success)
-                    {
-                        // Opening中に届いたイベントを受信順にディスパッチ（ロック外で安全に発火）
-                        foreach (var qe in flushedEvents)
-                        {
-                            if (qe.Note.HasValue)
-                            {
-                                OnNoteReceived?.Invoke(qe.Note.Value);
-                                OnNoteChange?.Invoke(qe.Note.Value.NoteNumber, qe.Note.Value.IsDown);
-                            }
-                            else if (qe.Control.HasValue)
-                            {
-                                OnControlReceived?.Invoke(qe.Control.Value);
-                                OnControlChange?.Invoke(qe.Control.Value.ControlNumber, qe.Control.Value.ControlValue);
-                            }
-                        }
                     }
                 }
                 else
@@ -328,8 +355,11 @@ namespace MidiToKeyApp
                 devicesToStop = new List<OpenDeviceInfo>(_devices);
                 foreach (var d in devicesToStop)
                 {
-                    d.State = DeviceState.Closing;
-                    d.PendingEvents.Clear();
+                    lock (d.EventDispatchLock)
+                    {
+                        d.State = DeviceState.Closing;
+                        d.PendingEvents.Clear();
+                    }
                 }
                 _devices.Clear();
             }
@@ -344,18 +374,34 @@ namespace MidiToKeyApp
                 catch { }
                 finally
                 {
-                    info.State = DeviceState.Closed;
+                    lock (info.EventDispatchLock)
+                    {
+                        info.State = DeviceState.Closed;
+                    }
                 }
             }
         }
 
         /// <summary>
         /// デバイスの接続状態を再確認し、切断されたデバイスがあれば検出して解放・通知します。
-        /// WindowsのWM_DEVICECHANGE等から呼び出されます。
+        /// WindowsのWM_DEVICECHANGEやWinRTデバイス監視から呼び出されます。
         /// </summary>
-        public void CheckDeviceHealth()
+        /// <param name="activeOsDeviceNames">OS (WinRT等) が認識している最新のポート名一覧。指定時はDryWetMIDIのキャッシュを越えて判定します。</param>
+        public void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null)
         {
-            DiagnosticLogger.Log("CheckDeviceHealth", $"実行開始: Gen={CurrentGeneration}, 監視デバイス数={_devices.Count}");
+            int monitoringCount;
+            lock (_lock)
+            {
+                monitoringCount = _devices.Count(d => d.State == DeviceState.Active);
+            }
+
+            DiagnosticLogger.Log("CheckDeviceHealth", $"実行開始: Gen={CurrentGeneration}, 監視デバイス数={monitoringCount}");
+
+            if (monitoringCount == 0)
+            {
+                DiagnosticLogger.Log("CheckDeviceHealth", "監視中のMIDIデバイスはありません。");
+                return;
+            }
 
             List<string> currentOnlineNames = new();
             try
@@ -381,7 +427,11 @@ namespace MidiToKeyApp
                 return;
             }
 
-            DiagnosticLogger.Log("CheckDeviceHealth", $"再列挙結果: [{string.Join(", ", currentOnlineNames)}]");
+            HashSet<string>? osNamesSet = activeOsDeviceNames != null
+                ? new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            DiagnosticLogger.Log("CheckDeviceHealth", $"再列挙結果: DryWetMIDI=[{string.Join(", ", currentOnlineNames)}], OS(WinRT)=[{ (osNamesSet != null ? string.Join(", ", osNamesSet) : "未指定") }]");
 
             List<OpenDeviceInfo> disconnectedDevices = new();
             bool hasAmbiguousDisconnection = false;
@@ -401,7 +451,23 @@ namespace MidiToKeyApp
                     int activeCount = group.Count();
                     int onlineCount = currentOnlineNames.Count(n => string.Equals(n, portName, StringComparison.OrdinalIgnoreCase));
 
-                    if (onlineCount < activeCount)
+                    // OS(WinRT)認識リストが提供されている場合、OS側で消えていればDryWetMIDIに名前が残っていても切断と判定
+                    bool missingInOs = osNamesSet != null && !osNamesSet.Contains(portName);
+
+                    if (missingInOs)
+                    {
+                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' はDryWetMIDIに残存していますが、OS(WinRT)からは消失しています。切断として処理します。");
+                        foreach (var devInfo in group)
+                        {
+                            lock (devInfo.EventDispatchLock)
+                            {
+                                devInfo.State = DeviceState.Closing;
+                            }
+                            _devices.Remove(devInfo);
+                            disconnectedDevices.Add(devInfo);
+                        }
+                    }
+                    else if (onlineCount < activeCount)
                     {
                         int lostCount = activeCount - onlineCount;
                         DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' が減少検知: Active={activeCount}, Online={onlineCount}, 減少={lostCount}");
@@ -411,7 +477,10 @@ namespace MidiToKeyApp
                             // その名前のデバイスが全滅した場合、所属する全インスタンスが切断されたと特定可能
                             foreach (var devInfo in group)
                             {
-                                devInfo.State = DeviceState.Closing;
+                                lock (devInfo.EventDispatchLock)
+                                {
+                                    devInfo.State = DeviceState.Closing;
+                                }
                                 _devices.Remove(devInfo);
                                 disconnectedDevices.Add(devInfo);
                             }
@@ -426,7 +495,10 @@ namespace MidiToKeyApp
                             // 安全側として該当グループのActiveデバイスをすべてClosingにする
                             foreach (var devInfo in group)
                             {
-                                devInfo.State = DeviceState.Closing;
+                                lock (devInfo.EventDispatchLock)
+                                {
+                                    devInfo.State = DeviceState.Closing;
+                                }
                                 _devices.Remove(devInfo);
                                 disconnectedDevices.Add(devInfo);
                             }
@@ -446,7 +518,10 @@ namespace MidiToKeyApp
                 catch { }
                 finally
                 {
-                    info.State = DeviceState.Closed;
+                    lock (info.EventDispatchLock)
+                    {
+                        info.State = DeviceState.Closed;
+                    }
                 }
             }
 
@@ -465,7 +540,7 @@ namespace MidiToKeyApp
                 }
             }
 
-            if (disconnectedDevices.Count == 0)
+            if (disconnectedDevices.Count == 0 && monitoringCount > 0)
             {
                 DiagnosticLogger.Log("CheckDeviceHealth", "監視対象デバイスはすべて再列挙一覧に存在します（※実機で取り外されている場合はドライバ側のキャッシュの可能性があります）");
             }
@@ -487,7 +562,10 @@ namespace MidiToKeyApp
 
                 foreach (var t in targets)
                 {
-                    t.State = DeviceState.Closing;
+                    lock (t.EventDispatchLock)
+                    {
+                        t.State = DeviceState.Closing;
+                    }
                     _devices.Remove(t);
                     disconnectedDevices.Add(t);
                 }
@@ -503,7 +581,10 @@ namespace MidiToKeyApp
                 catch { }
                 finally
                 {
-                    info.State = DeviceState.Closed;
+                    lock (info.EventDispatchLock)
+                    {
+                        info.State = DeviceState.Closed;
+                    }
                 }
 
                 OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(info.DeviceId, info.DeviceName, info.Generation, reason));
@@ -518,90 +599,82 @@ namespace MidiToKeyApp
 
         private void OnEventReceived(object? sender, MidiEventReceivedEventArgs e)
         {
-            string deviceId = "unknown";
-            string deviceName = "unknown";
-            long generation = -1;
-            DeviceState state = DeviceState.Closed;
             OpenDeviceInfo? targetInfo = null;
 
             lock (_lock)
             {
                 targetInfo = _devices.Find(d => ReferenceEquals(d.Device, sender));
-                if (targetInfo != null)
-                {
-                    deviceId = targetInfo.DeviceId;
-                    deviceName = targetInfo.DeviceName;
-                    generation = targetInfo.Generation;
-                    state = targetInfo.State;
-                }
             }
 
-            // 登録されていないデバイスや旧Generationのイベントは破棄
-            if (generation == -1 || targetInfo == null) return;
+            if (targetInfo == null) return;
 
-            // Closing / Closed 状態のイベントは破棄
-            if (state == DeviceState.Closing || state == DeviceState.Closed) return;
-
-            var midiEvent = e.Event;
-
-            if (midiEvent is NoteOnEvent noteOn)
+            // EventDispatchLock により、Opening -> Active移行時のキューフラッシュと
+            // 新着イベントの処理を直列化し、新着イベントの追い越しを防止
+            lock (targetInfo.EventDispatchLock)
             {
-                bool isDown = noteOn.Velocity > 0;
-                var noteData = new MidiNoteData(deviceId, deviceName, noteOn.Channel, noteOn.NoteNumber, noteOn.Velocity, isDown, generation);
+                string deviceId = targetInfo.DeviceId;
+                string deviceName = targetInfo.DeviceName;
+                long generation = targetInfo.Generation;
+                DeviceState state = targetInfo.State;
 
-                if (state == DeviceState.Opening)
+                // 登録されていないデバイスや旧Generationのイベントは破棄
+                if (generation != Interlocked.Read(ref _currentGeneration)) return;
+
+                // Closing / Closed 状態のイベントは破棄
+                if (state == DeviceState.Closing || state == DeviceState.Closed) return;
+
+                var midiEvent = e.Event;
+
+                if (midiEvent is NoteOnEvent noteOn)
                 {
-                    // Opening中はキューイング
-                    lock (_lock)
+                    bool isDown = noteOn.Velocity > 0;
+                    var noteData = new MidiNoteData(deviceId, deviceName, noteOn.Channel, noteOn.NoteNumber, noteOn.Velocity, isDown, generation);
+
+                    if (state == DeviceState.Opening)
+                    {
+                        // Opening中はキューイング
+                        if (targetInfo.PendingEvents.Count < 256)
+                        {
+                            targetInfo.PendingEvents.Enqueue(new QueuedMidiEvent(noteData, null));
+                        }
+                        return;
+                    }
+
+                    OnNoteReceived?.Invoke(noteData);
+                    OnNoteChange?.Invoke(noteOn.NoteNumber, isDown);
+                }
+                else if (midiEvent is NoteOffEvent noteOff)
+                {
+                    var noteData = new MidiNoteData(deviceId, deviceName, noteOff.Channel, noteOff.NoteNumber, noteOff.Velocity, false, generation);
+
+                    if (state == DeviceState.Opening)
                     {
                         if (targetInfo.PendingEvents.Count < 256)
                         {
                             targetInfo.PendingEvents.Enqueue(new QueuedMidiEvent(noteData, null));
                         }
+                        return;
                     }
-                    return;
+
+                    OnNoteReceived?.Invoke(noteData);
+                    OnNoteChange?.Invoke(noteOff.NoteNumber, false);
                 }
-                
-                OnNoteReceived?.Invoke(noteData);
-                OnNoteChange?.Invoke(noteOn.NoteNumber, isDown);
-            }
-            else if (midiEvent is NoteOffEvent noteOff)
-            {
-                var noteData = new MidiNoteData(deviceId, deviceName, noteOff.Channel, noteOff.NoteNumber, noteOff.Velocity, false, generation);
-
-                if (state == DeviceState.Opening)
+                else if (midiEvent is ControlChangeEvent controlChange)
                 {
-                    lock (_lock)
-                    {
-                        if (targetInfo.PendingEvents.Count < 256)
-                        {
-                            targetInfo.PendingEvents.Enqueue(new QueuedMidiEvent(noteData, null));
-                        }
-                    }
-                    return;
-                }
+                    var controlData = new MidiControlData(deviceId, deviceName, controlChange.Channel, controlChange.ControlNumber, controlChange.ControlValue, generation);
 
-                OnNoteReceived?.Invoke(noteData);
-                OnNoteChange?.Invoke(noteOff.NoteNumber, false);
-            }
-            else if (midiEvent is ControlChangeEvent controlChange)
-            {
-                var controlData = new MidiControlData(deviceId, deviceName, controlChange.Channel, controlChange.ControlNumber, controlChange.ControlValue, generation);
-
-                if (state == DeviceState.Opening)
-                {
-                    lock (_lock)
+                    if (state == DeviceState.Opening)
                     {
                         if (targetInfo.PendingEvents.Count < 256)
                         {
                             targetInfo.PendingEvents.Enqueue(new QueuedMidiEvent(null, controlData));
                         }
+                        return;
                     }
-                    return;
-                }
 
-                OnControlReceived?.Invoke(controlData);
-                OnControlChange?.Invoke(controlChange.ControlNumber, controlChange.ControlValue);
+                    OnControlReceived?.Invoke(controlData);
+                    OnControlChange?.Invoke(controlChange.ControlNumber, controlChange.ControlValue);
+                }
             }
         }
 
