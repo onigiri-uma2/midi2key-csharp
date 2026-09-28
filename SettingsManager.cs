@@ -36,18 +36,26 @@ namespace MidiToKeyApp
         /// </summary>
         /// <exception cref="JsonException">JSON形式が不正な場合</exception>
         /// <exception cref="InvalidDataException">データ項目や値が不正な場合</exception>
+        /// <summary>
+        /// 初回起動時や設定復旧用のデフォルト設定（Sky用15キー標準マッピング）を生成します。
+        /// </summary>
+        public static AppSettings GetDefaultSettings()
+        {
+            var defaultSettings = new AppSettings();
+            defaultSettings.Mapping = new Dictionary<string, string>
+            {
+                { "48", "y" }, { "50", "u" }, { "52", "i" }, { "53", "o" }, { "55", "p" },
+                { "57", "h" }, { "59", "j" }, { "60", "k" }, { "62", "l" }, { "64", ";" },
+                { "65", "n" }, { "67", "m" }, { "69", "," }, { "71", "." }, { "72", "/" }
+            };
+            return defaultSettings;
+        }
+
         public static AppSettings Load(string path)
         {
             if (!File.Exists(path))
             {
-                var defaultSettings = new AppSettings();
-                defaultSettings.Mapping = new Dictionary<string, string>
-                {
-                    { "48", "y" }, { "50", "u" }, { "52", "i" }, { "53", "o" }, { "55", "p" },
-                    { "57", "h" }, { "59", "j" }, { "60", "k" }, { "62", "l" }, { "64", ";" },
-                    { "65", "n" }, { "67", "m" }, { "69", "," }, { "71", "." }, { "72", "/" }
-                };
-                return defaultSettings;
+                return GetDefaultSettings();
             }
 
             string json = File.ReadAllText(path);

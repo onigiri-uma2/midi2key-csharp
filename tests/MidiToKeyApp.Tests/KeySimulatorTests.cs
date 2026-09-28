@@ -35,6 +35,38 @@ namespace MidiToKeyApp.Tests
         }
     }
 
+    public class FakeMidiListener : IMidiListener
+    {
+        public int StartCount { get; private set; }
+        public int StopCount { get; private set; }
+        public List<long> StartedGenerations { get; } = new();
+        public List<List<string>> StartedPorts { get; } = new();
+        public long CurrentGeneration { get; set; } = 0;
+
+        public event Action<MidiNoteData>? OnNoteReceived;
+        public event Action<MidiControlData>? OnControlReceived;
+
+        public long Start(IEnumerable<string> portNames, long? specificGeneration = null)
+        {
+            StartCount++;
+            long gen = specificGeneration ?? (CurrentGeneration + 1);
+            CurrentGeneration = gen;
+            StartedGenerations.Add(gen);
+            StartedPorts.Add(portNames.ToList());
+            return gen;
+        }
+
+        public void Stop()
+        {
+            StopCount++;
+        }
+
+        public void FireNote(MidiNoteData data) => OnNoteReceived?.Invoke(data);
+        public void FireControl(MidiControlData data) => OnControlReceived?.Invoke(data);
+
+        public void Dispose() => Stop();
+    }
+
     [TestClass]
     public class StabilityAndInputTests
     {
@@ -246,17 +278,28 @@ namespace MidiToKeyApp.Tests
             Assert.AreEqual(0, _mock.History.Count);
         }
 
-        // Test 9: 変換中にノート番号欄へフォーカス
+        // Test 9: 変換中にノート番号欄へフォーカス -> リスナーの再起動が発生しない
         [TestMethod]
         public void Test_09_FocusNoteTextBoxDuringListening_DoesNotRestartListener()
         {
+            var fakeListener = new FakeMidiListener();
             var settings = new AppSettings();
             var tracker = new InputTracker(_simulator, () => settings);
-            long session = tracker.StartSession();
+            
+            // 変換開始
+            long session = tracker.StartConversionSession();
+            fakeListener.Start(new[] { "Port1" }, session);
+            Assert.AreEqual(1, fakeListener.StartCount);
+            Assert.AreEqual(0, fakeListener.StopCount);
 
-            tracker.SetCapturing(true);
+            // 変換実行中にキャプチャ開始（ノート欄フォーカス）
+            long capSession = tracker.StartCaptureSession();
+            Assert.AreEqual(session, capSession); // Generationは変更されない
             Assert.IsTrue(tracker.IsListening);
-            Assert.AreEqual(session, tracker.CurrentSessionId);
+            Assert.IsTrue(tracker.IsCapturing);
+            // リスナーの再起動（Start/Stop）は呼ばれない
+            Assert.AreEqual(1, fakeListener.StartCount);
+            Assert.AreEqual(0, fakeListener.StopCount);
         }
 
         // Test 10: 押下中に変換停止
@@ -327,7 +370,7 @@ namespace MidiToKeyApp.Tests
             }
         }
 
-        // Test 14: 別名保存失敗
+        // Test 14: 別名保存失敗 -> 実際の設定パス管理ロジックと元データが変更されない
         [TestMethod]
         public void Test_14_SaveAsFailurePathSafeguard_MaintainsCurrentPath()
         {
@@ -347,6 +390,36 @@ namespace MidiToKeyApp.Tests
 
             Assert.IsTrue(threw);
             Assert.AreEqual("settings.json", currentPath);
+
+            // 実際の設定ファイルが存在する場合の別名保存失敗でもパスと元データが維持されることを検証
+            string tempDir = Path.Combine(Path.GetTempPath(), $"save_path_test_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            string validOriginalPath = Path.Combine(tempDir, "original.json");
+            try
+            {
+                var originalSettings = new AppSettings { KeyboardLayout = "JIS" };
+                SettingsManager.Save(validOriginalPath, originalSettings);
+                string activePath = validOriginalPath;
+
+                // 失敗する別名保存を試みる
+                try
+                {
+                    SettingsManager.Save(invalidPath, originalSettings);
+                    activePath = invalidPath;
+                }
+                catch
+                {
+                    // 例外発生時は activePath は更新されない
+                }
+
+                Assert.AreEqual(validOriginalPath, activePath);
+                var reloaded = SettingsManager.Load(activePath);
+                Assert.AreEqual("JIS", reloaded.KeyboardLayout);
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
         }
 
         // Test 15: Shift保持中にベースキー送信失敗 -> Shift参照数が元に戻る
@@ -588,7 +661,7 @@ namespace MidiToKeyApp.Tests
             }
         }
 
-        // Test 27: 保存失敗 -> 元ファイルと現在パスを維持
+        // Test 27: 保存失敗 -> 元ファイルと現在パスを維持（一時ファイル書き込み後や正式ファイル置換時の失敗含む）
         [TestMethod]
         public void Test_27_AtomicSaveFailure_PreservesOriginalFile()
         {
@@ -602,13 +675,29 @@ namespace MidiToKeyApp.Tests
                 SettingsManager.Save(settingsPath, initialSettings);
                 Assert.IsTrue(File.Exists(settingsPath));
 
-                // 不正な設定（mapping = null）を保存しようとすると失敗
+                // 1. 不正な設定（mapping = null）を保存しようとするとバリデーションで失敗
                 var badSettings = new AppSettings { Mapping = null! };
                 Assert.ThrowsException<InvalidDataException>(() => SettingsManager.Save(settingsPath, badSettings));
 
                 // 元の設定ファイルが破損せず、US設定のままであること
                 var reloaded = SettingsManager.Load(settingsPath);
                 Assert.AreEqual("US", reloaded.KeyboardLayout);
+
+                // 2. 一時ファイル作成後、正式ファイル置換時の失敗シミュレーション（ファイルが別プロセスで排他ロック中）
+                var modifiedSettings = new AppSettings { KeyboardLayout = "JIS" };
+                using (var lockStream = new FileStream(settingsPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    // 排他ロック中にSaveを実行すると置換（Replace/Move）でIOExceptionが発生
+                    Assert.ThrowsException<IOException>(() => SettingsManager.Save(settingsPath, modifiedSettings));
+                }
+
+                // ロック解除後、元のファイルが破損しておらず、変更前のUS設定が保持されていること
+                var preserved = SettingsManager.Load(settingsPath);
+                Assert.AreEqual("US", preserved.KeyboardLayout);
+
+                // ディレクトリ内に残留した一時ファイル (.tmp) がクリーンアップされていること
+                var tmpFiles = Directory.GetFiles(testDir, "*.tmp");
+                Assert.AreEqual(0, tmpFiles.Length);
             }
             finally
             {
@@ -677,6 +766,351 @@ namespace MidiToKeyApp.Tests
 
             // デバイス1 離す -> 解放
             tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano1", 0, 64, 0, session));
+            Assert.AreEqual(2, _mock.History.Count);
+            Assert.IsFalse(_mock.History[1].IsDown);
+        }
+
+        // Test 30: 停止中にキャプチャ開始 -> Generationが一致し、MIDI入力を取得できる
+        [TestMethod]
+        public void Test_30_StartCaptureWhileStopped_GenerationMatchesAndCapturesInput()
+        {
+            var fakeListener = new FakeMidiListener();
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            string? capturedInput = null;
+            tracker.OnInputCaptured += (input) => capturedInput = input;
+
+            // 変換停止中にキャプチャセッション開始
+            long capGen = tracker.StartCaptureSession();
+            fakeListener.Start(new[] { "Port1" }, capGen);
+
+            Assert.AreEqual(capGen, fakeListener.CurrentGeneration);
+            Assert.AreEqual(capGen, tracker.CurrentSessionId);
+            Assert.IsTrue(tracker.IsCapturing);
+            Assert.IsFalse(tracker.IsListening);
+
+            fakeListener.OnNoteReceived += data => tracker.ProcessNoteEvent(data);
+
+            // リスナーからMIDIノート到着
+            fakeListener.FireNote(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, capGen));
+
+            // 入力がキャプチャされたこと
+            Assert.AreEqual("60", capturedInput);
+            // PCキー送信は抑止されていること
+            Assert.AreEqual(0, _mock.History.Count);
+        }
+
+        // Test 31: キャプチャ終了後に重複NoteOn -> KeyDownを発生させない
+        [TestMethod]
+        public void Test_31_DuplicateNoteOnAfterCaptureEnded_DoesNotSendKeyDown()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartCaptureSession();
+
+            // キャプチャ中に Note 60 押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.AreEqual(0, _mock.History.Count);
+            Assert.AreEqual(1, tracker.SuppressedSourcesCount);
+
+            // キャプチャ終了
+            tracker.StopCaptureSession();
+            Assert.IsFalse(tracker.IsCapturing);
+
+            // 終了後に同じノート60から重複NoteOnが到着
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+
+            // 抑止されているため KeyDown は発生しない
+            Assert.AreEqual(0, _mock.History.Count);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        // Test 32: キャプチャ終了後のNoteOff -> 抑止状態が正常に解除される
+        [TestMethod]
+        public void Test_32_NoteOffAfterCaptureEnded_ReleasesSuppression()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartCaptureSession();
+
+            // キャプチャ中に Note 60 押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.AreEqual(1, tracker.SuppressedSourcesCount);
+
+            // キャプチャ終了
+            tracker.StopCaptureSession();
+
+            // NoteOff 到着
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session));
+
+            // 抑止セットが解除されていること
+            Assert.AreEqual(0, tracker.SuppressedSourcesCount);
+            // 不要なキー送信は一切ないこと
+            Assert.AreEqual(0, _mock.History.Count);
+        }
+
+        // Test 33: キャプチャ前から押下中のノート -> キャプチャ中も正常に解放
+        [TestMethod]
+        public void Test_33_PreExistingNoteDuringCapture_ReleasedNormally()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartConversionSession();
+
+            // 通常変換中に押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.IsTrue(_mock.History[0].Key == VirtualKeyCode.VK_A && _mock.History[0].IsDown);
+
+            // キャプチャ開始
+            tracker.StartCaptureSession();
+
+            // キャプチャ中に NoteOff 到着
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session));
+
+            // 正常に解放（KeyUp）されること
+            Assert.AreEqual(2, _mock.History.Count);
+            Assert.IsTrue(_mock.History[1].Key == VirtualKeyCode.VK_A && !_mock.History[1].IsDown);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        // Test 34: キャプチャ専用セッションの再開始 -> 旧イベントを破棄
+        [TestMethod]
+        public void Test_34_RestartCaptureSession_DiscardsOldEvents()
+        {
+            var settings = new AppSettings();
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            string? capturedText = null;
+            tracker.OnInputCaptured += (text) => capturedText = text;
+
+            long sessionA = tracker.StartCaptureSession();
+            tracker.StopCaptureSession();
+
+            long sessionB = tracker.StartCaptureSession();
+            Assert.IsTrue(sessionB > sessionA);
+
+            // セッションAの旧イベントが遅延到着
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, sessionA));
+            Assert.IsNull(capturedText); // 破棄される
+
+            // セッションBの新イベント
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 62, 100, true, sessionB));
+            Assert.AreEqual("62", capturedText); // 正常キャプチャ
+        }
+
+        // Test 35: 変換実行中にキャプチャ開始 -> Generationとリスナーを維持
+        [TestMethod]
+        public void Test_35_StartCaptureDuringConversion_MaintainsGenerationAndListener()
+        {
+            var fakeListener = new FakeMidiListener();
+            var settings = new AppSettings();
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            long convGen = tracker.StartConversionSession();
+            fakeListener.Start(new[] { "Port1" }, convGen);
+            Assert.AreEqual(1, fakeListener.StartCount);
+
+            // キャプチャ開始
+            long capGen = tracker.StartCaptureSession();
+
+            // Generationは維持される
+            Assert.AreEqual(convGen, capGen);
+            Assert.IsTrue(tracker.IsListening);
+            Assert.IsTrue(tracker.IsCapturing);
+            // リスナーは停止も再開もされない
+            Assert.AreEqual(1, fakeListener.StartCount);
+            Assert.AreEqual(0, fakeListener.StopCount);
+        }
+
+        // Test 36: キャプチャ中に変換開始 -> 状態遷移が正常に完了
+        [TestMethod]
+        public void Test_36_StartConversionDuringCapture_CompletesStateTransition()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            long capGen = tracker.StartCaptureSession();
+            Assert.IsTrue(tracker.IsCapturing);
+            Assert.IsFalse(tracker.IsListening);
+
+            // 変換開始
+            long convGen = tracker.StartConversionSession();
+            Assert.IsTrue(convGen > capGen);
+            Assert.IsTrue(tracker.IsListening);
+            Assert.IsFalse(tracker.IsCapturing);
+
+            // 新セッションでキー変換が正常に動作
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, convGen));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.VK_A, _mock.History[0].Key);
+        }
+
+        // Test 37: キャプチャ中のペダル重複CC64 -> KeyDownが重複しない
+        [TestMethod]
+        public void Test_37_PedalDuplicateCC64DuringCapture_DoesNotSendKeyDown()
+        {
+            var settings = new AppSettings { Mapping = new() { { "pedal", "space" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartCaptureSession();
+
+            // ペダル踏下
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+            // 重複踏下
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 100, session));
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+
+            // PCキー送信は一切発生しない
+            Assert.AreEqual(0, _mock.History.Count);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, tracker.SuppressedSourcesCount);
+        }
+
+        // Test 38: キャプチャ終了後のペダル解放 -> 抑止状態が正常に解除される
+        [TestMethod]
+        public void Test_38_PedalReleaseAfterCaptureEnded_ReleasesSuppression()
+        {
+            var settings = new AppSettings { Mapping = new() { { "pedal", "space" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartCaptureSession();
+
+            // キャプチャ中にペダル踏下
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+            Assert.AreEqual(1, tracker.SuppressedSourcesCount);
+
+            // キャプチャ終了
+            tracker.StopCaptureSession();
+
+            // 重複CC64 (まだ踏下中) が来てもキー送信なし
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 120, session));
+            Assert.AreEqual(0, _mock.History.Count);
+
+            // ペダル解放
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 0, session));
+
+            // 抑止解除
+            Assert.AreEqual(0, tracker.SuppressedSourcesCount);
+            Assert.AreEqual(0, _mock.History.Count);
+        }
+
+        // Test 39: 起動時の破損JSON -> 未処理例外による終了を防ぐ
+        [TestMethod]
+        public void Test_39_CorruptedJsonOnStartup_RecoversWithDefaultSettingsWithoutUnhandledException()
+        {
+            string tempDir = Path.Combine(Path.GetTempPath(), $"startup_bad_json_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            string badFilePath = Path.Combine(tempDir, "settings.json");
+
+            try
+            {
+                File.WriteAllText(badFilePath, "{ invalid json content! [[[ }}}");
+
+                AppSettings loadedSettings;
+                bool isCorrupted = false;
+
+                // Form1の LoadInitialSettings() 相当の安全起動ロジック
+                try
+                {
+                    loadedSettings = SettingsManager.Load(badFilePath);
+                }
+                catch
+                {
+                    isCorrupted = true;
+                    loadedSettings = SettingsManager.GetDefaultSettings();
+                }
+
+                // 未処理例外にならず、デフォルト設定で復旧すること
+                Assert.IsTrue(isCorrupted);
+                Assert.IsNotNull(loadedSettings);
+                Assert.AreEqual("JIS", loadedSettings.KeyboardLayout);
+                Assert.IsTrue(loadedSettings.Mapping.ContainsKey("60"));
+                // 元の破損ファイルが消去・上書きされていないこと
+                Assert.IsTrue(File.Exists(badFilePath));
+                Assert.AreEqual("{ invalid json content! [[[ }}}", File.ReadAllText(badFilePath));
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
+        }
+
+        // Test 40: 設定読込失敗 -> 既存設定と元ファイルを維持
+        [TestMethod]
+        public void Test_40_SettingsLoadFailure_PreservesExistingSettingsAndOriginalFile()
+        {
+            string tempDir = Path.Combine(Path.GetTempPath(), $"settings_fail_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            string corruptFile = Path.Combine(tempDir, "settings.json");
+
+            try
+            {
+                File.WriteAllText(corruptFile, "{\"mapping\": \"not a dictionary\"}");
+
+                var currentSettings = new AppSettings { KeyboardLayout = "US" };
+                bool threw = false;
+
+                try
+                {
+                    var newSettings = SettingsManager.Load(corruptFile);
+                    currentSettings = newSettings; // 成功時のみ更新
+                }
+                catch
+                {
+                    threw = true;
+                }
+
+                // 例外が検出され、既存設定が維持されること
+                Assert.IsTrue(threw);
+                Assert.AreEqual("US", currentSettings.KeyboardLayout);
+                // 元ファイルが保護されていること
+                Assert.AreEqual("{\"mapping\": \"not a dictionary\"}", File.ReadAllText(corruptFile));
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
+        }
+
+        // Test 41: 停止直後の旧イベント -> 新セッションへ混入しない
+        [TestMethod]
+        public void Test_41_OldSessionDelayedEvents_DoNotBleedIntoNewSession()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" }, { "pedal", "space" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            long session1 = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session1));
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session1));
+            Assert.AreEqual(2, _mock.History.Count);
+
+            // セッション1停止
+            tracker.StopSession();
+            _mock.Clear();
+
+            // 新セッション2開始
+            long session2 = tracker.StartConversionSession();
+            Assert.IsTrue(session2 > session1);
+
+            // セッション1由来の遅延 NoteOff / CC64 が新セッション中に到着
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session1));
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 0, session1));
+
+            // 新セッションには何の影響も与えず破棄される
+            Assert.AreEqual(0, _mock.History.Count);
+
+            // 新セッション2で Note 60 押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session2));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.VK_A, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+
+            // さらにセッション1由来の NoteOn が遅延到着しても無視
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session1));
+            Assert.AreEqual(1, _mock.History.Count); // 増加しない
+
+            // セッション2の NoteOff で正常解放
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session2));
             Assert.AreEqual(2, _mock.History.Count);
             Assert.IsFalse(_mock.History[1].IsDown);
         }

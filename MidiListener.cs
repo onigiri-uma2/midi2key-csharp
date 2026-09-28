@@ -18,10 +18,23 @@ namespace MidiToKeyApp
     public readonly record struct MidiControlData(string DeviceId, string DeviceName, int Channel, int ControlNumber, int ControlValue, long Generation);
 
     /// <summary>
+    /// MIDI入力監視の抽象化インターフェース。
+    /// テストでのMIDI入力模擬やリスナーの動作検証を可能にします。
+    /// </summary>
+    public interface IMidiListener : IDisposable
+    {
+        long CurrentGeneration { get; }
+        event Action<MidiNoteData>? OnNoteReceived;
+        event Action<MidiControlData>? OnControlReceived;
+        long Start(IEnumerable<string> portNames, long? specificGeneration = null);
+        void Stop();
+    }
+
+    /// <summary>
     /// PCに接続されたMIDI機器からの入力を監視し、鍵盤（ノート）やペダルのイベントを検知するクラス。
     /// 各セッションに一意のGenerationを紐付け、遅延到着した旧セッションイベントの識別を可能にします。
     /// </summary>
-    public class MidiListener : IDisposable
+    public class MidiListener : IMidiListener
     {
         private class OpenDeviceInfo
         {

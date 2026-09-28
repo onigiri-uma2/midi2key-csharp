@@ -18,6 +18,7 @@ namespace MidiToKeyApp
         private string appDir = AppDomain.CurrentDomain.BaseDirectory;
         private string currentSettingsDir = AppDomain.CurrentDomain.BaseDirectory;
         private string currentSettingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
+        private bool isCurrentSettingsCorrupted = false;
         
         private CheckedListBox chkPorts = null!;
         private RadioButton rbJIS = null!;
@@ -26,24 +27,25 @@ namespace MidiToKeyApp
         private TextBox txtNote = null!;
         private TextBox txtKey = null!;
         private Label lblStatus = null!;
+        private Button btnSaveAs = null!;
         
         private IKeyboardMouseEvents? globalHook;
-        private MidiListener midiListener = null!;
+        private IMidiListener midiListener = null!;
         private KeySimulator keySimulator = null!;
         private InputTracker inputTracker = null!;
 
-        public Form1()
+        public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null)
         {
             InitializeComponentProgrammatically();
             LoadInitialSettings();
-            SetupDependencies();
+            SetupDependencies(output, listener);
         }
         
-        private void SetupDependencies()
+        private void SetupDependencies(IKeyboardOutput? output = null, IMidiListener? listener = null)
         {
-            keySimulator = new KeySimulator();
+            keySimulator = new KeySimulator(output);
             inputTracker = new InputTracker(keySimulator, () => settings);
-            midiListener = new MidiListener();
+            midiListener = listener ?? new MidiListener();
 
             // ノート/ペダル取得（キャプチャモード）時のUI非同期更新（デッドロック防止）
             inputTracker.OnInputCaptured += (capturedText) => {
@@ -71,7 +73,24 @@ namespace MidiToKeyApp
         {
             currentSettingsPath = Path.Combine(appDir, "settings.json");
             currentSettingsDir = appDir;
-            settings = SettingsManager.Load(currentSettingsPath);
+
+            try
+            {
+                settings = SettingsManager.Load(currentSettingsPath);
+                isCurrentSettingsCorrupted = false;
+            }
+            catch (Exception ex)
+            {
+                // 起動時の破損JSON保護: クラッシュを防ぎ、デフォルト設定で復旧
+                isCurrentSettingsCorrupted = true;
+                settings = SettingsManager.GetDefaultSettings();
+
+                MessageBox.Show(
+                    $"設定ファイル ({Path.GetFileName(currentSettingsPath)}) の読み込みに失敗したため、初期設定で起動しました。\n\n詳細: {ex.Message}\n\n※破損した元ファイルは上書きされず保護されています。",
+                    "設定読み込み警告",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
             
             RefreshPorts(true);
 
@@ -161,10 +180,10 @@ namespace MidiToKeyApp
             rbUS = new RadioButton { Text = "US", Top = 20, Left = 55, Width = 45 };
             rbJIS = new RadioButton { Text = "JIS", Top = 20, Left = 10, Width = 45 };
             rbUS.CheckedChanged += (s, e) => {
-                if (rbUS.Checked) settings.KeyboardLayout = "US";
+                if (settings != null && rbUS.Checked) settings.KeyboardLayout = "US";
             };
             rbJIS.CheckedChanged += (s, e) => {
-                if (rbJIS.Checked) settings.KeyboardLayout = "JIS";
+                if (settings != null && rbJIS.Checked) settings.KeyboardLayout = "JIS";
             };
             grpLayout.Controls.Add(rbUS);
             grpLayout.Controls.Add(rbJIS);
@@ -237,21 +256,31 @@ namespace MidiToKeyApp
             var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 300, Left = 10, AutoSize = true };
             txtNote = new TextBox { Top = 320, Left = 10, Width = 75 };
             
-            // ノート取得モードと変換モードのライフサイクル分離
+            // ノート取得モードと変換モードのライフサイクルおよびGeneration同期
             txtNote.Enter += (s, e) => {
-                inputTracker.SetCapturing(true);
-                // 変換停止中であれば、ノート取得専用にMIDIリスナーを開始
                 if (!inputTracker.IsListening)
                 {
-                    midiListener.Start(GetSelectedPorts());
+                    // 停止中のキャプチャ開始: InputTracker側でGenerationを発行してリスナーに渡す
+                    long gen = inputTracker.StartCaptureSession();
+                    midiListener.Start(GetSelectedPorts(), gen);
+                }
+                else
+                {
+                    // 変換実行中: リスナーは再起動せずキャプチャフラグのみON
+                    inputTracker.SetCapturing(true);
                 }
             };
             txtNote.Leave += (s, e) => {
-                inputTracker.SetCapturing(false);
-                // 変換停止中であれば、専用リスナーを停止。変換実行中なら停止しない！
                 if (!inputTracker.IsListening)
                 {
+                    // 停止中のキャプチャ終了: キャプチャ専用リスナーを停止
+                    inputTracker.StopCaptureSession();
                     midiListener.Stop();
+                }
+                else
+                {
+                    // 変換実行中: キャプチャフラグのみOFF（押下中ノートの抑止は維持）
+                    inputTracker.SetCapturing(false);
                 }
             };
 
@@ -374,10 +403,30 @@ namespace MidiToKeyApp
             // 「上書き保存」ボタン
             var btnSave = new Button { Text = "上書き保存", Top = 375, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
+                if (isCurrentSettingsCorrupted)
+                {
+                    var confirm = MessageBox.Show(
+                        $"元の設定ファイル ({Path.GetFileName(currentSettingsPath)}) は破損していたため保護されています。\nこのまま上書き保存しますか？\n（[いいえ] を選ぶと別名保存ダイアログが開きます）",
+                        "破損ファイル保護確認",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+
+                    if (confirm == DialogResult.No)
+                    {
+                        btnSaveAs.PerformClick();
+                        return;
+                    }
+                    else if (confirm == DialogResult.Cancel)
+                    {
+                        return;
+                    }
+                }
+
                 UpdateSettingsFromUI();
                 try
                 {
                     SettingsManager.Save(currentSettingsPath, settings);
+                    isCurrentSettingsCorrupted = false;
                     lblStatus.Text = $"保存完了: {Path.GetFileName(currentSettingsPath)}";
                     lblStatus.ForeColor = Color.Blue;
                     MessageBox.Show($"設定を保存しました。\n保存先: {currentSettingsPath}", "保存完了");
@@ -389,7 +438,7 @@ namespace MidiToKeyApp
             };
 
             // 「別名保存」ボタン
-            var btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
+            btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
             btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
@@ -408,6 +457,7 @@ namespace MidiToKeyApp
                             // 保存成功後にのみファイルパスを更新
                             currentSettingsPath = targetPath;
                             currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
+                            isCurrentSettingsCorrupted = false;
                             MessageBox.Show("別名保存が完了しました。\n保存先: " + currentSettingsPath, "保存完了");
                         }
                         catch (Exception ex)
@@ -441,6 +491,7 @@ namespace MidiToKeyApp
 
                             currentSettingsPath = targetPath;
                             currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
+                            isCurrentSettingsCorrupted = false;
 
                             lock (settings.MappingLock)
                             {
@@ -468,8 +519,18 @@ namespace MidiToKeyApp
                 if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください", "ポート未選択"); return; }
                 
                 UpdateSettingsFromUI();
-                long sessionId = inputTracker.StartSession();
+
+                // 未解放キーの再試行
+                keySimulator.RetryReleasePendingKeys();
+
+                long sessionId = inputTracker.StartConversionSession();
                 midiListener.Start(ports, sessionId);
+
+                // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
+                if (txtNote.Focused)
+                {
+                    inputTracker.SetCapturing(true);
+                }
 
                 lblStatus.Text = "ステータス: 実行中";
                 lblStatus.ForeColor = Color.Green;

@@ -35,7 +35,7 @@ namespace MidiToKeyApp
         // ペダルの現在状態（"DeviceId:Channel" -> isPressed）
         private readonly Dictionary<string, bool> _pedalStates = new();
 
-        // キャプチャモード中に新規取得され、対応するNoteOffを受信するまでキー解放を抑止する入力元のセット
+        // キャプチャモード中に取得され、対応するNoteOffを受信するまでキー解放を抑止する入力元のセット
         private readonly HashSet<MidiSourceKey> _suppressedSources = new();
 
         /// <summary>
@@ -54,18 +54,71 @@ namespace MidiToKeyApp
         public bool IsCapturing => _isCapturing;
 
         /// <summary>
-        /// 変換セッションを開始します。新しいセッションIDを発行し、旧イベントを無効化します。
+        /// 通常の変換セッションを開始します。新しいGenerationを発行し、旧イベントを無効化します。
         /// </summary>
-        public long StartSession()
+        public long StartSession() => StartConversionSession();
+
+        public long StartConversionSession()
         {
             lock (_stateLock)
             {
                 long newSessionId = Interlocked.Increment(ref _currentSessionId);
                 _isListening = true;
+                _isCapturing = false;
                 _activeNotes.Clear();
                 _pedalStates.Clear();
                 _suppressedSources.Clear();
                 return newSessionId;
+            }
+        }
+
+        /// <summary>
+        /// ノート番号欄へフォーカスした際、キャプチャモードを開始します。
+        /// 停止中の場合は新しいGenerationを発行してMidiListenerへ同期させます。
+        /// 変換実行中の場合はGenerationおよび既存の押下状態を維持します。
+        /// </summary>
+        public long StartCaptureSession()
+        {
+            lock (_stateLock)
+            {
+                _isCapturing = true;
+
+                if (_isListening)
+                {
+                    // 変換実行中のキャプチャ開始: Generationを変更せず、既存の押下状態(_activeNotes)も維持
+                    return Interlocked.Read(ref _currentSessionId);
+                }
+                else
+                {
+                    // 変換停止中のキャプチャ開始: 新しいGenerationを発行し、内部状態を整理
+                    long newSessionId = Interlocked.Increment(ref _currentSessionId);
+                    _activeNotes.Clear();
+                    _pedalStates.Clear();
+                    _suppressedSources.Clear();
+                    return newSessionId;
+                }
+            }
+        }
+
+        /// <summary>
+        /// キャプチャモードを終了します。
+        /// 変換停止中の場合はGenerationを無効化し、キャプチャ専用の入力状態を整理します。
+        /// 変換実行中の場合はGenerationを変更せず、キャプチャ中に押されたノートの抑止はNoteOffまで維持します。
+        /// </summary>
+        public void StopCaptureSession()
+        {
+            lock (_stateLock)
+            {
+                _isCapturing = false;
+
+                if (!_isListening)
+                {
+                    // 変換停止中: Generationを無効化し、状態を整理
+                    Interlocked.Increment(ref _currentSessionId);
+                    _suppressedSources.Clear();
+                    _pedalStates.Clear();
+                }
+                // 変換実行中の場合: Generationは変更せず、_suppressedSourcesはNoteOffまで維持
             }
         }
 
@@ -88,8 +141,8 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// キャプチャモード（ノート番号欄の自動入力待ち）の開始/終了を設定します。
-        /// 終了時にも、キャプチャ中に押されたノートに対する抑止セットは維持されます。
+        /// 変換実行中のキャプチャモード（ノート番号欄の自動入力待ち）の開始/終了を設定します。
+        /// 実行中のリスナーやGenerationは変更せず、キャプチャフラグのみを切り替えます。
         /// </summary>
         public void SetCapturing(bool capturing)
         {
@@ -98,11 +151,10 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// MIDIノートイベント（NoteOn / NoteOff）を処理します。
-        /// イベントに焼き付けられたGenerationを検証し、キャプチャ開始前の既存ノートを保護します。
         /// </summary>
         public void ProcessNoteEvent(MidiNoteData note)
         {
-            // (1) Generationの検証（停止後や旧セッションの遅延イベントはロック取得前に即破棄）
+            // (1) Generationの検証（停止後や旧セッションの遅延イベントは即破棄）
             if (note.Generation != Interlocked.Read(ref _currentSessionId))
             {
                 return;
@@ -118,15 +170,21 @@ namespace MidiToKeyApp
                 {
                     // --- NoteOn 処理 ---
 
-                    // 【最優先】既に通常変換で押下中のノートであるか確認
+                    // 1. 【最優先】既に通常変換で押下中のノートであるか確認
                     if (_activeNotes.ContainsKey(sourceKey))
                     {
-                        // 既に押下中の入力元であれば、キャプチャ中であっても重複NoteOnとして扱い、
-                        // 抑止対象には追加せず、参照カウントの重複増加も防止する
+                        // 既に押下中の入力元であれば、キャプチャ中であっても重複NoteOnとして既存状態を維持
                         return;
                     }
 
-                    // キャプチャモード中の新規NoteOn
+                    // 2. キャプチャ抑止中であるか確認（キャプチャ終了後の重複NoteOn対策）
+                    if (_suppressedSources.Contains(sourceKey))
+                    {
+                        // キャプチャ中に取得されNoteOff待ちの入力であれば、キャプチャ終了後も重複NoteOnを無視
+                        return;
+                    }
+
+                    // 3. キャプチャモード中の新規NoteOn
                     if (_isCapturing)
                     {
                         _suppressedSources.Add(sourceKey);
@@ -134,10 +192,10 @@ namespace MidiToKeyApp
                         return;
                     }
 
-                    // 通常変換実行中でない場合は何もしない
+                    // 4. 通常変換実行中でない場合は何もしない（停止中など）
                     if (!_isListening) return;
 
-                    // 現在の設定からキーを解決（NoteOn時のスナップショット作成）
+                    // 5. 通常変換の新規NoteOn処理
                     var settings = _settingsProvider();
                     string noteStr = note.NoteNumber.ToString();
                     string? mappedKey = null;
@@ -214,12 +272,19 @@ namespace MidiToKeyApp
                 if (isDown)
                 {
                     // --- ペダル踏み込み (PedalDown) ---
-                    // 既に通常変換で押下中であれば重複追加しない
+                    // 1. 既に通常変換で押下中であれば重複追加しない
                     if (_activeNotes.ContainsKey(sourceKey))
                     {
                         return;
                     }
 
+                    // 2. キャプチャ抑止中であれば重複踏み込みを無視
+                    if (_suppressedSources.Contains(sourceKey))
+                    {
+                        return;
+                    }
+
+                    // 3. キャプチャモード中の新規踏み込み
                     if (_isCapturing)
                     {
                         _suppressedSources.Add(sourceKey);
@@ -227,8 +292,10 @@ namespace MidiToKeyApp
                         return;
                     }
 
+                    // 4. 通常変換実行中でない場合は何もしない
                     if (!_isListening) return;
 
+                    // 5. 通常変換処理
                     var settings = _settingsProvider();
                     string? mappedKey = null;
 
@@ -268,9 +335,6 @@ namespace MidiToKeyApp
             }
         }
 
-        /// <summary>
-        /// テスト用: 現在保持されているアクティブノート数を取得します。
-        /// </summary>
         public int ActiveNotesCount
         {
             get
@@ -279,9 +343,6 @@ namespace MidiToKeyApp
             }
         }
 
-        /// <summary>
-        /// テスト用: 抑止対象の入力元数を取得します。
-        /// </summary>
         public int SuppressedSourcesCount
         {
             get
@@ -290,12 +351,14 @@ namespace MidiToKeyApp
             }
         }
 
-        /// <summary>
-        /// テスト用: 指定入力元がアクティブノートとして保持されているか確認します。
-        /// </summary>
         public bool IsNoteActive(MidiSourceKey key)
         {
             lock (_stateLock) return _activeNotes.ContainsKey(key);
+        }
+
+        public bool IsSourceSuppressed(MidiSourceKey key)
+        {
+            lock (_stateLock) return _suppressedSources.Contains(key);
         }
     }
 }
