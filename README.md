@@ -1,4 +1,4 @@
-# midi2key (C# / .NET 9 Edition)
+# midi2key (C# / .NET 10 Edition)
 このアプリは、MIDIキーボードやMIDIシーケンサーのノート入力を、PCの生キーボード入力として変換する軽量なWinFormsアプリケーションです。
 
 ---
@@ -41,7 +41,8 @@
 
 ### 開発・ビルドを行う場合
 * **OS**: Windows 10/11 (64bit, Build 19041以上推奨)
-* **SDK**: .NET 9.0 SDK
+* **SDK**: .NET 10 SDK
+* **IDE**: Visual Studio 2026
 * 使用パッケージ (NuGet):
   * `InputSimulatorCore`
   * `Melanchall.DryWetMidi`
@@ -116,7 +117,7 @@
 dotnet publish MidiToKeyApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
-正常に終了すると、`bin\Release\net9.0-windows10.0.19041.0\win-x64\publish\` フォルダの中に `midi2key.exe` がたった一つだけ（Native DLL等もすべて埋め込まれた状態で）生成されます。
+正常に終了すると、`bin\Release\net10.0-windows10.0.19041.0\win-x64\publish\` フォルダの中に `midi2key.exe` がたった一つだけ（Native DLL等もすべて埋め込まれた状態で）生成されます。
 
 ---
 
