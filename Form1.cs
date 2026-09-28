@@ -21,7 +21,6 @@ namespace MidiToKeyApp
         private bool isCurrentSettingsCorrupted = false;
         
         private CheckedListBox chkPorts = null!;
-        private Button btnReloadPorts = null!;
         private RadioButton rbJIS = null!;
         private RadioButton rbUS = null!;
         private ListView listMapping = null!;
@@ -39,8 +38,12 @@ namespace MidiToKeyApp
         private readonly HotkeyManager hotkeyManager = new();
         private System.Windows.Forms.Timer? deviceDebounceTimer;
         private WinRtMidiWatcher? _winRtWatcher;
-        private Label lblPortSummary = null!;
         private volatile bool _isTransitioning = false;
+
+        // 接続変更・切断警告の通知集約用（同一メッセージの重複抑止）
+        private string? _lastAlertMessage = null;
+        private DateTime _lastAlertTime = DateTime.MinValue;
+        private readonly object _alertLock = new();
 
         // キー送信エラーの通知集約用
         private int lastReportedErrorCode = 0;
@@ -169,10 +172,6 @@ namespace MidiToKeyApp
                 };
                 _winRtWatcher.OnEnumerationCompleted += () => {
                     DiagnosticLogger.Log($"[WinRT] Initial enumeration completed. Devices count={_winRtWatcher.Devices.Count}");
-                    if (IsHandleCreated && !IsDisposed)
-                    {
-                        try { BeginInvoke(new Action(() => UpdatePortSummaryUi())); } catch { }
-                    }
                 };
                 _winRtWatcher.Start();
                 DiagnosticLogger.Log("[WinRT] WinRtMidiWatcher started successfully.");
@@ -190,16 +189,30 @@ namespace MidiToKeyApp
             deviceDebounceTimer?.Start();
         }
 
-        private void UpdatePortSummaryUi(OutOfProcessWinMmResult? outProcResult = null)
+        /// <summary>
+        /// 接続変更等のユーザー向け警告メッセージを集約し、短時間の同一メッセージ連続ダイアログを抑止して表示します。
+        /// </summary>
+        private void ShowAggregatedWarning(string message, string title = "MIDIデバイス通知")
         {
-            if (lblPortSummary == null) return;
-            int osCount = _winRtWatcher?.Devices.Count ?? -1;
-            int backendCount = chkPorts?.Items.Count ?? 0;
-            string osText = osCount >= 0 ? $"{osCount}件" : "0件";
-            string outProcText = outProcResult.HasValue
-                ? (outProcResult.Value.Success ? $"{outProcResult.Value.Ports.Count}件" : "エラー")
-                : "取得中...";
-            lblPortSummary.Text = $"親プロセス: {backendCount}件 | 新規プロセス: {outProcText} | WinRT: {osText}";
+            lock (_alertLock)
+            {
+                if (message == _lastAlertMessage && (DateTime.Now - _lastAlertTime).TotalSeconds < 5)
+                {
+                    return;
+                }
+                _lastAlertMessage = message;
+                _lastAlertTime = DateTime.Now;
+            }
+
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => ShowAggregatedWarning(message, title)));
+                return;
+            }
+
+            lblStatus.Text = $"ステータス: 停止中 ({message})";
+            lblStatus.ForeColor = Color.DarkGoldenrod;
+            MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void RefreshPorts(bool isInitialLoad = false)
@@ -212,13 +225,14 @@ namespace MidiToKeyApp
             {
                 DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
                 chkPorts.Items.Clear();
-                UpdatePortSummaryUi();
+                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
                 return;
             }
 
             var availablePorts = enumResult.Ports;
             
-            // 新規プロセスWinMMの結果を非同期で確認
+            // 新規プロセスWinMMの結果を非同期で確認し、真に利用可能なポートのみをUIに反映
             _ = System.Threading.Tasks.Task.Run(() => {
                 var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
                 if (IsHandleCreated && !IsDisposed)
@@ -239,119 +253,58 @@ namespace MidiToKeyApp
         {
             chkPorts.Items.Clear();
 
-            // ケース1: 新規プロセスで1件以上検出され、親プロセスDryWetMIDIで0件の場合
-            if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
+            // 利用可能なポートの厳格な絞り込み:
+            // 1. 新規プロセスWinMMで正常に0件（消失）と確認されたポートは、取り外し済みのため除外
+            // 2. 新規プロセスWinMMで検出されていても親プロセスDryWetMIDIにないポートは除外
+            // 3. 診断プロセス失敗時は親プロセスの一覧をそのまま使用
+            List<string> validPorts;
+            if (outProcResult.Success && outProcResult.Ports.Count == 0)
             {
-                lblStatus.Text = "ステータス: 停止中 (接続検出・MIDIバックエンド未反映: 再起動してください)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-                foreach (var p in outProcResult.Ports)
-                {
-                    chkPorts.Items.Add($"{p} [未反映: 要再起動]");
-                }
+                // 新規プロセスWinMMが正常に0件: デバイスが取り外されているため、親プロセスの残存ポートは利用不可
+                validPorts = new List<string>();
             }
-            // ケース2: 親プロセスで1件以上あるが、新規プロセスWinMMで0件（正常取得）の場合: 取り外し済みの可能性
-            else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
+            else if (outProcResult.Success)
             {
-                lblStatus.Text = "ステータス: 停止中 (機器取り外し済みの可能性: 再起動してください)";
-                lblStatus.ForeColor = Color.DarkOrange;
-                foreach (var port in availablePorts)
-                {
-                    chkPorts.Items.Add($"{port} (取り外し済みの可能性)");
-                }
+                // 新規プロセスWinMMに含まれており、かつ親プロセスにも存在するポートのみ
+                var outSet = new HashSet<string>(outProcResult.Ports, StringComparer.OrdinalIgnoreCase);
+                validPorts = availablePorts.Where(p => outSet.Contains(p)).ToList();
             }
             else
             {
-                foreach (var port in availablePorts)
+                // 新規プロセスの確認失敗時は親プロセスの列挙をそのまま使用
+                validPorts = availablePorts.ToList();
+            }
+
+            // 純粋なポート名のみを追加（修飾文字列は一切追加しない）
+            foreach (var port in validPorts)
+            {
+                int index = chkPorts.Items.Add(port);
+                if (checkedPorts.Contains(port, StringComparer.OrdinalIgnoreCase))
                 {
-                    int index = chkPorts.Items.Add(port);
-                    if (checkedPorts.Contains(port))
-                    {
-                        chkPorts.SetItemChecked(index, true);
-                    }
+                    chkPorts.SetItemChecked(index, true);
                 }
             }
 
-            UpdatePortSummaryUi(outProcResult);
-        }
-
-        /// <summary>
-        /// ユーザー操作による手動ポート再読み込み。
-        /// 変換実行中の場合は安全停止した上で再列挙し、選択状態を可能な範囲で維持します。
-        /// </summary>
-        private void ReloadPortsManually()
-        {
-            DiagnosticLogger.Log($"[Form1] Manual port reload triggered by user. IsListening={inputTracker.IsListening}");
-
-            if (inputTracker.IsListening)
-            {
-                StopConversion();
-                lblStatus.Text = "ステータス: 停止中 (ポート再読み込みのため安全停止)";
-                lblStatus.ForeColor = Color.Red;
-            }
-
-            var previousSelected = GetSelectedPorts();
-            var enumResult = MidiListener.GetPortNames();
-
-            if (!enumResult.Success)
-            {
-                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration failed: {enumResult.ErrorMessage}");
-                lblStatus.Text = "ステータス: 停止中 (ポート一覧更新失敗)";
-                lblStatus.ForeColor = Color.Red;
-                MessageBox.Show(
-                    $"MIDIポート一覧の再読み込みに失敗しました。\n\n詳細: {enumResult.ErrorMessage}\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                    "ポート再読み込みエラー",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                return;
-            }
-
-            var availablePorts = enumResult.Ports;
-            var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1500);
-            DiagnosticLogger.Log($"[Form1] ReloadPortsManually result: DryWetMIDI={availablePorts.Count}件, 新規プロセスWinMM={(outProcResult.Success ? $"{outProcResult.Ports.Count}件" : "失敗")}");
-
-            ApplyPortsToUi(availablePorts, previousSelected, outProcResult);
-
-            // 5系統比較診断をバックグラウンド実行してログ記録
-            _ = System.Threading.Tasks.Task.Run(async () => {
-                try
-                {
-                    var activePorts = midiListener.GetActivePorts();
-                    await MidiDeviceDiagnostics.RunComparisonAsync("ManualReload", activePorts);
-                }
-                catch { }
-            });
-
-            // 第3項目のユーザー向け案内
+            // ステータス表示の更新（接続不一致はステータス欄で案内）
             if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
             {
-                MessageBox.Show(
-                    $"接続は検出されていますが、MIDIバックエンドには未反映です。\n機器を利用するにはmidi2keyを再起動してください。\n\n検出デバイス: {string.Join(", ", outProcResult.Ports)}",
-                    "MIDIポート未反映 (再起動が必要)",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス未反映: 再起動してください)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
             }
             else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
             {
-                MessageBox.Show(
-                    "親プロセスのポート一覧には残存していますが、新規プロセスのWinMMでは検出されませんでした。\n機器が物理的に取り外されている可能性があります。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                    "機器取り外し検出",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断: 再起動してください)";
+                lblStatus.ForeColor = Color.DarkOrange;
             }
-            else if (availablePorts.Count == 0)
+            else if (validPorts.Count == 0)
             {
                 lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
                 lblStatus.ForeColor = Color.DarkGoldenrod;
-                MessageBox.Show(
-                    "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                    "MIDIポートなし",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
             }
-            else
+            else if (!inputTracker.IsListening)
             {
-                lblStatus.Text = $"ステータス: 停止中 (ポート再読み込み完了: {availablePorts.Count}件検出)";
-                lblStatus.ForeColor = Color.Blue;
+                lblStatus.Text = "ステータス: 停止中";
+                lblStatus.ForeColor = Color.Red;
             }
         }
 
@@ -406,53 +359,38 @@ namespace MidiToKeyApp
             string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.3";
             this.Text = $"midi2key C#{verStr}";
             this.Width = 430;
-            this.Height = 585;
+            this.Height = 550;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("Yu Gothic UI", 9);
 
-            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 50 };
-            rbUS = new RadioButton { Text = "US", Top = 20, Left = 55, Width = 45 };
-            rbJIS = new RadioButton { Text = "JIS", Top = 20, Left = 10, Width = 45 };
+            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 95, Top = 10, Left = 10 };
+            chkPorts = new CheckedListBox { Top = 18, Left = 10, Width = 255, Height = 52, BorderStyle = BorderStyle.None, CheckOnClick = true };
+            chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
+            grpPorts.Controls.Add(chkPorts);
+
+            var lblPortWarn = new Label { Text = "※機器の接続・切断後はmidi2keyを再起動してください", ForeColor = Color.DarkSlateGray, Top = 73, Left = 5, AutoSize = true, Font = new Font(this.Font.FontFamily, 7.5f) };
+            grpPorts.Controls.Add(lblPortWarn);
+            this.Controls.Add(grpPorts);
+
+            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 95 };
+            rbJIS = new RadioButton { Text = "JIS", Top = 25, Left = 20, Width = 65 };
+            rbUS = new RadioButton { Text = "US", Top = 55, Left = 20, Width = 65 };
             rbUS.CheckedChanged += (s, e) => {
                 if (settings != null && rbUS.Checked) settings.KeyboardLayout = "US";
             };
             rbJIS.CheckedChanged += (s, e) => {
                 if (settings != null && rbJIS.Checked) settings.KeyboardLayout = "JIS";
             };
-            grpLayout.Controls.Add(rbUS);
             grpLayout.Controls.Add(rbJIS);
+            grpLayout.Controls.Add(rbUS);
             this.Controls.Add(grpLayout);
 
-            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 120, Top = 10, Left = 10 };
-            chkPorts = new CheckedListBox { Top = 18, Left = 10, Width = 255, Height = 58, BorderStyle = BorderStyle.None, CheckOnClick = true };
-            chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
-            grpPorts.Controls.Add(chkPorts);
-
-            lblPortSummary = new Label { Text = "OS認識: 取得中... | バックエンド: 0件", ForeColor = Color.Navy, Top = 78, Left = 10, AutoSize = true, Font = new Font(this.Font.FontFamily, 8f) };
-            grpPorts.Controls.Add(lblPortSummary);
-
-            var lblPortWarn = new Label { Text = "※機器の抜き差し時は自動検知または再起動してください", ForeColor = Color.DarkSlateGray, Top = 98, Left = 5, AutoSize = true, Font = new Font(this.Font.FontFamily, 7.5f) };
-            grpPorts.Controls.Add(lblPortWarn);
-            this.Controls.Add(grpPorts);
-
-            btnReloadPorts = new Button 
-            { 
-                Text = "🔄 ポート\n再読み込み", 
-                Top = 65, 
-                Left = 295, 
-                Width = 105, 
-                Height = 60, 
-                Font = new Font(this.Font.FontFamily, 8.5f) 
-            };
-            btnReloadPorts.Click += (s, e) => ReloadPortsManually();
-            this.Controls.Add(btnReloadPorts);
-
-            var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
+            var lblList = new Label { Text = "📄 マッピング一覧", Top = 115, Left = 10, AutoSize = true };
             listMapping = new ListView 
             { 
-                Top = 155, 
+                Top = 135, 
                 Left = 10, 
                 Width = 390, 
                 Height = 135,
@@ -504,8 +442,8 @@ namespace MidiToKeyApp
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 300, Left = 10, AutoSize = true };
-            txtNote = new TextBox { Top = 320, Left = 10, Width = 75 };
+            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 280, Left = 10, AutoSize = true };
+            txtNote = new TextBox { Top = 300, Left = 10, Width = 75 };
             
             // ノート取得モードと変換モードのライフサイクルおよびGeneration同期
             txtNote.Enter += (s, e) => {
@@ -535,11 +473,11 @@ namespace MidiToKeyApp
                 }
             };
 
-            var lblKey = new Label { Text = "⌨ キー", Top = 300, Left = 95, AutoSize = true };
-            txtKey = new TextBox { Top = 320, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
+            var lblKey = new Label { Text = "⌨ キー", Top = 280, Left = 95, AutoSize = true };
+            txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
             // キー入力欄の「消去」ボタン
-            var btnClearKey = new Button { Text = "消去", Top = 319, Left = 215, Width = 50, Height = 25 };
+            var btnClearKey = new Button { Text = "消去", Top = 299, Left = 215, Width = 50, Height = 25 };
             btnClearKey.Click += (s, e) => {
                 txtKey.Text = "";
             };
@@ -581,7 +519,7 @@ namespace MidiToKeyApp
             };
 
             // ノート番号バリデーション（0〜127）、pedal の登録、およびキー厳格検証
-            var btnAdd = new Button { Text = "追加", Top = 295, Left = 315, Width = 85, Height = 25 };
+            var btnAdd = new Button { Text = "追加", Top = 275, Left = 315, Width = 85, Height = 25 };
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
                 string keyInput = txtKey.Text.Trim();
@@ -654,7 +592,7 @@ namespace MidiToKeyApp
                 }
             };
             
-            var btnDel = new Button { Text = "削除", Top = 325, Left = 315, Width = 85, Height = 25 };
+            var btnDel = new Button { Text = "削除", Top = 305, Left = 315, Width = 85, Height = 25 };
             btnDel.Click += (s, e) => {
                 if (listMapping.SelectedItems.Count > 0)
                 {
@@ -675,11 +613,11 @@ namespace MidiToKeyApp
             this.Controls.Add(btnAdd);
             this.Controls.Add(btnDel);
 
-            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 360, Left = 10, Width = 390, Height = 2 };
+            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 340, Left = 10, Width = 390, Height = 2 };
             this.Controls.Add(sep);
 
             // 「上書き保存」ボタン
-            var btnSave = new Button { Text = "上書き保存", Top = 375, Left = 10, Width = 85, Height = 28 };
+            var btnSave = new Button { Text = "上書き保存", Top = 355, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
                 if (isCurrentSettingsCorrupted)
                 {
@@ -716,7 +654,7 @@ namespace MidiToKeyApp
             };
 
             // 「別名保存」ボタン
-            btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
+            btnSaveAs = new Button { Text = "別名保存", Top = 355, Left = 105, Width = 85, Height = 28 };
             btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
@@ -745,7 +683,7 @@ namespace MidiToKeyApp
             };
             
             // 「設定読込」ボタン
-            var btnLoad = new Button { Text = "設定読込", Top = 375, Left = 305, Width = 95, Height = 28 };
+            var btnLoad = new Button { Text = "設定読込", Top = 355, Left = 305, Width = 95, Height = 28 };
             btnLoad.Click += (s, e) => {
                 using (var ofd = new OpenFileDialog())
                 {
@@ -786,18 +724,18 @@ namespace MidiToKeyApp
                 }
             };
 
-            var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => StartConversion();
 
-            var btnStop = new Button { Text = "変換停止", Top = 415, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStop = new Button { Text = "変換停止", Top = 395, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStop.Click += (s, e) => StopConversion();
 
             // トグルホットキー表示＆変更ボタン
-            lblHotkeyInfo = new Label { Top = 460, Left = 10, Width = 280, AutoSize = false, Text = "ホットキー: 有効 (Ctrl+Alt+F9)", ForeColor = Color.FromArgb(40, 40, 40) };
-            btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 455, Left = 295, Width = 105, Height = 26 };
+            lblHotkeyInfo = new Label { Top = 440, Left = 10, Width = 280, AutoSize = false, Text = "ホットキー: 有効 (Ctrl+Alt+F9)", ForeColor = Color.FromArgb(40, 40, 40) };
+            btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 435, Left = 295, Width = 105, Height = 26 };
             btnHotkeyConfig.Click += (s, e) => OpenHotkeyConfigDialog();
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 495, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
 
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
@@ -833,8 +771,34 @@ namespace MidiToKeyApp
                             {
                                 BeginInvoke(new Action(() => {
                                     if (IsDisposed) return;
+                                    var beforeActive = midiListener.GetActivePorts();
                                     midiListener.CheckDeviceHealth(osDeviceNames, outProcResult);
+                                    var afterActive = midiListener.GetActivePorts();
                                     RefreshPorts(false);
+
+                                    // 監視中デバイスの切断は HandleDeviceDisconnected で通知される。
+                                    // 切断が発生しなかった場合の接続変更判定:
+                                    if (beforeActive.Count == afterActive.Count)
+                                    {
+                                        var currentPorts = MidiListener.GetPortNames();
+
+                                        // 1. 新規プロセスでポートが検出されたが親プロセスに未反映の場合
+                                        if (outProcResult.Success && outProcResult.Ports.Count > 0 &&
+                                            (currentPorts.Ports.Count == 0 || outProcResult.Ports.Any(p => !currentPorts.Ports.Contains(p, StringComparer.OrdinalIgnoreCase))))
+                                        {
+                                            ShowAggregatedWarning(
+                                                "MIDIデバイスの接続を検知しました。利用するにはmidi2keyを再起動してください。",
+                                                "MIDIデバイス接続検知");
+                                        }
+                                        // 2. 接続状態を確認できない場合（タイムアウトまたは取得失敗）
+                                        else if (!outProcResult.Success)
+                                        {
+                                            ShowAggregatedWarning(
+                                                "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。",
+                                                "MIDIデバイス状態確認");
+                                        }
+                                        // 3. 無関係なUSB機器の変更等（ポート変化なし）: 警告を表示しない
+                                    }
                                 }));
                             }
                             catch { }
@@ -985,7 +949,25 @@ namespace MidiToKeyApp
                     MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
                     return;
                 }
-                
+
+                // 変換開始直前にも選択ポートが現在有効か検証（要件4）
+                var enumResult = MidiListener.GetPortNames();
+                var outProc = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
+                bool isRemovedInOutOfProcess = outProc.Success && outProc.Ports.Count == 0;
+                bool isMissingInBackend = !enumResult.Success || !ports.All(p => enumResult.Ports.Contains(p, StringComparer.OrdinalIgnoreCase));
+
+                if (isRemovedInOutOfProcess || isMissingInBackend)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (MIDIポート開始不可)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    MessageBox.Show(
+                        "選択されたMIDIポートを開始できませんでした。機器が取り外されているか、MIDIバックエンドに未反映の可能性があります。機器を接続し直し、midi2keyを再起動してください。",
+                        "MIDIポート開始不可",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
                 UpdateSettingsFromUI();
 
                 // 未解放キーの再試行・復旧確認
@@ -1011,7 +993,7 @@ namespace MidiToKeyApp
                     lblStatus.Text = "ステータス: 停止中 (ポート開始失敗)";
                     lblStatus.ForeColor = Color.Red;
                     MessageBox.Show(
-                        $"すべてのMIDIポートの開始に失敗しました。\n\n詳細:\n{errDetails}",
+                        $"すべてのMIDIポートの開始に失敗しました。\n機器が取り外されているか、MIDIバックエンドに未反映の可能性があります。機器を接続し直し、midi2keyを再起動してください。\n\n詳細:\n{errDetails}",
                         "ポート開始エラー",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
@@ -1116,13 +1098,9 @@ namespace MidiToKeyApp
                 // 全ポート切断または同名等で切断元特定不能の場合: 安全側として変換全体を停止
                 DiagnosticLogger.Log($"[Form1] Full disconnect or unidentified device disconnect. Stopping conversion safely. RemainingActivePorts={activePorts.Count}");
                 StopConversion();
-                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断検知)";
-                lblStatus.ForeColor = Color.Red;
-                MessageBox.Show(
-                    $"MIDIデバイスの切断を検知したため、安全のためキーを解放して変換を停止しました。\n切断元: {(string.IsNullOrEmpty(data.DeviceName) ? "特定不能" : data.DeviceName)}\n理由: {data.Reason}\n\n※再開するには機器を接続し直し、変換開始ボタンまたはトグルホットキーで再開してください。",
-                    "デバイス切断検知",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                ShowAggregatedWarning(
+                    "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。",
+                    "MIDIデバイス切断検知");
             }
             else
             {

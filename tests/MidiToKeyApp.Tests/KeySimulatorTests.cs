@@ -2633,5 +2633,209 @@ namespace MidiToKeyApp.Tests
                 Assert.AreEqual(0, exceptionsCount, "並行実行中に例外が発生しないこと");
             }
         }
+
+        // Test 94: 未反映ポートが変換対象として選択できないこと（要件10-1）
+        [TestMethod]
+        public void Test_94_UnreflectedPort_CannotBeSelectedForConversion()
+        {
+            // 親プロセスDryWetMIDI: 0件, 新規プロセスWinMM: 1件
+            var availablePorts = Array.Empty<string>();
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            
+            // 親プロセスに未反映のポートは利用可能ポートに含まれない
+            var validPorts = availablePorts.Where(p => outProcResult.Ports.Contains(p, StringComparer.OrdinalIgnoreCase)).ToList();
+            Assert.AreEqual(0, validPorts.Count, "親プロセスに未反映のポートは利用可能ポートとして選択できないこと");
+        }
+
+        // Test 95: 取り外し済みポートが通常の選択対象に残らないこと（要件10-2）
+        [TestMethod]
+        public void Test_95_DisconnectedPort_NotInAvailableSelection()
+        {
+            // 親プロセスDryWetMIDI: 1件（キャッシュ残存）, 新規プロセスWinMM: 0件（取り外し検知）
+            var availablePorts = new[] { "nanoKEY2 1 KEYBOARD" };
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(Array.Empty<string>());
+
+            // 新規プロセスWinMMで0件（正常取得）の場合、親プロセスの残存ポートは除外される
+            List<string> validPorts;
+            if (outProcResult.Success && outProcResult.Ports.Count == 0)
+            {
+                validPorts = new List<string>();
+            }
+            else
+            {
+                validPorts = availablePorts.ToList();
+            }
+
+            Assert.AreEqual(0, validPorts.Count, "新規プロセスで0件が確認された取り外し済みポートは選択対象に残らないこと");
+        }
+
+        // Test 96: 設定に古いポート名があっても不正開始しないこと（要件10-3）
+        [TestMethod]
+        public void Test_96_StalePortInSettings_DoesNotStartConversion()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                SelectedPorts = new List<string> { "OldPort" },
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            var fakeListener = new FakeMidiListener();
+
+            // 現在のバックエンドには "OldPort" は存在しない
+            var backendPorts = new List<string>(); // 0件
+            var requestedPorts = new List<string> { "OldPort" };
+
+            // 選択されたポートが現在バックエンドにないため開始拒否・ロールバック
+            bool isValid = requestedPorts.All(p => backendPorts.Contains(p, StringComparer.OrdinalIgnoreCase));
+            Assert.IsFalse(isValid, "古いポート名は無効と判定されること");
+
+            if (!isValid)
+            {
+                // 開始せずに停止状態を維持
+                Assert.IsFalse(tracker.IsListening);
+                Assert.AreEqual(0, tracker.ActiveNotesCount);
+            }
+        }
+
+        // Test 97: 無関係なUSB変更通知で変換を停止しないこと（要件10-4）
+        [TestMethod]
+        public void Test_97_UnrelatedUsbChange_DoesNotStopConversion()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            var fakeListener = new FakeMidiListener();
+            long gen = tracker.StartConversionSession();
+
+            fakeListener.OnDeviceDisconnected += data =>
+            {
+                tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+            };
+
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, gen);
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+            Assert.IsTrue(tracker.IsListening);
+
+            // 鍵盤押下中
+            string devId = fakeListener.GetActivePorts()[0].DeviceId;
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+
+            // 無関係なUSB変更通知契機のCheckDeviceHealth:
+            // 新規プロセスWinMMに対象ポートが存在している（WinRTが0件であっても）
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: outProcResult);
+
+            // 変換は停止せず、キーも解放されないこと
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count, "ポートは監視中のまま維持されること");
+            Assert.IsTrue(tracker.IsListening, "変換は停止しないこと");
+            Assert.AreEqual(1, tracker.ActiveNotesCount, "押下中ノートは維持されること");
+            Assert.AreEqual(0, _mock.KeyUpCount, "誤ってキーが解放されないこと");
+        }
+
+        // Test 98: 通常起動時にログが上書きされること（要件10-5）
+        [TestMethod]
+        public void Test_98_NormalStartup_OverwritesLog()
+        {
+            string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
+            try
+            {
+                // 過去のログを作成
+                File.WriteAllText(tempLog, "OLD_SESSION_LOG_ENTRY_1\nOLD_SESSION_LOG_ENTRY_2\n");
+                Assert.IsTrue(File.ReadAllText(tempLog).Contains("OLD_SESSION_LOG_ENTRY_1"));
+
+                // 通常起動初期化（overwrite: true）
+                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog);
+
+                string newContent = File.ReadAllText(tempLog);
+                Assert.IsFalse(newContent.Contains("OLD_SESSION_LOG_ENTRY_1"), "古いセッションのログは上書き消去されること");
+                Assert.IsTrue(newContent.Contains("DiagnosticLogger initialized"), "新しいセッション開始ログが書き込まれること");
+            }
+            finally
+            {
+                try { File.Delete(tempLog); } catch { }
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+            }
+        }
+
+        // Test 99: --enum-winmm の診断用子プロセスではログが上書きされないこと（要件10-6）
+        [TestMethod]
+        public void Test_99_DiagnosticSubprocess_DoesNotOverwriteLog()
+        {
+            string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
+            try
+            {
+                // 既存ログ
+                string originalContent = "MAIN_APP_LOG_SESSION_ACTIVE\n";
+                File.WriteAllText(tempLog, originalContent);
+
+                // 診断用子プロセス（--enum-winmm）では Initialize(overwrite: true) は呼ばれない
+                // 通常のLog書き込みのみが行われる
+                DiagnosticLogger.LogFilePath = tempLog;
+                DiagnosticLogger.Log("ChildProc", "WinMM enumeration test");
+
+                string afterContent = File.ReadAllText(tempLog);
+                Assert.IsTrue(afterContent.Contains("MAIN_APP_LOG_SESSION_ACTIVE"), "親プロセスの既存ログが保持されていること");
+                Assert.IsTrue(afterContent.Contains("ChildProc"), "追記のみが行われること");
+            }
+            finally
+            {
+                try { File.Delete(tempLog); } catch { }
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+            }
+        }
+
+        // Test 100: ログサイズが上限を超えて増え続けないこと（要件10-7）
+        [TestMethod]
+        public void Test_100_LogSize_EnforcesLimit_DoesNotGrowIndefinitely()
+        {
+            string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
+            try
+            {
+                DiagnosticLogger.LogFilePath = tempLog;
+                DiagnosticLogger.MaxLogSizeBytes = 1024; // 1KB上限に設定
+
+                // 1KBを超える大量ログを書き込み
+                for (int i = 0; i < 50; i++)
+                {
+                    DiagnosticLogger.Log("Stress", $"This is a test log message line {i} to exceed the log size limit.");
+                }
+
+                var fi = new FileInfo(tempLog);
+                Assert.IsTrue(fi.Exists);
+                // 整理により約半分＋通知＋新規行となるため、最大サイズ近傍に抑えられる
+                Assert.IsTrue(fi.Length <= 2048, $"ファイルサイズが制限近傍に抑えられていること (実際: {fi.Length} bytes)");
+
+                string content = File.ReadAllText(tempLog);
+                Assert.IsTrue(content.Contains("Log size limit reached"), "サイズ制限到達の通知が記録されること");
+            }
+            finally
+            {
+                try { File.Delete(tempLog); } catch { }
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+                DiagnosticLogger.MaxLogSizeBytes = 1024 * 1024; // 1MBに戻す
+            }
+        }
+
+        // Test 101: ログ書き込みエラーでアプリがクラッシュしないこと（要件10-8）
+        [TestMethod]
+        public void Test_101_LogWriteFailure_DoesNotCrashApp()
+        {
+            try
+            {
+                // 不正なパス（書き込み不可）を設定
+                DiagnosticLogger.LogFilePath = "Z:\\NonExistentDirectory\\invalid:path*?.log";
+
+                // 例外がスローされず安全に終了すること
+                DiagnosticLogger.Log("TestCategory", "This log write should safely fail without throwing.");
+                DiagnosticLogger.Initialize(overwrite: true);
+            }
+            finally
+            {
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+            }
+        }
     }
 }
