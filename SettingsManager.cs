@@ -43,13 +43,17 @@ namespace MidiToKeyApp
     public static class SettingsManager
     {
         /// <summary>
-        /// 指定されたパスから設定を読み込みます。ファイルがない場合はデフォルト値を返します。
+        /// 指定されたパスから設定を読み込みます。
+        /// ファイルが存在しない場合は初回起動用のデフォルト設定を返し、破損している場合は例外をスローします。
         /// </summary>
         /// <param name="path">設定ファイル(settings.json)のファイルパス</param>
         /// <returns>読み込まれた設定データを含むAppSettingsオブジェクト</returns>
+        /// <exception cref="FileNotFoundException">ファイルが見つからない場合</exception>
+        /// <exception cref="JsonException">JSON形式が不正な場合</exception>
+        /// <exception cref="InvalidDataException">データが空または無効な場合</exception>
         public static AppSettings Load(string path)
         {
-            // 設定ファイルが存在しない場合、初回起動時用のデフォルト設定を生成して返す
+            // 設定ファイルが存在しない場合のみ、初回起動用デフォルト設定を生成して返す
             if (!File.Exists(path))
             {
                 var defaultSettings = new AppSettings();
@@ -63,19 +67,15 @@ namespace MidiToKeyApp
                 return defaultSettings;
             }
 
-            try
+            // ファイルが存在する場合は厳格に読み込み・解析を実行
+            string json = File.ReadAllText(path);
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var settings = JsonSerializer.Deserialize<AppSettings>(json, options);
+            if (settings == null)
             {
-                // JSONファイルから文字列を読み込み、オブジェクトに変換する
-                string json = File.ReadAllText(path);
-                var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                var settings = JsonSerializer.Deserialize<AppSettings>(json, options);
-                return settings ?? new AppSettings();
+                throw new InvalidDataException("設定ファイルのJSON解析結果が無効または空です。");
             }
-            catch
-            {
-                // 読み込みや解析に失敗した場合は、空の初期設定を安全に返す
-                return new AppSettings();
-            }
+            return settings;
         }
 
         /// <summary>
@@ -93,7 +93,17 @@ namespace MidiToKeyApp
             };
             
             string json = JsonSerializer.Serialize(settings, options);
-            File.WriteAllText(path, json);
+            AllTextOrAtomicWrite(path, json);
+        }
+
+        private static void AllTextOrAtomicWrite(string path, string content)
+        {
+            string? dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            File.WriteAllText(path, content);
         }
     }
 }

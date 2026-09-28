@@ -14,26 +14,24 @@ namespace MidiToKeyApp
     /// </summary>
     public partial class Form1 : Form
     {
-        private AppSettings settings;
+        private AppSettings settings = null!;
         private string appDir = AppDomain.CurrentDomain.BaseDirectory;
         private string currentSettingsDir = AppDomain.CurrentDomain.BaseDirectory;
         private string currentSettingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
         
-        private CheckedListBox chkPorts;
-        private RadioButton rbJIS;
-        private RadioButton rbUS;
-        private ListView listMapping;
-        private TextBox txtNote;
-        private TextBox txtKey;
-        private Label lblStatus;
+        private CheckedListBox chkPorts = null!;
+        private RadioButton rbJIS = null!;
+        private RadioButton rbUS = null!;
+        private ListView listMapping = null!;
+        private TextBox txtNote = null!;
+        private TextBox txtKey = null!;
+        private Label lblStatus = null!;
         
-        private IKeyboardMouseEvents globalHook;
-        private MidiListener midiListener;
-        private KeySimulator keySimulator;
-        
-        private volatile bool isListening = false;
-        private volatile bool isCapturingNote = false;
-        
+        private IKeyboardMouseEvents? globalHook;
+        private MidiListener midiListener = null!;
+        private KeySimulator keySimulator = null!;
+        private InputTracker inputTracker = null!;
+
         public Form1()
         {
             InitializeComponentProgrammatically();
@@ -43,83 +41,30 @@ namespace MidiToKeyApp
         
         private void SetupDependencies()
         {
-            midiListener = new MidiListener();
             keySimulator = new KeySimulator();
-            midiListener.OnNoteChange += MidiListener_OnNoteChange;
-            midiListener.OnControlChange += MidiListener_OnControlChange;
-        }
+            inputTracker = new InputTracker(keySimulator, () => settings);
+            midiListener = new MidiListener();
 
-        /// <summary>
-        /// コントロールチェンジ（サステインペダル CC 64 など）を受け取った際のイベントハンドラ。
-        /// </summary>
-        private void MidiListener_OnControlChange(int controlNumber, int value)
-        {
-            // CC 64 = ダンパー / サステインペダル
-            if (controlNumber == 64)
-            {
-                bool isDown = value >= 64; // 64以上でペダル踏み込み、64未満で解放
-
-                if (isCapturingNote && isDown)
+            // ノート/ペダル取得（キャプチャモード）時のUI非同期更新（デッドロック防止）
+            inputTracker.OnInputCaptured += (capturedText) => {
+                if (IsHandleCreated && !IsDisposed)
                 {
-                    Invoke((MethodInvoker)delegate {
-                        txtNote.Text = "pedal";
-                    });
-                    return;
-                }
-
-                if (isListening)
-                {
-                    string? mappedKey = null;
-                    lock (settings.MappingLock)
+                    try
                     {
-                        if (settings.Mapping.TryGetValue("pedal", out var key))
-                        {
-                            mappedKey = key;
-                        }
+                        BeginInvoke(new Action(() => {
+                            if (!IsDisposed)
+                            {
+                                txtNote.Text = capturedText;
+                            }
+                        }));
                     }
-
-                    if (mappedKey != null)
-                    {
-                        keySimulator.SendKey(mappedKey, isDown, settings.KeyboardLayout);
-                    }
+                    catch { }
                 }
-            }
-        }
+            };
 
-        /// <summary>
-        /// MIDIポートから信号(NoteOn / NoteOff)を受け取った際に発火するイベントのハンドラ。
-        /// 設定状況に応じて、テキストボックスへの入力記録か、実際のキー送信かを分岐させます。
-        /// </summary>
-        /// <param name="noteNumber">受信したMIDIノートの番号</param>
-        /// <param name="isDown">押されているか(true)離されているか(false)</param>
-        private void MidiListener_OnNoteChange(int noteNumber, bool isDown)
-        {
-            if (isCapturingNote && isDown)
-            {
-                Invoke((MethodInvoker)delegate {
-                    txtNote.Text = noteNumber.ToString();
-                });
-                return;
-            }
-            
-            if (isListening)
-            {
-                string noteKey = noteNumber.ToString();
-                string? mappedKey = null;
-
-                lock (settings.MappingLock)
-                {
-                    if (settings.Mapping.TryGetValue(noteKey, out var key))
-                    {
-                        mappedKey = key;
-                    }
-                }
-
-                if (mappedKey != null)
-                {
-                    keySimulator.SendKey(mappedKey, isDown, settings.KeyboardLayout);
-                }
-            }
+            // MIDIリスナーのイベントをInputTrackerへ中継
+            midiListener.OnNoteReceived += (data) => inputTracker.ProcessNoteEvent(data, inputTracker.CurrentSessionId);
+            midiListener.OnControlReceived += (data) => inputTracker.ProcessControlEvent(data, inputTracker.CurrentSessionId);
         }
 
         private void LoadInitialSettings()
@@ -156,89 +101,87 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// マッピング辞書の内容をリストボックスに描画します。
+        /// マッピング辞書の内容をリストビュー（3列グリッド）に描画します。
         /// 88鍵盤（21〜108）などのノート番号には対応する音階名（例: C4 / ド）を併記します。
         /// </summary>
         private void RefreshMappingList()
         {
+            if (listMapping == null) return;
             listMapping.Items.Clear();
-            List<KeyValuePair<string, string>> pairs;
+
             lock (settings.MappingLock)
             {
-                pairs = settings.Mapping
-                    .OrderBy(x => x.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase) ? 9999 : (int.TryParse(x.Key, out int n) ? n : 9998))
-                    .ToList();
-            }
-            foreach (var kvp in pairs)
-            {
-                ListViewItem item;
-                if (kvp.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
+                var sortedKeys = settings.Mapping.Keys.OrderBy(k => {
+                    if (k.Equals("pedal", StringComparison.OrdinalIgnoreCase)) return -1;
+                    return int.TryParse(k, out int n) ? n : 999;
+                });
+
+                foreach (var key in sortedKeys)
                 {
-                    item = new ListViewItem("pedal");
-                    item.SubItems.Add("サステイン (CC64)");
-                    item.SubItems.Add(kvp.Value);
+                    string targetKey = settings.Mapping[key];
+                    string typeOrNoteName;
+
+                    if (key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
+                    {
+                        typeOrNoteName = "サステインペダル";
+                    }
+                    else if (int.TryParse(key, out int note))
+                    {
+                        typeOrNoteName = MidiNoteHelper.GetNoteDisplayName(note);
+                    }
+                    else
+                    {
+                        typeOrNoteName = "-";
+                    }
+
+                    var item = new ListViewItem(key);
+                    item.SubItems.Add(typeOrNoteName);
+                    item.SubItems.Add(targetKey);
+                    listMapping.Items.Add(item);
                 }
-                else if (int.TryParse(kvp.Key, out int note))
-                {
-                    string noteName = MidiNoteHelper.GetNoteDisplayName(note);
-                    item = new ListViewItem(note.ToString());
-                    item.SubItems.Add(noteName);
-                    item.SubItems.Add(kvp.Value);
-                }
-                else
-                {
-                    item = new ListViewItem(kvp.Key);
-                    item.SubItems.Add("-");
-                    item.SubItems.Add(kvp.Value);
-                }
-                listMapping.Items.Add(item);
             }
         }
-        
-        /// <summary>
-        /// UIコントロール（ボタン、テキストボックス、リスト等の配置とサイズ）をプログラムコード上で手動定義します。
-        /// デザイナを使わずに軽量かつ精緻な配置を実現しており、Pythonのtkinter版と同一のルック＆フィールを提供します。
-        /// </summary>
+
         private void InitializeComponentProgrammatically()
         {
-            var version = typeof(Form1).Assembly.GetName().Version;
-            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.2";
-            this.Text = $"midi2key C#{verStr}";
-            this.Width = 430;
-            this.Height = 555;
-            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.Text = "MIDI to Key Mapper v1.0.2";
+            this.Size = new Size(430, 560);
+            this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
-            this.Font = new Font("Yu Gothic UI", 9);
+            this.StartPosition = FormStartPosition.CenterScreen;
 
-            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 50 };
-            rbUS = new RadioButton { Text = "US", Top = 20, Left = 55, Width = 45 };
-            rbJIS = new RadioButton { Text = "JIS", Top = 20, Left = 10, Width = 45 };
-            rbUS.CheckedChanged += (s, e) => {
-                if (rbUS.Checked) settings.KeyboardLayout = "US";
-            };
-            rbJIS.CheckedChanged += (s, e) => {
-                if (rbJIS.Checked) settings.KeyboardLayout = "JIS";
-            };
-            grpLayout.Controls.Add(rbUS);
-            grpLayout.Controls.Add(rbJIS);
-            this.Controls.Add(grpLayout);
-
-            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 115, Top = 10, Left = 10 };
-            chkPorts = new CheckedListBox { Top = 20, Left = 10, Width = 255, Height = 65, BorderStyle = BorderStyle.None, CheckOnClick = true };
-            chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
-            grpPorts.Controls.Add(chkPorts);
-
-            var lblPortWarn = new Label { Text = "※機器の抜き差し時はアプリを再起動してください", ForeColor = Color.Red, Top = 88, Left = 5, AutoSize = true };
-            grpPorts.Controls.Add(lblPortWarn);
-            this.Controls.Add(grpPorts);
+            var lblPorts = new Label { Text = "🎹 MIDI ポート選択", Top = 10, Left = 10, AutoSize = true };
+            chkPorts = new CheckedListBox { Top = 30, Left = 10, Width = 390, Height = 70 };
             
-            var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
-            listMapping = new ListView 
-            { 
-                Top = 155, 
+            var btnRefresh = new Button { Text = "再読込", Top = 105, Left = 325, Width = 75, Height = 25 };
+            btnRefresh.Click += (s, e) => RefreshPorts();
+
+            this.Controls.Add(lblPorts);
+            this.Controls.Add(chkPorts);
+            this.Controls.Add(btnRefresh);
+
+            var gbLayout = new GroupBox { Text = "⌨ キーボード配列", Top = 100, Left = 10, Width = 200, Height = 45 };
+            rbJIS = new RadioButton { Text = "日本語 (JIS)", Left = 10, Top = 18, AutoSize = true, Checked = true };
+            rbUS = new RadioButton { Text = "英語 (US)", Left = 110, Top = 18, AutoSize = true };
+            
+            rbJIS.CheckedChanged += (s, e) => {
+                if (rbJIS.Checked) UpdateSettingsFromUI();
+            };
+            rbUS.CheckedChanged += (s, e) => {
+                if (rbUS.Checked) UpdateSettingsFromUI();
+            };
+
+            gbLayout.Controls.Add(rbJIS);
+            gbLayout.Controls.Add(rbUS);
+            this.Controls.Add(gbLayout);
+
+            var lblList = new Label { Text = "🗺 マッピング設定一覧", Top = 150, Left = 10, AutoSize = true };
+            
+            listMapping = new ListView { 
+                Top = 170, 
                 Left = 10, 
                 Width = 390, 
-                Height = 135,
+                Height = 120,
                 View = View.Details,
                 FullRowSelect = true,
                 GridLines = true,
@@ -250,21 +193,18 @@ namespace MidiToKeyApp
             listMapping.Columns.Add("音名 / 種類", 145, HorizontalAlignment.Left);
             listMapping.Columns.Add("変換キー", 135, HorizontalAlignment.Left);
 
-            // カラムヘッダーに上品な淡いブルーグレーの背景と境界線、濃紺の太字を設定
+            // カラムヘッダーのカスタム描画（淡いブルーグレー背景・濃紺太字）
             listMapping.DrawColumnHeader += (s, e) => {
                 if (e.Header == null) return;
-                // ヘッダー背景（淡いスレートブルー）
                 using (var bgBrush = new SolidBrush(Color.FromArgb(228, 236, 246)))
                 {
                     e.Graphics.FillRectangle(bgBrush, e.Bounds);
                 }
-                // 区切り線
                 using (var borderPen = new Pen(Color.FromArgb(200, 212, 228)))
                 {
                     e.Graphics.DrawLine(borderPen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
                     e.Graphics.DrawLine(borderPen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
                 }
-                // テキスト描画
                 var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.LeftAndRightPadding;
                 if (e.Header.TextAlign == HorizontalAlignment.Center)
                     flags |= TextFormatFlags.HorizontalCenter;
@@ -290,22 +230,31 @@ namespace MidiToKeyApp
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 300, Left = 10, AutoSize = true };
-            txtNote = new TextBox { Top = 320, Left = 10, Width = 75 };
+            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 295, Left = 10, AutoSize = true };
+            txtNote = new TextBox { Top = 315, Left = 10, Width = 75 };
+            
+            // ノート取得モードと変換モードの分離
             txtNote.Enter += (s, e) => {
-                isCapturingNote = true;
-                midiListener.Start(GetSelectedPorts());
+                inputTracker.SetCapturing(true);
+                // 変換停止中であれば、ノート取得専用にMIDIリスナーを開始
+                if (!inputTracker.IsListening)
+                {
+                    midiListener.Start(GetSelectedPorts());
+                }
             };
             txtNote.Leave += (s, e) => {
-                isCapturingNote = false;
-                if (!isListening) midiListener.Stop();
+                inputTracker.SetCapturing(false);
+                // 変換停止中であれば、専用リスナーを停止。変換実行中なら停止しない！
+                if (!inputTracker.IsListening)
+                {
+                    midiListener.Stop();
+                }
             };
 
-            var lblKey = new Label { Text = "⌨ キー", Top = 300, Left = 95, AutoSize = true };
-            txtKey = new TextBox { Top = 320, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
+            var lblKey = new Label { Text = "⌨ キー", Top = 295, Left = 95, AutoSize = true };
+            txtKey = new TextBox { Top = 315, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
-            // ⑥ キー入力欄の「消去」ボタン
-            var btnClearKey = new Button { Text = "消去", Top = 319, Left = 215, Width = 50, Height = 25 };
+            var btnClearKey = new Button { Text = "消去", Top = 314, Left = 215, Width = 50, Height = 25 };
             btnClearKey.Click += (s, e) => {
                 txtKey.Text = "";
             };
@@ -346,7 +295,6 @@ namespace MidiToKeyApp
                 }
             };
 
-            // ⑤ ノート番号バリデーション（0〜127）および pedal の登録
             var btnAdd = new Button { Text = "追加", Top = 295, Left = 315, Width = 85, Height = 25 };
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
@@ -414,11 +362,11 @@ namespace MidiToKeyApp
             this.Controls.Add(btnAdd);
             this.Controls.Add(btnDel);
 
-            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 360, Left = 10, Width = 390, Height = 2 };
+            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 355, Left = 10, Width = 390, Height = 2 };
             this.Controls.Add(sep);
 
-            // ⑦ 「上書き保存」ボタン
-            var btnSave = new Button { Text = "上書き保存", Top = 375, Left = 10, Width = 85, Height = 28 };
+            // 「上書き保存」ボタン
+            var btnSave = new Button { Text = "上書き保存", Top = 370, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 try
@@ -434,8 +382,8 @@ namespace MidiToKeyApp
                 }
             };
 
-            // ⑦ 「別名保存」ボタン
-            var btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
+            // 「別名保存」ボタン
+            var btnSaveAs = new Button { Text = "別名保存", Top = 370, Left = 105, Width = 85, Height = 28 };
             btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
@@ -446,15 +394,26 @@ namespace MidiToKeyApp
                     sfd.FileName = Path.GetFileName(currentSettingsPath);
                     if (sfd.ShowDialog() == DialogResult.OK)
                     {
-                        currentSettingsPath = sfd.FileName;
-                        currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
-                        SettingsManager.Save(currentSettingsPath, settings);
-                        MessageBox.Show("別名保存が完了しました。\n保存先: " + currentSettingsPath, "保存完了");
+                        string targetPath = sfd.FileName;
+                        try
+                        {
+                            // 候補パスへの保存を先に実行
+                            SettingsManager.Save(targetPath, settings);
+                            // 保存成功後にのみファイルパスを更新
+                            currentSettingsPath = targetPath;
+                            currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
+                            MessageBox.Show("別名保存が完了しました。\n保存先: " + currentSettingsPath, "保存完了");
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show("設定の保存に失敗しました: " + ex.Message, "保存エラー");
+                        }
                     }
                 }
             };
             
-            var btnLoad = new Button { Text = "設定読込", Top = 375, Left = 305, Width = 95, Height = 28 };
+            // 「設定読込」ボタン
+            var btnLoad = new Button { Text = "設定読込", Top = 370, Left = 305, Width = 95, Height = 28 };
             btnLoad.Click += (s, e) => {
                 using (var ofd = new OpenFileDialog())
                 {
@@ -462,15 +421,26 @@ namespace MidiToKeyApp
                     ofd.Filter = "JSONファイル (*.json)|*.json|すべてのファイル (*.*)|*.*";
                     if (ofd.ShowDialog() == DialogResult.OK)
                     {
+                        string targetPath = ofd.FileName;
                         try 
                         {
-                            currentSettingsPath = ofd.FileName;
+                            // 先に解析と検証を実行（失敗時は例外発生で現設定を維持）
+                            var newSettings = SettingsManager.Load(targetPath);
+
+                            // 変換実行中であれば、安全に全キー解放・停止した上で新設定を適用
+                            if (inputTracker.IsListening)
+                            {
+                                StopConversion();
+                            }
+
+                            currentSettingsPath = targetPath;
                             currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
-                            var newSettings = SettingsManager.Load(ofd.FileName);
+
                             lock (settings.MappingLock)
                             {
                                 settings = newSettings;
                             }
+
                             RefreshPorts(true);
                             if (settings.KeyboardLayout == "US") rbUS.Checked = true; else rbJIS.Checked = true;
                             RefreshMappingList();
@@ -478,34 +448,33 @@ namespace MidiToKeyApp
                         }
                         catch (Exception ex)
                         {
-                            MessageBox.Show("ファイルの読み込みに失敗しました: " + ex.Message);
+                            MessageBox.Show("設定ファイルの読み込みに失敗しました:\n" + ex.Message, "読込エラー");
                         }
                     }
                 }
             };
 
-            var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStart = new Button { Text = "変換開始", Top = 410, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => {
+                if (inputTracker.IsListening) return; // 連打防止
+
                 var ports = GetSelectedPorts();
-                if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください"); return; }
+                if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください", "ポート未選択"); return; }
+                
                 UpdateSettingsFromUI();
-                isListening = true;
+                inputTracker.StartSession();
+                midiListener.Start(ports);
+
                 lblStatus.Text = "ステータス: 実行中";
                 lblStatus.ForeColor = Color.Green;
-                midiListener.Start(ports);
             };
 
-            // ① 停止時に押下中のすべてのキーを強制解放（ReleaseAllKeys）
-            var btnStop = new Button { Text = "変換停止", Top = 415, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStop = new Button { Text = "変換停止", Top = 410, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStop.Click += (s, e) => {
-                isListening = false;
-                lblStatus.Text = "ステータス: 停止中";
-                lblStatus.ForeColor = Color.Red;
-                midiListener.Stop();
-                keySimulator.ReleaseAllKeys();
+                StopConversion();
             };
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 465, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 460, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
 
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
@@ -516,43 +485,57 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// ユーザーのキーボード入力をOSレベルで捕獲（フック）し、「キー設定の入力欄」にキー名称を反映させる処理。
-        /// ユーザーが意図した物理キー操作を検知するため、MouseKeyHookライブラリを使用しています。
+        /// 変換処理を安全に停止します。
+        /// デッドロック防止のため、ロック外でMIDIリスナーを停止した上で全キーを解放します。
         /// </summary>
-        private void GlobalHook_KeyDown(object sender, KeyEventArgs e)
+        private void StopConversion()
+        {
+            // (1) 新規キー送信無効化、セッション無効化、全キー解放、内部状態クリア
+            inputTracker.StopSession();
+
+            // (2) ロック外でMIDIリスナーを停止し、受信スレッドの完了を安全に待機
+            midiListener.Stop();
+
+            // (3) UIステータス更新
+            lblStatus.Text = "ステータス: 停止中";
+            lblStatus.ForeColor = Color.Red;
+        }
+
+        /// <summary>
+        /// ユーザーのキーボード入力をOSレベルで捕獲（フック）し、「キー設定の入力欄」にキー名称を反映させる処理。
+        /// </summary>
+        private void GlobalHook_KeyDown(object? sender, KeyEventArgs e)
         {
             bool isUS = false;
             
-            if (IsHandleCreated) {
-                Invoke((MethodInvoker)delegate {
-                    isUS = rbUS.Checked;
-                    string keyName = FormatKey(e, isUS);
-                    
-                    if (keyName != "shift" && keyName != "ctrl" && keyName != "alt")
-                    {
-                        txtKey.Text = keyName;
-                    }
-                    else if (txtKey.Text == "")
-                    {
-                        txtKey.Text = keyName;
-                    }
-                });
+            if (IsHandleCreated && !IsDisposed) {
+                try {
+                    BeginInvoke(new Action(() => {
+                        if (IsDisposed) return;
+                        isUS = rbUS.Checked;
+                        string keyName = FormatKey(e, isUS);
+                        
+                        if (keyName != "shift" && keyName != "ctrl" && keyName != "alt")
+                        {
+                            txtKey.Text = keyName;
+                        }
+                        else if (txtKey.Text == "")
+                        {
+                            txtKey.Text = keyName;
+                        }
+                    }));
+                } catch { }
             }
         }
 
         /// <summary>
-        /// OSレベルの生キー入力イベントデータから、JIS/US配列の違いやShiftキーの押下状態を考慮し、
-        /// "ユーザーが見て直感的にわかる記号や文字（例：'¥' や '|' など）" へ動的に変換します。
+        /// 生キー入力イベントから人間が直感的に理解できるキー名称文字列を生成します。
         /// </summary>
-        /// <param name="e">キャプチャしたキーボードイベント</param>
-        /// <param name="isUS">US配列の場合はtrue、JIS配列の場合はfalse</param>
-        /// <returns>変換された人間が読める文字列フォーマットのキー名</returns>
         private string FormatKey(KeyEventArgs e, bool isUS)
         {
             bool shift = e.Shift;
             int code = (int)e.KeyCode;
             
-            // IME等に吸収されてKeyCodeがNone(0)になる場合のパッチ対策 (MouseKeyHook拡張機能)
             if (code == 0 && e is Gma.System.MouseKeyHook.KeyEventArgsExt ext)
             {
                 if (ext.ScanCode == 41) return "zenkaku_hankaku";
@@ -605,8 +588,8 @@ namespace MidiToKeyApp
                 case (int)Keys.KanjiMode: case 243: case 244: return "zenkaku_hankaku";
                 case (int)Keys.IMEConvert: return "henkan";
                 case (int)Keys.IMENonconvert: return "muhenkan";
-                case 240: return "eisuy";    // Alphanumeric
-                case 242: return "hiragana"; // Katakana/Hiragana/Romaji
+                case 240: return "eisuy";
+                case 242: return "hiragana";
             }
 
             return e.KeyCode.ToString().ToLower();
@@ -617,7 +600,10 @@ namespace MidiToKeyApp
             var ports = new List<string>();
             foreach (var item in chkPorts.CheckedItems)
             {
-                ports.Add(item.ToString());
+                if (item != null)
+                {
+                    ports.Add(item.ToString() ?? "");
+                }
             }
             return ports;
         }
@@ -630,7 +616,7 @@ namespace MidiToKeyApp
         
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            keySimulator?.ReleaseAllKeys(); // 終了時にもキー押しっぱなしを強制解除
+            StopConversion();
             midiListener?.Dispose();
             if (globalHook != null)
             {
@@ -638,25 +624,6 @@ namespace MidiToKeyApp
                 globalHook.Dispose();
             }
             base.OnFormClosing(e);
-        }
-    }
-
-    /// <summary>
-    /// MIDIノート番号（0-127）から音階名（例: C4 / ド、A0 / ラ）への変換を行うヘルパークラス。
-    /// 88鍵盤ピアノ（21[A0]〜108[C8]）の視覚的把握をサポートします。
-    /// </summary>
-    public static class MidiNoteHelper
-    {
-        private static readonly string[] NoteNames = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-        private static readonly string[] KanaNames = { "ド", "ド#", "レ", "レ#", "ミ", "ファ", "ファ#", "ソ", "ソ#", "ラ", "ラ#", "シ" };
-
-        public static string GetNoteDisplayName(int noteNumber)
-        {
-            if (noteNumber < 0 || noteNumber > 127) return noteNumber.ToString();
-            int octave = (noteNumber / 12) - 1; // MIDI規格: Note 60 = C4, Note 21 = A0
-            string name = NoteNames[noteNumber % 12];
-            string kana = KanaNames[noteNumber % 12];
-            return $"{name}{octave} / {kana}";
         }
     }
 }
