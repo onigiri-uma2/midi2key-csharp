@@ -2735,7 +2735,7 @@ namespace MidiToKeyApp.Tests
             Assert.AreEqual(0, _mock.KeyUpCount, "誤ってキーが解放されないこと");
         }
 
-        // Test 98: 通常起動時にログが上書きされること（要件10-5）
+        // Test 98: ログ有効時の起動においてログが上書きされること（要件10-5）
         [TestMethod]
         public void Test_98_NormalStartup_OverwritesLog()
         {
@@ -2746,8 +2746,8 @@ namespace MidiToKeyApp.Tests
                 File.WriteAllText(tempLog, "OLD_SESSION_LOG_ENTRY_1\nOLD_SESSION_LOG_ENTRY_2\n");
                 Assert.IsTrue(File.ReadAllText(tempLog).Contains("OLD_SESSION_LOG_ENTRY_1"));
 
-                // 通常起動初期化（overwrite: true）
-                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog);
+                // ログ有効化での初期化（overwrite: true, enable: true）
+                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog, enable: true);
 
                 string newContent = File.ReadAllText(tempLog);
                 Assert.IsFalse(newContent.Contains("OLD_SESSION_LOG_ENTRY_1"), "古いセッションのログは上書き消去されること");
@@ -2755,6 +2755,7 @@ namespace MidiToKeyApp.Tests
             }
             finally
             {
+                DiagnosticLogger.IsEnabled = false;
                 try { File.Delete(tempLog); } catch { }
                 DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
             }
@@ -2773,6 +2774,7 @@ namespace MidiToKeyApp.Tests
 
                 // 診断用子プロセス（--enum-winmm）では Initialize(overwrite: true) は呼ばれない
                 // 通常のLog書き込みのみが行われる
+                DiagnosticLogger.IsEnabled = true;
                 DiagnosticLogger.LogFilePath = tempLog;
                 DiagnosticLogger.Log("ChildProc", "WinMM enumeration test");
 
@@ -2782,6 +2784,7 @@ namespace MidiToKeyApp.Tests
             }
             finally
             {
+                DiagnosticLogger.IsEnabled = false;
                 try { File.Delete(tempLog); } catch { }
                 DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
             }
@@ -2794,6 +2797,7 @@ namespace MidiToKeyApp.Tests
             string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
             try
             {
+                DiagnosticLogger.IsEnabled = true;
                 DiagnosticLogger.LogFilePath = tempLog;
                 DiagnosticLogger.MaxLogSizeBytes = 1024; // 1KB上限に設定
 
@@ -2813,6 +2817,7 @@ namespace MidiToKeyApp.Tests
             }
             finally
             {
+                DiagnosticLogger.IsEnabled = false;
                 try { File.Delete(tempLog); } catch { }
                 DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
                 DiagnosticLogger.MaxLogSizeBytes = 1024 * 1024; // 1MBに戻す
@@ -2825,6 +2830,7 @@ namespace MidiToKeyApp.Tests
         {
             try
             {
+                DiagnosticLogger.IsEnabled = true;
                 // 不正なパス（書き込み不可）を設定
                 DiagnosticLogger.LogFilePath = "Z:\\NonExistentDirectory\\invalid:path*?.log";
 
@@ -2834,6 +2840,29 @@ namespace MidiToKeyApp.Tests
             }
             finally
             {
+                DiagnosticLogger.IsEnabled = false;
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+            }
+        }
+
+        // Test 102: 普段（IsEnabled=false、引数なし）はログファイルを出力・作成しないこと
+        [TestMethod]
+        public void Test_102_DefaultDisabled_DoesNotCreateLogFile()
+        {
+            string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
+            try
+            {
+                // 初期化時に明示的に無効化（通常起動の挙動）
+                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog, enable: false);
+                DiagnosticLogger.Log("AppStart", "通常起動メッセージ");
+
+                // ファイルが存在しないこと
+                Assert.IsFalse(File.Exists(tempLog), "普段（ログ無効時）はログファイルが作成されないこと");
+            }
+            finally
+            {
+                DiagnosticLogger.IsEnabled = false;
+                try { if (File.Exists(tempLog)) File.Delete(tempLog); } catch { }
                 DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
             }
         }

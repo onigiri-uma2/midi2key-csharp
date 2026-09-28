@@ -13,6 +13,13 @@ namespace MidiToKeyApp
         private static readonly object _lock = new();
         private static string _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
         private static long _maxLogSizeBytes = 1024 * 1024; // 1MB
+        private static bool _isEnabled = false;
+
+        public static bool IsEnabled
+        {
+            get { lock (_lock) return _isEnabled; }
+            set { lock (_lock) _isEnabled = value; }
+        }
 
         public static string LogFilePath
         {
@@ -27,16 +34,27 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// 通常起動時に呼び出し、既存ログファイルを上書き（クリア）して初期化します。
+        /// ログ機能を初期化します。
+        /// 普段は debug_device.log を出力せず、明示的に有効化（--debug 引数等）された場合のみ出力します。
         /// 診断用子プロセス（--enum-winmm）からは呼び出さないでください。
         /// </summary>
-        public static void Initialize(bool overwrite = true, string? customPath = null)
+        public static void Initialize(bool overwrite = true, string? customPath = null, bool? enable = null)
         {
             lock (_lock)
             {
+                if (enable.HasValue)
+                {
+                    _isEnabled = enable.Value;
+                }
+
                 if (!string.IsNullOrEmpty(customPath))
                 {
                     _logFilePath = customPath;
+                }
+
+                if (!_isEnabled)
+                {
+                    return;
                 }
 
                 if (overwrite)
@@ -73,12 +91,21 @@ namespace MidiToKeyApp
         /// <param name="message">ログメッセージ本文</param>
         public static void Log(string category, string message)
         {
+            lock (_lock)
+            {
+                if (!_isEnabled)
+                {
+                    return;
+                }
+            }
+
             string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{category}] {message}";
             try
             {
                 Console.WriteLine(line);
                 lock (_lock)
                 {
+                    if (!_isEnabled) return;
                     EnforceLogSizeLimit();
                     File.AppendAllText(_logFilePath, line + Environment.NewLine);
                 }

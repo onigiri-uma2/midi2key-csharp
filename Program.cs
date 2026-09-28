@@ -22,9 +22,19 @@ namespace MidiToKeyApp
                 return;
             }
 
-            // 2. 通常起動の場合に限り、DiagnosticLoggerを初期化して既存ログを上書き
-            DiagnosticLogger.Initialize(overwrite: true);
-            DiagnosticLogger.Log("AppStart", "midi2key 通常セッションを開始しました。");
+            // 2. 普段はdebug_device.logを出力しない。
+            //    引数で --debug, --log, -d が指定された場合のみログ出力を有効化して上書き初期化する。
+            bool enableDebugLog = args != null && args.Length > 0 && Array.Exists(args, a =>
+                string.Equals(a, "--debug", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(a, "--log", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(a, "-d", StringComparison.OrdinalIgnoreCase)
+            );
+
+            DiagnosticLogger.Initialize(overwrite: true, enable: enableDebugLog);
+            if (enableDebugLog)
+            {
+                DiagnosticLogger.Log("AppStart", "midi2key デバッグログセッションを開始しました。");
+            }
 
             // 3. WinFormsのメイン画面を起動
             ApplicationConfiguration.Initialize();
