@@ -215,9 +215,33 @@ namespace MidiToKeyApp
                 return;
             }
 
-            lblStatus.Text = $"ステータス: 停止中 ({message})";
-            lblStatus.ForeColor = Color.DarkGoldenrod;
+            // 接続警告では実際の変換状態を維持し、安全停止を実行した場合にのみStopConversion等で停止中へ更新される
             MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>
+        /// デバイスの接続変更（新規接続や状態取得失敗）を検知し、必要に応じて集約警告ダイアログを表示します。
+        /// </summary>
+        private void CheckConnectionChangeAndNotify(OutOfProcessWinMmResult outProcResult)
+        {
+            var currentPorts = MidiListener.GetPortNames();
+
+            // 1. 新規プロセスでポートが検出されたが親プロセスに未反映の場合
+            if (outProcResult.Success && outProcResult.Ports.Count > 0 &&
+                (currentPorts.Ports.Count == 0 || outProcResult.Ports.Any(p => !currentPorts.Ports.Contains(p, StringComparer.OrdinalIgnoreCase))))
+            {
+                ShowAggregatedWarning(
+                    "MIDIデバイスの接続を検知しました。利用するにはmidi2keyを再起動してください。",
+                    "MIDIデバイス接続検知");
+            }
+            // 2. 接続状態を確認できない場合（タイムアウトまたは取得失敗）
+            else if (!outProcResult.Success)
+            {
+                ShowAggregatedWarning(
+                    "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。",
+                    "MIDIデバイス状態確認");
+            }
+            // 3. 無関係なUSB機器の変更等（ポート変化なし）: 警告を表示しない
         }
 
         private void RefreshPorts(bool isInitialLoad = false)
@@ -793,13 +817,6 @@ namespace MidiToKeyApp
                                 BeginInvoke(new Action(() => {
                                     if (IsDisposed) return;
 
-                                    // 要件5: Generation検証（セッションが変わっているか停止していれば古い結果を破棄）
-                                    if (triggerGen != inputTracker.CurrentSessionId || !inputTracker.IsListening)
-                                    {
-                                        DiagnosticLogger.Log($"[DebounceTimer] Ignored outdated health check result: TriggerGen={triggerGen}, CurrentGen={inputTracker.CurrentSessionId}, IsListening={inputTracker.IsListening}");
-                                        return;
-                                    }
-
                                     // 要件5: 同一セッション内での古い列挙結果の後着上書き防止
                                     if (requestId < _latestCompletedHealthCheckRequestId)
                                     {
@@ -808,33 +825,35 @@ namespace MidiToKeyApp
                                     }
                                     _latestCompletedHealthCheckRequestId = requestId;
 
-                                    var beforeActive = midiListener.GetActivePorts();
-                                    midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
-                                    var afterActive = midiListener.GetActivePorts();
-                                    RefreshPorts(false);
-
-                                    // 監視中デバイスの切断は HandleDeviceDisconnected で通知される。
-                                    // 切断が発生しなかった場合の接続変更判定:
-                                    if (beforeActive.Count == afterActive.Count)
+                                    if (inputTracker.IsListening)
                                     {
-                                        var currentPorts = MidiListener.GetPortNames();
+                                        // 変換実行中:
+                                        // Generation検証（タイマー発火時からセッションが変わっていればリスナーのヘルスチェックはスキップ）
+                                        if (triggerGen != inputTracker.CurrentSessionId)
+                                        {
+                                            DiagnosticLogger.Log($"[DebounceTimer] Ignored outdated session health check: TriggerGen={triggerGen}, CurrentGen={inputTracker.CurrentSessionId}");
+                                            RefreshPorts(false);
+                                            return;
+                                        }
 
-                                        // 1. 新規プロセスでポートが検出されたが親プロセスに未反映の場合
-                                        if (outProcResult.Success && outProcResult.Ports.Count > 0 &&
-                                            (currentPorts.Ports.Count == 0 || outProcResult.Ports.Any(p => !currentPorts.Ports.Contains(p, StringComparer.OrdinalIgnoreCase))))
+                                        var beforeActive = midiListener.GetActivePorts();
+                                        midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
+                                        var afterActive = midiListener.GetActivePorts();
+                                        RefreshPorts(false);
+
+                                        // 監視中デバイスの切断は HandleDeviceDisconnected で通知される。
+                                        // 切断が発生しなかった場合の接続変更判定:
+                                        if (beforeActive.Count == afterActive.Count)
                                         {
-                                            ShowAggregatedWarning(
-                                                "MIDIデバイスの接続を検知しました。利用するにはmidi2keyを再起動してください。",
-                                                "MIDIデバイス接続検知");
+                                            CheckConnectionChangeAndNotify(outProcResult);
                                         }
-                                        // 2. 接続状態を確認できない場合（タイムアウトまたは取得失敗）
-                                        else if (!outProcResult.Success)
-                                        {
-                                            ShowAggregatedWarning(
-                                                "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。",
-                                                "MIDIデバイス状態確認");
-                                        }
-                                        // 3. 無関係なUSB機器の変更等（ポート変化なし）: 警告を表示しない
+                                    }
+                                    else
+                                    {
+                                        // ① 変換停止中:
+                                        // リスナー監視はないためCheckDeviceHealthは不要だが、ポート一覧更新と接続変更（再起動案内）を実行する
+                                        RefreshPorts(false);
+                                        CheckConnectionChangeAndNotify(outProcResult);
                                     }
                                 }));
                             }
