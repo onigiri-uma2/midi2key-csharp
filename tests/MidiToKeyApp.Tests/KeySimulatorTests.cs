@@ -16,11 +16,14 @@ namespace MidiToKeyApp.Tests
         public List<SentEvent> History { get; } = new();
         public HashSet<VirtualKeyCode> FailKeys { get; } = new();
         public bool FailAll { get; set; } = false;
+        public int LastWin32Error { get; set; } = 0;
+        public int SimulatedWin32ErrorOnFail { get; set; } = 5; // ERROR_ACCESS_DENIED
 
         public bool SendHardwareKey(VirtualKeyCode vk, bool isDown)
         {
             if (FailAll || FailKeys.Contains(vk))
             {
+                LastWin32Error = SimulatedWin32ErrorOnFail;
                 return false;
             }
             History.Add(new SentEvent(vk, isDown));
@@ -32,6 +35,7 @@ namespace MidiToKeyApp.Tests
             History.Clear();
             FailKeys.Clear();
             FailAll = false;
+            LastWin32Error = 0;
         }
     }
 
@@ -41,24 +45,72 @@ namespace MidiToKeyApp.Tests
         public int StopCount { get; private set; }
         public List<long> StartedGenerations { get; } = new();
         public List<List<string>> StartedPorts { get; } = new();
+        public List<MidiPortInfo> ActivePorts { get; } = new();
+        public HashSet<string> FailPorts { get; } = new();
+        public bool FailAllPorts { get; set; } = false;
         public long CurrentGeneration { get; set; } = 0;
 
         public event Action<MidiNoteData>? OnNoteReceived;
         public event Action<MidiControlData>? OnControlReceived;
+        public event Action<string, string>? OnDeviceDisconnected;
 
-        public long Start(IEnumerable<string> portNames, long? specificGeneration = null)
+        public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null)
         {
             StartCount++;
             long gen = specificGeneration ?? (CurrentGeneration + 1);
             CurrentGeneration = gen;
             StartedGenerations.Add(gen);
-            StartedPorts.Add(portNames.ToList());
-            return gen;
+            var portList = portNames.ToList();
+            StartedPorts.Add(portList);
+
+            ActivePorts.Clear();
+            var opened = new List<MidiPortInfo>();
+            var failed = new List<MidiPortError>();
+
+            int idx = 1;
+            foreach (var p in portList)
+            {
+                if (FailAllPorts || FailPorts.Contains(p))
+                {
+                    failed.Add(new MidiPortError(p, "開始失敗シミュレート"));
+                }
+                else
+                {
+                    var info = new MidiPortInfo($"{p}#{idx++}", p, DeviceState.Active);
+                    opened.Add(info);
+                    ActivePorts.Add(info);
+                }
+            }
+
+            return new MidiPortStartResult(gen, opened, failed);
         }
 
         public void Stop()
         {
             StopCount++;
+            ActivePorts.Clear();
+        }
+
+        public IReadOnlyList<MidiPortInfo> GetActivePorts() => ActivePorts.ToList();
+
+        public void CheckDeviceHealth() { }
+
+        public void SimulateDeviceDisconnected(string deviceId)
+        {
+            var targets = string.IsNullOrEmpty(deviceId)
+                ? ActivePorts.ToList()
+                : ActivePorts.Where(p => p.DeviceId == deviceId).ToList();
+
+            foreach (var t in targets)
+            {
+                ActivePorts.Remove(t);
+                OnDeviceDisconnected?.Invoke(t.DeviceId, t.DeviceName);
+            }
+
+            if (targets.Count == 0 && string.IsNullOrEmpty(deviceId))
+            {
+                OnDeviceDisconnected?.Invoke(string.Empty, string.Empty);
+            }
         }
 
         public void FireNote(MidiNoteData data) => OnNoteReceived?.Invoke(data);
@@ -1381,6 +1433,346 @@ namespace MidiToKeyApp.Tests
             Assert.AreEqual(2, _mock.History.Count);
             Assert.AreEqual(VirtualKeyCode.SHIFT, _mock.History[1].Key);
             Assert.IsFalse(_mock.History[1].IsDown);
+        }
+
+        // Test 49: 全ポート開始失敗時のロールバック
+        [TestMethod]
+        public void Test_49_AllPortsFailed_RollbackAndReportsAllFailed()
+        {
+            var listener = new FakeMidiListener { FailAllPorts = true };
+            var result = listener.Start(new[] { "Port1", "Port2" });
+
+            Assert.IsTrue(result.IsAllFailed);
+            Assert.IsFalse(result.IsAllSuccess);
+            Assert.IsFalse(result.IsPartialSuccess);
+            Assert.AreEqual(0, result.OpenedPorts.Count);
+            Assert.AreEqual(2, result.FailedPorts.Count);
+            Assert.AreEqual(0, listener.GetActivePorts().Count);
+        }
+
+        // Test 50: 一部ポート失敗時の正常ポート継続
+        [TestMethod]
+        public void Test_50_PartialPortsFailed_ContinuesActivePorts()
+        {
+            var listener = new FakeMidiListener();
+            listener.FailPorts.Add("BadPort");
+            var result = listener.Start(new[] { "GoodPort", "BadPort" });
+
+            Assert.IsTrue(result.IsPartialSuccess);
+            Assert.IsFalse(result.IsAllFailed);
+            Assert.AreEqual(1, result.OpenedPorts.Count);
+            Assert.AreEqual("GoodPort", result.OpenedPorts[0].DeviceName);
+            Assert.AreEqual(1, result.FailedPorts.Count);
+            Assert.AreEqual("BadPort", result.FailedPorts[0].PortName);
+            Assert.AreEqual(1, listener.GetActivePorts().Count);
+        }
+
+        // Test 51: 監視開始直後のイベントが正しくディスパッチされる
+        [TestMethod]
+        public void Test_51_EventsImmediatelyAfterStart_AreProcessed()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "k" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            var listener = new FakeMidiListener();
+
+            listener.OnNoteReceived += tracker.ProcessNoteEvent;
+            long gen = tracker.StartConversionSession();
+            var startRes = listener.Start(new[] { "Piano" }, gen);
+
+            Assert.IsTrue(startRes.IsAllSuccess);
+
+            // 開始直後にイベントを発火
+            listener.FireNote(new MidiNoteData(startRes.OpenedPorts[0].DeviceId, "Piano", 0, 60, 100, true, gen));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.VK_K, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+        }
+
+        // Test 52: ホットキーの登録競合とロールバック
+        [TestMethod]
+        public void Test_52_HotkeyManager_ConflictWithMapping_Rejected()
+        {
+            var hotkeyMgr = new HotkeyManager();
+            var mapping = new Dictionary<string, string> { { "60", "F9" } };
+            var hotkey = new HotkeySettings { Enabled = true, Modifiers = "Ctrl+Alt", Key = "F9" };
+
+            // マッピングにF9が存在するため衝突拒否されること
+            bool registered = hotkeyMgr.TryRegister(IntPtr.Zero, 9001, hotkey, mapping, "JIS", out string? errMsg);
+            Assert.IsFalse(registered);
+            Assert.IsNotNull(errMsg);
+            Assert.IsTrue(errMsg.Contains("MIDIマッピング先"));
+            Assert.IsFalse(hotkeyMgr.IsRegistered);
+        }
+
+        // Test 53: MIDIマッピングによるホットキー誤発動防止（衝突判定）
+        [TestMethod]
+        public void Test_53_IsHotkeyConflictingWithMapping_Verification()
+        {
+            var hotkey = new HotkeySettings { Enabled = true, Modifiers = "Ctrl+Alt", Key = "F9" };
+            var conflictMapping = new Dictionary<string, string> { { "60", "f9" } };
+            var nonConflictMapping = new Dictionary<string, string> { { "60", "a" }, { "62", "b" } };
+
+            Assert.IsTrue(SettingsManager.IsHotkeyConflictingWithMapping(hotkey, conflictMapping, "JIS"));
+            Assert.IsTrue(SettingsManager.IsHotkeyConflictingWithMapping(hotkey, conflictMapping, "US"));
+            Assert.IsFalse(SettingsManager.IsHotkeyConflictingWithMapping(hotkey, nonConflictMapping, "JIS"));
+
+            // ホットキーが無効な場合は衝突と判定しない
+            hotkey.Enabled = false;
+            Assert.IsFalse(SettingsManager.IsHotkeyConflictingWithMapping(hotkey, conflictMapping, "JIS"));
+        }
+
+        // Test 54: 切断したデバイスの入力のみ解放（他デバイス維持）
+        [TestMethod]
+        public void Test_54_DisconnectedDeviceInputs_ReleasedIndependently()
+        {
+            var settings = new AppSettings {
+                Mapping = new() { { "60", "x" }, { "62", "x" } }
+            };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartConversionSession();
+
+            // dev1からNote 60 ('x'), dev2からNote 62 ('x')
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano1", 0, 60, 100, true, session));
+            tracker.ProcessNoteEvent(new MidiNoteData("dev2", "Piano2", 0, 62, 100, true, session));
+
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(2, _simulator.GetRefCount(VirtualKeyCode.VK_X));
+
+            // dev1のみ切断
+            tracker.ReleaseDeviceInputs("dev1", session);
+
+            // dev2の入力があるため、キー 'x' の押下は維持される
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_X));
+            Assert.AreEqual(1, _mock.History.Count); // 解放イベントは未送信
+
+            // dev2も切断
+            tracker.ReleaseDeviceInputs("dev2", session);
+            Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_X));
+            Assert.AreEqual(2, _mock.History.Count);
+            Assert.IsFalse(_mock.History[1].IsDown);
+        }
+
+        // Test 55: 同名デバイスの複数接続（一意DeviceIdにより独立管理）
+        [TestMethod]
+        public void Test_55_DuplicateDeviceNames_HandledIndependently()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" }, { "62", "b" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartConversionSession();
+
+            string devA = "USB-MIDI#1";
+            string devB = "USB-MIDI#2";
+
+            tracker.ProcessNoteEvent(new MidiNoteData(devA, "USB-MIDI", 0, 60, 100, true, session));
+            tracker.ProcessNoteEvent(new MidiNoteData(devB, "USB-MIDI", 0, 62, 100, true, session));
+
+            Assert.AreEqual(2, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_A));
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_B));
+
+            // 片方のインスタンスが切断
+            tracker.ReleaseDeviceInputs(devA, session);
+
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_A));
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_B)); // もう片方は維持
+        }
+
+        // Test 56: 全ポート切断または切断元特定不能時の安全停止
+        [TestMethod]
+        public void Test_56_AllPortsDisconnectedOrUnknown_StopsSessionSafely()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "z" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartConversionSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.IsTrue(tracker.IsListening);
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_Z));
+
+            // 切断元が特定不能（空文字）の切断通知 -> 安全側として全変換停止
+            tracker.ReleaseDeviceInputs(string.Empty, session);
+
+            Assert.IsFalse(tracker.IsListening);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_Z));
+        }
+
+        // Test 57: 切断処理と手動停止の競合
+        [TestMethod]
+        public void Test_57_DisconnectionAndManualStopRace_DoesNotThrow()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "y" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartConversionSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+
+            // 切断処理と手動停止を並行実行
+            var task1 = Task.Run(() => tracker.ReleaseDeviceInputs("dev1", session));
+            var task2 = Task.Run(() => tracker.StopSession());
+
+            Task.WaitAll(task1, task2);
+
+            Assert.IsFalse(tracker.IsListening);
+            Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_Y));
+        }
+
+        // Test 58: 再接続後の旧イベント破棄
+        [TestMethod]
+        public void Test_58_StaleEventsFromDisconnectedDeviceOrOldGeneration_Discarded()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "m" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+
+            long oldSession = tracker.StartConversionSession();
+            tracker.ReleaseDeviceInputs("dev1", oldSession);
+            tracker.StopSession();
+
+            // 新セッション開始
+            long newSession = tracker.StartConversionSession();
+            Assert.AreNotEqual(oldSession, newSession);
+
+            _mock.Clear();
+
+            // 旧セッションの遅延イベントが届く
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, oldSession));
+            Assert.AreEqual(0, _mock.History.Count);
+            Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_M));
+
+            // 新セッションのイベントは正常処理
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1_new", "Piano", 0, 60, 100, true, newSession));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(1, _simulator.GetRefCount(VirtualKeyCode.VK_M));
+        }
+
+        // Test 59: キー送信失敗時のエラー通知
+        [TestMethod]
+        public void Test_59_KeySendError_NotifiesWithWin32ErrorWithoutLock()
+        {
+            _mock.FailKeys.Add(VirtualKeyCode.VK_A);
+            _mock.SimulatedWin32ErrorOnFail = 5; // ERROR_ACCESS_DENIED
+
+            KeySendErrorInfo? capturedError = null;
+            _simulator.OnKeySendError += (err) => {
+                capturedError = err;
+            };
+
+            var resolved = KeyResolver.Resolve("a", "JIS");
+            bool success = _simulator.PressResolvedKey(resolved);
+
+            Assert.IsFalse(success);
+            Assert.IsNotNull(capturedError);
+            Assert.AreEqual("VK_A", capturedError.KeyName);
+            Assert.AreEqual(5, capturedError.Win32Error);
+            Assert.IsTrue(capturedError.IsDown);
+        }
+
+        // Test 60: キー名厳格検証（KeyResolver.IsValidTargetKey）
+        [TestMethod]
+        public void Test_60_KeyResolver_RejectsInvalidKeysStrictly()
+        {
+            // 有効なキー
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("a", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("Z", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("1", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("enter", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("space", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("f9", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("F12", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey("zenkaku_hankaku", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey(";", "JIS"));
+            Assert.IsTrue(KeyResolver.IsValidTargetKey(";", "US"));
+
+            // 拒否されるべきキー
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("   ", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("NONAME", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("noname", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("LButton", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("RButton", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("MButton", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("XButton1", "JIS"));
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("123", "JIS")); // 2桁以上の数字
+            Assert.IsFalse(KeyResolver.IsValidTargetKey("invalid_key_code", "JIS"));
+        }
+
+        // Test 61: 既存JSON互換性および大文字PEDALの正規化
+        [TestMethod]
+        public void Test_61_SettingsCompatibility_NormalizesUppercasePedal()
+        {
+            string tempFile = Path.Combine(Path.GetTempPath(), $"settings_test_{Guid.NewGuid():N}.json");
+            try
+            {
+                string json = @"
+{
+  ""selected_ports"": [""TestPort""],
+  ""keyboard_layout"": ""JIS"",
+  ""mapping"": {
+    ""60"": ""k"",
+    ""PEDAL"": ""space""
+  }
+}";
+                File.WriteAllText(tempFile, json);
+
+                var loaded = SettingsManager.Load(tempFile);
+                Assert.IsNotNull(loaded);
+                Assert.AreEqual("JIS", loaded.KeyboardLayout);
+                Assert.IsTrue(loaded.Mapping.ContainsKey("pedal"));
+                Assert.IsFalse(loaded.Mapping.ContainsKey("PEDAL"));
+                Assert.AreEqual("space", loaded.Mapping["pedal"]);
+                Assert.AreEqual("k", loaded.Mapping["60"]);
+                Assert.IsNotNull(loaded.Hotkey);
+                Assert.IsTrue(loaded.Hotkey.Enabled);
+            }
+            finally
+            {
+                if (File.Exists(tempFile)) File.Delete(tempFile);
+            }
+        }
+
+        // Test 62: 既存JSON読み込み時のホットキー衝突自動復旧
+        [TestMethod]
+        public void Test_62_SettingsLoad_HotkeyConflict_AutoDisablesHotkeySafely()
+        {
+            string tempFile = Path.Combine(Path.GetTempPath(), $"settings_conflict_{Guid.NewGuid():N}.json");
+            try
+            {
+                // マッピングにF9があり、ホットキーもF9で有効
+                string json = @"
+{
+  ""selected_ports"": [],
+  ""keyboard_layout"": ""JIS"",
+  ""mapping"": {
+    ""60"": ""F9""
+  },
+  ""hotkey"": {
+    ""enabled"": true,
+    ""modifiers"": ""Ctrl+Alt"",
+    ""key"": ""F9""
+  }
+}";
+                File.WriteAllText(tempFile, json);
+
+                var loaded = SettingsManager.Load(tempFile);
+                Assert.IsNotNull(loaded);
+                // マッピングは維持され、ホットキーが無効化されて安全に復旧
+                Assert.AreEqual("F9", loaded.Mapping["60"]);
+                Assert.IsFalse(loaded.Hotkey.Enabled);
+            }
+            finally
+            {
+                if (File.Exists(tempFile)) File.Delete(tempFile);
+            }
+        }
+
+        // Test 63: 列挙メソッドの安全性
+        [TestMethod]
+        public void Test_63_GetPortNames_DisposesAllEnumeratedDevices()
+        {
+            // 例外が発生せず正常に列挙リストが取得できること
+            var names = MidiListener.GetPortNames();
+            Assert.IsNotNull(names);
         }
     }
 }

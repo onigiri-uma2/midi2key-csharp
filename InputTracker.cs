@@ -351,6 +351,72 @@ namespace MidiToKeyApp
             }
         }
 
+        /// <summary>
+        /// 指定されたデバイスが切断された際に、そのデバイスに属する入力状態（ノート、ペダル、キャプチャ抑止）のみを解放・整理します。
+        /// 他の正常なデバイスの入力状態および参照カウントは維持されます。
+        /// deviceIdが空または特定できない場合は、安全側としてセッション全体を停止します。
+        /// </summary>
+        public void ReleaseDeviceInputs(string deviceId, long generation)
+        {
+            if (generation != Interlocked.Read(ref _currentSessionId))
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(deviceId))
+            {
+                // 切断元を特定できない場合は安全側として全セッション停止
+                StopSession();
+                return;
+            }
+
+            List<ResolvedKey> keysToRelease = new();
+
+            lock (_stateLock)
+            {
+                if (generation != Interlocked.Read(ref _currentSessionId)) return;
+
+                // 1. 切断デバイスのノート入力を抽出・削除
+                var deviceNotes = new List<MidiSourceKey>();
+                foreach (var kvp in _activeNotes)
+                {
+                    if (kvp.Key.DeviceId == deviceId)
+                    {
+                        deviceNotes.Add(kvp.Key);
+                        keysToRelease.Add(kvp.Value);
+                    }
+                }
+
+                foreach (var k in deviceNotes)
+                {
+                    _activeNotes.Remove(k);
+                }
+
+                // 2. 切断デバイスのペダル状態を削除
+                var pedalKeys = new List<string>();
+                foreach (var pk in _pedalStates.Keys)
+                {
+                    if (pk.StartsWith(deviceId + ":", StringComparison.Ordinal))
+                    {
+                        pedalKeys.Add(pk);
+                    }
+                }
+                foreach (var pk in pedalKeys)
+                {
+                    _pedalStates.Remove(pk);
+                }
+
+                // 3. 切断デバイスのキャプチャ抑止状態を削除
+                _suppressedSources.RemoveWhere(s => s.DeviceId == deviceId);
+            }
+
+            // ロック外でキーシミュレータのキー解放を実行（他デバイスと競合しているキーは参照カウントにより押下維持される）
+            foreach (var rk in keysToRelease)
+            {
+                _keySimulator.ReleaseResolvedKey(rk);
+            }
+        }
+
         public bool IsNoteActive(MidiSourceKey key)
         {
             lock (_stateLock) return _activeNotes.ContainsKey(key);

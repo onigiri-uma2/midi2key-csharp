@@ -27,12 +27,22 @@ namespace MidiToKeyApp
         private TextBox txtNote = null!;
         private TextBox txtKey = null!;
         private Label lblStatus = null!;
+        private Label lblHotkeyInfo = null!;
+        private Button btnHotkeyConfig = null!;
         private Button btnSaveAs = null!;
         
         private IKeyboardMouseEvents? globalHook;
         private IMidiListener midiListener = null!;
         private KeySimulator keySimulator = null!;
         private InputTracker inputTracker = null!;
+        private readonly HotkeyManager hotkeyManager = new();
+        private System.Windows.Forms.Timer? deviceDebounceTimer;
+
+        // キー送信エラーの通知集約用
+        private int lastReportedErrorCode = 0;
+        private uint lastReportedVkCode = 0;
+        private DateTime lastReportedErrorTime = DateTime.MinValue;
+        private int errorRepeatCount = 0;
 
         public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null)
         {
@@ -67,6 +77,36 @@ namespace MidiToKeyApp
             // イベント自身に保持されたGenerationを検証して処理
             midiListener.OnNoteReceived += (data) => inputTracker.ProcessNoteEvent(data);
             midiListener.OnControlReceived += (data) => inputTracker.ProcessControlEvent(data);
+
+            // デバイス切断イベントの処理
+            midiListener.OnDeviceDisconnected += (deviceId, deviceName) => {
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    try
+                    {
+                        BeginInvoke(new Action(() => {
+                            if (IsDisposed) return;
+                            HandleDeviceDisconnected(deviceId, deviceName);
+                        }));
+                    }
+                    catch { }
+                }
+            };
+
+            // キー送信エラーのUI集約通知（ロック外で呼ばれる）
+            keySimulator.OnKeySendError += (errorInfo) => {
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    try
+                    {
+                        BeginInvoke(new Action(() => {
+                            if (IsDisposed) return;
+                            HandleKeySendError(errorInfo);
+                        }));
+                    }
+                    catch { }
+                }
+            };
         }
 
         private void LoadInitialSettings()
@@ -100,6 +140,7 @@ namespace MidiToKeyApp
                 rbJIS.Checked = true;
 
             RefreshMappingList();
+            UpdateHotkeyUi();
         }
 
         private void RefreshPorts(bool isInitialLoad = false)
@@ -162,15 +203,15 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// UIコントロールの生成と配置（コミット 6a0af51 のデザインを完全復元）。
+        /// UIコントロールの生成と配置。
         /// </summary>
         private void InitializeComponentProgrammatically()
         {
             var version = typeof(Form1).Assembly.GetName().Version;
-            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.2";
+            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.3";
             this.Text = $"midi2key C#{verStr}";
             this.Width = 430;
-            this.Height = 555;
+            this.Height = 585;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -194,7 +235,7 @@ namespace MidiToKeyApp
             chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
             grpPorts.Controls.Add(chkPorts);
 
-            var lblPortWarn = new Label { Text = "※機器の抜き差し時はアプリを再起動してください", ForeColor = Color.Red, Top = 88, Left = 5, AutoSize = true };
+            var lblPortWarn = new Label { Text = "※機器の抜き差し時は自動検知または再起動してください", ForeColor = Color.DarkSlateGray, Top = 88, Left = 5, AutoSize = true };
             grpPorts.Controls.Add(lblPortWarn);
             this.Controls.Add(grpPorts);
 
@@ -329,7 +370,7 @@ namespace MidiToKeyApp
                 }
             };
 
-            // ノート番号バリデーション（0〜127）および pedal の登録
+            // ノート番号バリデーション（0〜127）、pedal の登録、およびキー厳格検証
             var btnAdd = new Button { Text = "追加", Top = 295, Left = 315, Width = 85, Height = 25 };
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
@@ -344,6 +385,33 @@ namespace MidiToKeyApp
                 {
                     MessageBox.Show("割り当てるキーを設定してください。", "入力エラー");
                     return;
+                }
+
+                // 変換先キーの厳格な検証
+                if (!KeyResolver.IsValidTargetKey(keyInput, settings.KeyboardLayout))
+                {
+                    MessageBox.Show(
+                        $"指定された変換先キー '{keyInput}' は無効またはサポートされていません。\n有効なキーを指定してください。",
+                        "キー検証エラー",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // ホットキーとの衝突検証
+                if (settings.Hotkey.Enabled)
+                {
+                    var hotkeyResolved = KeyResolver.Resolve(settings.Hotkey.Key, settings.KeyboardLayout);
+                    var keyResolved = KeyResolver.Resolve(keyInput, settings.KeyboardLayout);
+                    if (hotkeyResolved.IsValid && keyResolved.IsValid && hotkeyResolved.VkCode == keyResolved.VkCode)
+                    {
+                        MessageBox.Show(
+                            $"キー '{keyInput}' は現在のトグルホットキー ({settings.Hotkey.Key}) と同一のため割り当てられません。\n誤発動を防ぐため別のキーを指定するか、ホットキー設定を変更してください。",
+                            "キー衝突エラー",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        return;
+                    }
                 }
 
                 if (noteInput.Equals("pedal", StringComparison.OrdinalIgnoreCase))
@@ -452,9 +520,7 @@ namespace MidiToKeyApp
                         string targetPath = sfd.FileName;
                         try
                         {
-                            // 候補パスへの原子的保存を先に実行
                             SettingsManager.Save(targetPath, settings);
-                            // 保存成功後にのみファイルパスを更新
                             currentSettingsPath = targetPath;
                             currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
                             isCurrentSettingsCorrupted = false;
@@ -480,10 +546,8 @@ namespace MidiToKeyApp
                         string targetPath = ofd.FileName;
                         try 
                         {
-                            // 先に解析と内容検証を実行（失敗時は例外発生で現設定を維持）
                             var newSettings = SettingsManager.Load(targetPath);
 
-                            // 変換実行中であれば、安全に全キー解放・停止した上で新設定を適用
                             if (inputTracker.IsListening)
                             {
                                 StopConversion();
@@ -501,6 +565,7 @@ namespace MidiToKeyApp
                             RefreshPorts(true);
                             if (settings.KeyboardLayout == "US") rbUS.Checked = true; else rbJIS.Checked = true;
                             RefreshMappingList();
+                            UpdateHotkeyRegistration();
                             MessageBox.Show("読込み完了しました: " + Path.GetFileName(currentSettingsPath), "読込完了");
                         }
                         catch (Exception ex)
@@ -512,51 +577,202 @@ namespace MidiToKeyApp
             };
 
             var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
-            btnStart.Click += (s, e) => {
-                if (inputTracker.IsListening) return; // 既に実行中なら処理終了
-
-                var ports = GetSelectedPorts();
-                if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください", "ポート未選択"); return; }
-                
-                UpdateSettingsFromUI();
-
-                // 未解放キーの再試行・復旧確認
-                if (!keySimulator.TryPrepareStartConversion())
-                {
-                    MessageBox.Show(
-                        $"キー解放に失敗した未解放キー（{keySimulator.UnreleasedKeysCount} 件）が残っているため、変換を開始できません。\nキー入力を解放してから再度お試しください。",
-                        "未解放キー警告",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return; // 変換開始を中止
-                }
-
-                long sessionId = inputTracker.StartConversionSession();
-                midiListener.Start(ports, sessionId);
-
-                // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
-                if (txtNote.Focused)
-                {
-                    inputTracker.SetCapturing(true);
-                }
-
-                lblStatus.Text = "ステータス: 実行中";
-                lblStatus.ForeColor = Color.Green;
-            };
+            btnStart.Click += (s, e) => StartConversion();
 
             var btnStop = new Button { Text = "変換停止", Top = 415, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
-            btnStop.Click += (s, e) => {
-                StopConversion();
-            };
+            btnStop.Click += (s, e) => StopConversion();
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 465, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
+            // トグルホットキー表示＆変更ボタン
+            lblHotkeyInfo = new Label { Top = 460, Left = 10, Width = 280, AutoSize = false, Text = "ホットキー: 有効 (Ctrl+Alt+F9)", ForeColor = Color.FromArgb(40, 40, 40) };
+            btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 455, Left = 295, Width = 105, Height = 26 };
+            btnHotkeyConfig.Click += (s, e) => OpenHotkeyConfigDialog();
+
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 495, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
 
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
             this.Controls.Add(btnLoad);
             this.Controls.Add(btnStart);
             this.Controls.Add(btnStop);
+            this.Controls.Add(lblHotkeyInfo);
+            this.Controls.Add(btnHotkeyConfig);
             this.Controls.Add(lblStatus);
+
+            // デバイス切断・変更検知のデバウンスタイマー
+            deviceDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
+            deviceDebounceTimer.Tick += (s, e) => {
+                deviceDebounceTimer.Stop();
+                midiListener.CheckDeviceHealth();
+                RefreshPorts(false);
+            };
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            UpdateHotkeyRegistration();
+        }
+
+        /// <summary>
+        /// ホットキー設定ダイアログを表示し、変更を反映します。
+        /// </summary>
+        private void OpenHotkeyConfigDialog()
+        {
+            using (var dlg = new HotkeyConfigDialog(settings.Hotkey))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    var newHotkey = dlg.ResultSettings;
+
+                    // 1. 既存MIDIマッピングとの衝突検証
+                    if (newHotkey.Enabled && SettingsManager.IsHotkeyConflictingWithMapping(newHotkey, settings.Mapping, settings.KeyboardLayout))
+                    {
+                        MessageBox.Show(
+                            $"ホットキー '{newHotkey.Key}' は既にMIDIマッピング先として登録されています。\n誤動作を防ぐため、MIDIマッピングで使用されていないキーを指定してください。",
+                            "ホットキー競合警告",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    // 2. ホットキー登録とロールバック
+                    if (hotkeyManager.TryRegister(this.Handle, HotkeyManager.DEFAULT_HOTKEY_ID, newHotkey, settings.Mapping, settings.KeyboardLayout, out string? errMsg))
+                    {
+                        settings.Hotkey = newHotkey;
+                        UpdateHotkeyUi();
+                        lblStatus.Text = $"ホットキー設定更新: {(newHotkey.Enabled ? $"{newHotkey.Modifiers}+{newHotkey.Key}" : "無効")}";
+                        lblStatus.ForeColor = Color.Blue;
+                    }
+                    else
+                    {
+                        MessageBox.Show(errMsg ?? "ホットキーの登録に失敗しました。", "ホットキー登録エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        UpdateHotkeyUi();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 現在の設定に基づいてホットキーの登録を行います。
+        /// </summary>
+        private void UpdateHotkeyRegistration()
+        {
+            if (!IsHandleCreated || IsDisposed) return;
+
+            if (settings?.Hotkey == null) return;
+
+            if (hotkeyManager.TryRegister(this.Handle, HotkeyManager.DEFAULT_HOTKEY_ID, settings.Hotkey, settings.Mapping, settings.KeyboardLayout, out string? errMsg))
+            {
+                UpdateHotkeyUi();
+            }
+            else
+            {
+                UpdateHotkeyUi();
+                if (!string.IsNullOrEmpty(errMsg))
+                {
+                    Console.WriteLine($"ホットキー登録通知: {errMsg}");
+                }
+            }
+        }
+
+        private void UpdateHotkeyUi()
+        {
+            if (lblHotkeyInfo == null) return;
+
+            if (settings?.Hotkey != null && settings.Hotkey.Enabled)
+            {
+                lblHotkeyInfo.Text = $"ホットキー: 有効 ({settings.Hotkey.Modifiers}+{settings.Hotkey.Key})";
+            }
+            else
+            {
+                lblHotkeyInfo.Text = "ホットキー: 無効";
+            }
+        }
+
+        /// <summary>
+        /// トグルホットキー受信時の変換状態切り替え処理。
+        /// </summary>
+        private void ToggleConversion()
+        {
+            if (inputTracker.IsListening)
+            {
+                StopConversion();
+            }
+            else
+            {
+                StartConversion();
+            }
+        }
+
+        /// <summary>
+        /// 変換処理を開始します。ポート開始結果（全成功・一部成功・全失敗）に応じた適切な処理とロールバックを行います。
+        /// </summary>
+        private void StartConversion()
+        {
+            if (inputTracker.IsListening) return;
+
+            var ports = GetSelectedPorts();
+            if (ports.Count == 0)
+            {
+                MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
+                return;
+            }
+            
+            UpdateSettingsFromUI();
+
+            // 未解放キーの再試行・復旧確認
+            if (!keySimulator.TryPrepareStartConversion())
+            {
+                MessageBox.Show(
+                    $"キー解放に失敗した未解放キー（{keySimulator.UnreleasedKeysCount} 件）が残っているため、変換を開始できません。\nキー入力を解放してから再度お試しください。",
+                    "未解放キー警告",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            long sessionId = inputTracker.StartConversionSession();
+            var startResult = midiListener.Start(ports, sessionId);
+
+            if (startResult.IsAllFailed)
+            {
+                // 全ポート開始失敗時のロールバック
+                inputTracker.StopSession();
+                string errDetails = string.Join("\n", startResult.FailedPorts.Select(f => $"・{f.PortName}: {f.Reason}"));
+                lblStatus.Text = "ステータス: 停止中 (ポート開始失敗)";
+                lblStatus.ForeColor = Color.Red;
+                MessageBox.Show(
+                    $"すべてのMIDIポートの開始に失敗しました。\n\n詳細:\n{errDetails}",
+                    "ポート開始エラー",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
+            if (txtNote.Focused)
+            {
+                inputTracker.SetCapturing(true);
+            }
+
+            if (startResult.IsPartialSuccess)
+            {
+                // 一部ポート失敗時の正常ポート継続
+                string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
+                string openedNames = string.Join(", ", startResult.OpenedPorts.Select(o => o.DeviceName));
+                lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中, 失敗: {failedNames})";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+                MessageBox.Show(
+                    $"一部のポートの開始に失敗しました:\n・{failedNames}\n\n次の正常なポートで監視を開始しました:\n・{openedNames}",
+                    "一部ポート開始警告",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            else
+            {
+                lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中)";
+                lblStatus.ForeColor = Color.Green;
+            }
         }
 
         /// <summary>
@@ -586,6 +802,96 @@ namespace MidiToKeyApp
                 lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
                 lblStatus.ForeColor = Color.DarkOrange;
             }
+        }
+
+        /// <summary>
+        /// デバイス切断イベント発生時のハンドラ。
+        /// 切断されたデバイスの入力のみを解放し、全切断または切断元不明時は変換を安全に停止します。
+        /// </summary>
+        private void HandleDeviceDisconnected(string deviceId, string deviceName)
+        {
+            // 切断されたデバイスの入力のみを解放（別デバイスの押下状態は維持）
+            inputTracker.ReleaseDeviceInputs(deviceId, inputTracker.CurrentSessionId);
+            RefreshPorts(false);
+
+            var activePorts = midiListener.GetActivePorts();
+            if (activePorts.Count == 0 || string.IsNullOrEmpty(deviceId))
+            {
+                // 全ポート切断または切断元不明の場合: 安全側として変換全体を停止
+                StopConversion();
+                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断検知)";
+                lblStatus.ForeColor = Color.Red;
+                MessageBox.Show(
+                    $"MIDIデバイスの切断を検知したため、安全のためキーを解放して変換を停止しました。\n切断元: {(string.IsNullOrEmpty(deviceName) ? "不明" : deviceName)}\n\n※再開するには機器を接続し直し、変換開始ボタンまたはトグルホットキーで再開してください。",
+                    "デバイス切断検知",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            else
+            {
+                lblStatus.Text = $"ステータス: 実行中 (切断: {deviceName}, 残り {activePorts.Count} ポート)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+            }
+        }
+
+        /// <summary>
+        /// キー送信失敗時のエラーハンドラ。短時間の同一エラーを集約し、連続ダイアログを防止します。
+        /// </summary>
+        private void HandleKeySendError(KeySendErrorInfo errorInfo)
+        {
+            var now = DateTime.Now;
+            bool isSameError = (now - lastReportedErrorTime).TotalSeconds < 2.0 &&
+                               lastReportedErrorCode == errorInfo.Win32Error &&
+                               lastReportedVkCode == errorInfo.VkCode;
+
+            if (isSameError)
+            {
+                errorRepeatCount++;
+                lblStatus.Text = $"キー送信エラー (VK:0x{errorInfo.VkCode:X2}, Win32:{errorInfo.Win32Error}) x{errorRepeatCount}";
+                lblStatus.ForeColor = Color.DarkOrange;
+            }
+            else
+            {
+                errorRepeatCount = 1;
+                lastReportedErrorCode = errorInfo.Win32Error;
+                lastReportedVkCode = errorInfo.VkCode;
+                lastReportedErrorTime = now;
+
+                string win32Msg = new System.ComponentModel.Win32Exception(errorInfo.Win32Error).Message;
+                lblStatus.Text = $"キー送信エラー: {errorInfo.KeyName} (Win32: {errorInfo.Win32Error})";
+                lblStatus.ForeColor = Color.DarkOrange;
+
+                MessageBox.Show(
+                    $"キー送信に失敗しました。\n\n対象キー: {errorInfo.KeyName} (VK: 0x{errorInfo.VkCode:X2})\n操作: {(errorInfo.IsDown ? "押下" : "解放")}\nWin32エラー: {errorInfo.Win32Error} - {win32Msg}",
+                    "キー送信エラー",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_HOTKEY = 0x0312;
+            const int WM_DEVICECHANGE = 0x0219;
+            const int DBT_DEVNODES_CHANGED = 0x0007;
+
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HotkeyManager.DEFAULT_HOTKEY_ID)
+            {
+                ToggleConversion();
+                return;
+            }
+
+            if (m.Msg == WM_DEVICECHANGE)
+            {
+                if (m.WParam.ToInt32() == DBT_DEVNODES_CHANGED)
+                {
+                    // デバイス変更通知をデバウンスして処理
+                    deviceDebounceTimer?.Stop();
+                    deviceDebounceTimer?.Start();
+                }
+            }
+
+            base.WndProc(ref m);
         }
 
         private void GlobalHook_KeyDown(object? sender, KeyEventArgs e)
@@ -697,6 +1003,9 @@ namespace MidiToKeyApp
         
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            hotkeyManager.Unregister();
+            deviceDebounceTimer?.Stop();
+            deviceDebounceTimer?.Dispose();
             StopConversion();
             keySimulator.RetryReleasePendingKeys();
             midiListener?.Dispose();

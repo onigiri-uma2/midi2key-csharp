@@ -19,6 +19,27 @@ namespace MidiToKeyApp
         /// <param name="isDown">押下時はtrue、解放時はfalse</param>
         /// <returns>送信が成功した場合はtrue、失敗した場合はfalse</returns>
         bool SendHardwareKey(VirtualKeyCode vk, bool isDown);
+
+        /// <summary>
+        /// 直近のWin32エラーコードを取得します。
+        /// </summary>
+        int LastWin32Error { get; }
+    }
+
+    /// <summary>
+    /// キー送信エラーの詳細情報レコード。
+    /// </summary>
+    public sealed record KeySendErrorInfo(
+        VirtualKeyCode Key,
+        bool IsDown,
+        DateTime Timestamp,
+        int Win32ErrorCode,
+        int UnreleasedKeysCount
+    )
+    {
+        public uint VkCode => (uint)Key;
+        public int Win32Error => Win32ErrorCode;
+        public string KeyName => Key.ToString();
     }
 
     /// <summary>
@@ -119,8 +140,16 @@ namespace MidiToKeyApp
             }
 
             uint result = SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT)));
-            return result == 1;
+            if (result == 0)
+            {
+                LastWin32Error = Marshal.GetLastWin32Error();
+                return false;
+            }
+            LastWin32Error = 0;
+            return true;
         }
+
+        public int LastWin32Error { get; private set; }
     }
 
     /// <summary>
@@ -129,6 +158,7 @@ namespace MidiToKeyApp
     public readonly record struct ResolvedKey(VirtualKeyCode BaseKey, bool ShiftRequired)
     {
         public bool IsValid => BaseKey != VirtualKeyCode.NONAME;
+        public uint VkCode => (uint)BaseKey;
         public static readonly ResolvedKey None = new ResolvedKey(VirtualKeyCode.NONAME, false);
     }
 
@@ -209,6 +239,55 @@ namespace MidiToKeyApp
             return new ResolvedKey(baseKey, shiftRequired);
         }
 
+        /// <summary>
+        /// 指定されたキー名が有効なキーボード変換対象キーであるかを厳格に検証します。
+        /// </summary>
+        public static bool IsValidTargetKey(string? keyName, string layout) => IsValidTargetKey(keyName, layout, out _);
+
+        /// <summary>
+        /// 指定されたキー名が有効なキーボード変換対象キーであるかを厳格に検証します。
+        /// 空文字、未定義キー、NONAME、マウス用コード、不正な数値文字列を拒否します。
+        /// </summary>
+        public static bool IsValidTargetKey(string? keyName, string layout, out string? errorMessage)
+        {
+            if (string.IsNullOrWhiteSpace(keyName))
+            {
+                errorMessage = "キー名が空です。";
+                return false;
+            }
+
+            keyName = keyName.Trim();
+
+            // 2文字以上の数値のみの文字列はキー名として不正（例: "999"）
+            if (keyName.Length > 1 && int.TryParse(keyName, out _))
+            {
+                errorMessage = $"'{keyName}' は有効なキーボードキーではありません。";
+                return false;
+            }
+
+            var resolved = Resolve(keyName, layout);
+            if (!resolved.IsValid || resolved.BaseKey == VirtualKeyCode.NONAME || (int)resolved.BaseKey == 0)
+            {
+                errorMessage = $"'{keyName}' は対応していないか、認識できないキー名です。";
+                return false;
+            }
+
+            // マウス用仮想キーコードの除外
+            switch (resolved.BaseKey)
+            {
+                case VirtualKeyCode.LBUTTON:
+                case VirtualKeyCode.RBUTTON:
+                case VirtualKeyCode.MBUTTON:
+                case VirtualKeyCode.XBUTTON1:
+                case VirtualKeyCode.XBUTTON2:
+                    errorMessage = $"'{keyName}' はマウス入力用コードのため、キーボード変換キーとしては指定できません。";
+                    return false;
+            }
+
+            errorMessage = null;
+            return true;
+        }
+
         public static VirtualKeyCode ParseKey(string key, bool isJis)
         {
             key = key.ToLowerInvariant();
@@ -218,7 +297,20 @@ namespace MidiToKeyApp
             if (key.Length == 1 && key[0] >= '0' && key[0] <= '9') return (VirtualKeyCode)((int)VirtualKeyCode.VK_0 + (key[0] - '0'));
             if (key.Length == 1 && key[0] >= 'a' && key[0] <= 'z') return (VirtualKeyCode)((int)VirtualKeyCode.VK_A + (key[0] - 'a'));
 
-            if (Enum.TryParse<VirtualKeyCode>(key, true, out var vk)) return vk;
+            // 2文字以上の数字文字列はEnum.TryParseで数値パースされるのを防ぐため除外
+            if (int.TryParse(key, out _)) return VirtualKeyCode.NONAME;
+
+            if (Enum.TryParse<VirtualKeyCode>(key, true, out var vk))
+            {
+                // マウス用コードおよびNONAMEは除外
+                if (vk == VirtualKeyCode.LBUTTON || vk == VirtualKeyCode.RBUTTON ||
+                    vk == VirtualKeyCode.MBUTTON || vk == VirtualKeyCode.XBUTTON1 ||
+                    vk == VirtualKeyCode.XBUTTON2 || vk == VirtualKeyCode.NONAME)
+                {
+                    return VirtualKeyCode.NONAME;
+                }
+                return vk;
+            }
 
             return key switch
             {
@@ -282,6 +374,20 @@ namespace MidiToKeyApp
             _output = output ?? new WindowsKeyboardOutput();
         }
 
+        public event Action<KeySendErrorInfo>? OnKeySendError;
+
+        private void DispatchError(VirtualKeyCode vk, bool isDown, int unreleasedCount)
+        {
+            var errorInfo = new KeySendErrorInfo(
+                vk,
+                isDown,
+                DateTime.Now,
+                _output.LastWin32Error,
+                unreleasedCount
+            );
+            OnKeySendError?.Invoke(errorInfo);
+        }
+
         /// <summary>
         /// 指定された解決済みキー（BaseKeyおよびShift要求）を押下状態にします。
         /// ベースキー送信失敗時は、直前に追加したShift参照を必ずロールバックします。
@@ -289,6 +395,8 @@ namespace MidiToKeyApp
         public bool PressResolvedKey(ResolvedKey key)
         {
             if (!key.IsValid) return false;
+
+            KeySendErrorInfo? pendingError = null;
 
             lock (_keyLock)
             {
@@ -299,25 +407,37 @@ namespace MidiToKeyApp
                 {
                     if (!SendInternal(VirtualKeyCode.SHIFT, true, out _))
                     {
-                        return false;
+                        pendingError = new KeySendErrorInfo(VirtualKeyCode.SHIFT, true, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count);
+                        // Shift押下失敗
                     }
-                    shiftRefAdded = true;
-                }
-
-                // ベースキーを押下
-                if (!SendInternal(key.BaseKey, true, out _))
-                {
-                    // ベースキー送信失敗時は、今回追加したShift参照を必ず取り消す！
-                    // （以前からShiftが押されていた場合でもカウントを1減らし、新規押下だった場合はKeyUpも送信）
-                    if (shiftRefAdded)
+                    else
                     {
-                        SendInternal(VirtualKeyCode.SHIFT, false, out _);
+                        shiftRefAdded = true;
                     }
-                    return false;
                 }
 
-                return true;
+                if (pendingError == null)
+                {
+                    // ベースキーを押下
+                    if (!SendInternal(key.BaseKey, true, out _))
+                    {
+                        pendingError = new KeySendErrorInfo(key.BaseKey, true, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count);
+                        // ベースキー送信失敗時は、今回追加したShift参照を必ず取り消す！
+                        if (shiftRefAdded)
+                        {
+                            SendInternal(VirtualKeyCode.SHIFT, false, out _);
+                        }
+                    }
+                }
             }
+
+            if (pendingError != null)
+            {
+                OnKeySendError?.Invoke(pendingError);
+                return false;
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -327,19 +447,38 @@ namespace MidiToKeyApp
         {
             if (!key.IsValid) return false;
 
+            List<KeySendErrorInfo> errors = new();
+
             lock (_keyLock)
             {
                 // ベースキーを解放
-                SendInternal(key.BaseKey, false, out _);
+                if (!SendInternal(key.BaseKey, false, out _))
+                {
+                    if (_unreleasedKeys.Contains(key.BaseKey))
+                    {
+                        errors.Add(new KeySendErrorInfo(key.BaseKey, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
+                    }
+                }
 
                 // Shiftを解放
                 if (key.ShiftRequired)
                 {
-                    SendInternal(VirtualKeyCode.SHIFT, false, out _);
+                    if (!SendInternal(VirtualKeyCode.SHIFT, false, out _))
+                    {
+                        if (_unreleasedKeys.Contains(VirtualKeyCode.SHIFT))
+                        {
+                            errors.Add(new KeySendErrorInfo(VirtualKeyCode.SHIFT, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
+                        }
+                    }
                 }
-
-                return true;
             }
+
+            foreach (var err in errors)
+            {
+                OnKeySendError?.Invoke(err);
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -421,6 +560,8 @@ namespace MidiToKeyApp
         /// </summary>
         public bool RetryReleasePendingKeys()
         {
+            List<KeySendErrorInfo> errors = new();
+
             lock (_keyLock)
             {
                 foreach (var vk in _unreleasedKeys.ToList())
@@ -429,7 +570,20 @@ namespace MidiToKeyApp
                     {
                         _unreleasedKeys.Remove(vk);
                     }
+                    else
+                    {
+                        errors.Add(new KeySendErrorInfo(vk, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
+                    }
                 }
+            }
+
+            foreach (var err in errors)
+            {
+                OnKeySendError?.Invoke(err);
+            }
+
+            lock (_keyLock)
+            {
                 return _unreleasedKeys.Count == 0;
             }
         }
@@ -440,6 +594,8 @@ namespace MidiToKeyApp
         /// <returns>全キーの解放に成功した場合はtrue、失敗したキーが残っている場合はfalse</returns>
         public bool ReleaseAllKeys()
         {
+            List<KeySendErrorInfo> errors = new();
+
             lock (_keyLock)
             {
                 var keysToRelease = new HashSet<VirtualKeyCode>(_keyRefCount.Keys);
@@ -459,9 +615,18 @@ namespace MidiToKeyApp
                     else
                     {
                         _unreleasedKeys.Add(vk);
+                        errors.Add(new KeySendErrorInfo(vk, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
                     }
                 }
+            }
 
+            foreach (var err in errors)
+            {
+                OnKeySendError?.Invoke(err);
+            }
+
+            lock (_keyLock)
+            {
                 return _unreleasedKeys.Count == 0;
             }
         }

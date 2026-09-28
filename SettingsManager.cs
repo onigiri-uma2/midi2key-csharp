@@ -10,6 +10,25 @@ namespace MidiToKeyApp
     /// アプリケーションの設定データを保持するクラス。
     /// JSONからデシリアライズ、およびJSONへシリアライズされるデータ構造を定義します。
     /// </summary>
+    /// <summary>
+    /// グローバルトグルホットキーの設定。
+    /// </summary>
+    public class HotkeySettings
+    {
+        [JsonPropertyName("enabled")]
+        public bool Enabled { get; set; } = true;
+
+        [JsonPropertyName("modifiers")]
+        public string Modifiers { get; set; } = "Ctrl+Alt";
+
+        [JsonPropertyName("key")]
+        public string Key { get; set; } = "F9";
+    }
+
+    /// <summary>
+    /// アプリケーションの設定データを保持するクラス。
+    /// JSONからデシリアライズ、およびJSONへシリアライズされるデータ構造を定義します。
+    /// </summary>
     public class AppSettings
     {
         [JsonIgnore]
@@ -23,6 +42,9 @@ namespace MidiToKeyApp
 
         [JsonPropertyName("keyboard_layout")]
         public string KeyboardLayout { get; set; } = "JIS";
+
+        [JsonPropertyName("hotkey")]
+        public HotkeySettings Hotkey { get; set; } = new HotkeySettings();
     }
 
     /// <summary>
@@ -30,12 +52,6 @@ namespace MidiToKeyApp
     /// </summary>
     public static class SettingsManager
     {
-        /// <summary>
-        /// 指定されたパスから設定を読み込み、内容を検証します。
-        /// ファイルが存在しない場合は初回起動用デフォルト設定を返し、破損または内容が不正な場合は例外をスローします。
-        /// </summary>
-        /// <exception cref="JsonException">JSON形式が不正な場合</exception>
-        /// <exception cref="InvalidDataException">データ項目や値が不正な場合</exception>
         /// <summary>
         /// 初回起動時や設定復旧用のデフォルト設定（Sky用15キー標準マッピング）を生成します。
         /// </summary>
@@ -48,6 +64,7 @@ namespace MidiToKeyApp
                 { "57", "h" }, { "59", "j" }, { "60", "k" }, { "62", "l" }, { "64", ";" },
                 { "65", "n" }, { "67", "m" }, { "69", "," }, { "71", "." }, { "72", "/" }
             };
+            defaultSettings.Hotkey = new HotkeySettings();
             return defaultSettings;
         }
 
@@ -62,9 +79,70 @@ namespace MidiToKeyApp
             var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
             var settings = JsonSerializer.Deserialize<AppSettings>(json, options);
 
+            if (settings == null)
+            {
+                throw new InvalidDataException("設定データがnullです。");
+            }
+
+            if (settings.Hotkey == null)
+            {
+                settings.Hotkey = new HotkeySettings();
+            }
+
+            NormalizeMapping(settings);
             ValidateSettings(settings);
 
-            return settings!;
+            // ホットキーのメインキーとマッピング先キーの衝突を検証
+            // 衝突が検出された場合はマッピングを優先し、ホットキーを無効化して安全に復旧
+            if (settings.Hotkey.Enabled && IsHotkeyConflictingWithMapping(settings.Hotkey, settings.Mapping, settings.KeyboardLayout))
+            {
+                Console.WriteLine($"警告: ホットキー '{settings.Hotkey.Key}' がMIDIマッピング先と衝突しています。安全のためホットキーを無効化します。");
+                settings.Hotkey.Enabled = false;
+            }
+
+            return settings;
+        }
+
+        /// <summary>
+        /// PEDAL等の大文字表記を小文字のpedalへ正規化します。
+        /// </summary>
+        public static void NormalizeMapping(AppSettings settings)
+        {
+            if (settings.Mapping == null) return;
+
+            var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in settings.Mapping)
+            {
+                string key = kvp.Key;
+                if (key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
+                {
+                    key = "pedal";
+                }
+                normalized[key] = kvp.Value;
+            }
+            settings.Mapping = new Dictionary<string, string>(normalized);
+        }
+
+        /// <summary>
+        /// ホットキーのメインキーがマッピング先に含まれているか衝突判定を行います。
+        /// </summary>
+        public static bool IsHotkeyConflictingWithMapping(HotkeySettings hotkey, IDictionary<string, string> mapping, string layout)
+        {
+            if (!hotkey.Enabled || string.IsNullOrWhiteSpace(hotkey.Key)) return false;
+
+            var hotkeyResolved = KeyResolver.Resolve(hotkey.Key, layout);
+            if (!hotkeyResolved.IsValid) return false;
+
+            foreach (var kvp in mapping)
+            {
+                var mapResolved = KeyResolver.Resolve(kvp.Value, layout);
+                if (mapResolved.IsValid && mapResolved.VkCode == hotkeyResolved.VkCode)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -106,10 +184,10 @@ namespace MidiToKeyApp
                     }
                 }
 
-                // 変換先キーの検証: nullまたは空文字列は不正
-                if (string.IsNullOrWhiteSpace(targetKey))
+                // 変換先キーの厳格な検証
+                if (!KeyResolver.IsValidTargetKey(targetKey, settings.KeyboardLayout))
                 {
-                    throw new InvalidDataException($"マッピングキー '{noteKey}' の変換先キーが空または無効です。");
+                    throw new InvalidDataException($"マッピングキー '{noteKey}' の変換先キー '{targetKey}' が無効です。");
                 }
             }
         }
@@ -129,7 +207,13 @@ namespace MidiToKeyApp
                 {
                     SelectedPorts = new List<string>(settings.SelectedPorts),
                     Mapping = new Dictionary<string, string>(settings.Mapping),
-                    KeyboardLayout = settings.KeyboardLayout
+                    KeyboardLayout = settings.KeyboardLayout,
+                    Hotkey = new HotkeySettings
+                    {
+                        Enabled = settings.Hotkey?.Enabled ?? true,
+                        Modifiers = settings.Hotkey?.Modifiers ?? "Ctrl+Alt",
+                        Key = settings.Hotkey?.Key ?? "F9"
+                    }
                 };
             }
 
