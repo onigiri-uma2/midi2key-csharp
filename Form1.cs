@@ -377,7 +377,7 @@ namespace MidiToKeyApp
                 {
                     if (note < 0 || note > 127)
                     {
-                        MessageBox.Show("MIDIノート番号は 0 〜 127 の範囲で入力してください。\n（一般的な88鍵盤ピアノは 21[A0] 〜 108[C8] です）", "範囲エラー");
+                        MessageBox.Show("ノート番号は 0 〜 127 の範囲で入力してください。", "範囲エラー");
                         return;
                     }
 
