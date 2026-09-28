@@ -95,17 +95,41 @@ namespace MidiToKeyApp.Tests
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts() => ActivePorts.ToList();
 
-        public void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null)
+        public void CheckDeviceHealth(
+            IEnumerable<string>? activeOsDeviceNames = null,
+            OutOfProcessWinMmResult? outOfProcessWinMmResult = null)
         {
-            if (activeOsDeviceNames != null)
+            var disconnected = new List<MidiPortInfo>();
+            var osNames = activeOsDeviceNames != null
+                ? new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            foreach (var port in ActivePorts.ToList())
             {
-                var osNames = new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase);
-                var disconnected = ActivePorts.Where(p => !osNames.Contains(p.DeviceName)).ToList();
-                foreach (var d in disconnected)
+                bool presentInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                             outOfProcessWinMmResult.Value.Success &&
+                                             outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+
+                bool missingInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                             outOfProcessWinMmResult.Value.Success &&
+                                             !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+
+                bool missingInWinRt = osNames != null && osNames.Count > 0 && !osNames.Contains(port.DeviceName);
+
+                if (presentInOutOfProcess)
                 {
-                    ActivePorts.Remove(d);
-                    OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
+                    continue;
                 }
+                else if (missingInOutOfProcess || missingInWinRt)
+                {
+                    disconnected.Add(port);
+                }
+            }
+
+            foreach (var d in disconnected)
+            {
+                ActivePorts.Remove(d);
+                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
             }
         }
 
@@ -2248,8 +2272,10 @@ namespace MidiToKeyApp.Tests
             Assert.AreEqual(1, tracker.ActiveNotesCount);
             Assert.AreEqual(1, _mock.KeyDownCount);
 
-            // OS(WinRT)認識ポートは0件（DryWetMIDIには古い名前が残っていると想定されるケース）
-            fakeListener.CheckDeviceHealth(activeOsDeviceNames: Array.Empty<string>());
+            // 新規プロセスWinMMで0件（切断検知）
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(Array.Empty<string>()));
 
             // OSで切断されたため、安全解放されキーがKeyUpされること
             Assert.AreEqual(0, fakeListener.GetActivePorts().Count);
@@ -2418,6 +2444,194 @@ namespace MidiToKeyApp.Tests
             var reconnectedPorts = new List<string> { "nanoKEY2 1 KEYBOARD" };
             Assert.IsFalse(tracker.IsListening, "デバイス再接続時に自動で変換が再開されないこと");
             Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        // Test 91: 実機ケースA: 接続状態で起動して取り外した場合
+        // 親プロセスWinMM 1件（キャッシュ残存）、新規プロセスWinMM 0件、WinRT 0件
+        // 新規プロセスの0件を確実な根拠として切断検知し、安全停止すること
+        [TestMethod]
+        public void Test_91_RealWorldCaseA_ConnectedAtStartup_ThenDisconnected_SafelyStops()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            var fakeListener = new FakeMidiListener();
+            long gen = tracker.StartConversionSession();
+
+            fakeListener.OnDeviceDisconnected += data =>
+            {
+                tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+            };
+
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, gen);
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+            string devId = fakeListener.GetActivePorts()[0].DeviceId;
+
+            // 鍵盤を押下
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // 診断レポートの検証（親1件、新規0件、WinRT 0件）
+            var dryWetResult = PortEnumerationResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            var inProcWinMm = new[] { new WinMmDeviceInfo(0, "nanoKEY2 1 KEYBOARD", 1, 0) };
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(Array.Empty<string>());
+            var winRtResult = Array.Empty<WinRtMidiDeviceInfo>();
+
+            var report = MidiDeviceDiagnostics.CompareEndpoints(
+                "CaseA_Disconnected",
+                dryWetResult,
+                inProcWinMm,
+                outProcResult,
+                winRtResult,
+                fakeListener.GetActivePorts(),
+                gen);
+
+            Assert.IsTrue(report.HasDiscrepancy, "不一致が検知されること");
+            Assert.IsTrue(report.DiscrepancySummary.Contains("新規プロセスWinMMは0件"), "取り外しの可能性が指摘されること");
+
+            // CheckDeviceHealth を実行: 新規プロセスWinMMが0件のため切断確定
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: outProcResult);
+
+            // 切断により安全停止され、キーがKeyUpされること
+            Assert.AreEqual(0, fakeListener.GetActivePorts().Count);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+        }
+
+        // Test 92: 実機ケースB: 未接続状態で起動して接続した場合
+        // 親プロセスWinMM 0件、新規プロセスWinMM 1件、WinRT 0件
+        // 接続は検出されているが親プロセスに未反映であることが診断され、誤った切断や不正開始が行われないこと
+        [TestMethod]
+        public void Test_92_RealWorldCaseB_DisconnectedAtStartup_ThenConnected_DetectedNeedsRestart()
+        {
+            var dryWetResult = PortEnumerationResult.Succeeded(Array.Empty<string>());
+            var inProcWinMm = Array.Empty<WinMmDeviceInfo>();
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+            var winRtResult = Array.Empty<WinRtMidiDeviceInfo>();
+            var activePorts = Array.Empty<MidiPortInfo>();
+
+            var report = MidiDeviceDiagnostics.CompareEndpoints(
+                "CaseB_ConnectedLater",
+                dryWetResult,
+                inProcWinMm,
+                outProcResult,
+                winRtResult,
+                activePorts);
+
+            Assert.IsTrue(report.HasDiscrepancy, "親と新規プロセスの不一致が検出されること");
+            Assert.IsTrue(report.DiscrepancySummary.Contains("接続は検出されていますが、MIDIバックエンドには未反映です。再起動してください。"));
+
+            // 起動中に動作していたデバイス（もしあれば）が、WinRT 0件でも新規プロセス1件なら接続中維持される検証
+            var fakeListener = new FakeMidiListener();
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, 1);
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+
+            // WinRTが0件であっても、新規プロセスWinMMに存在していれば切断されないこと！
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: outProcResult);
+
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count, "WinRTが0件でも新規プロセスWinMMで検出されていれば接続中を維持すること");
+        }
+
+        // Test 93: デバイス切断・手動停止・イベント配送が同時に発生する並行テスト
+        // ロックネスト撤廃により、並行実行下でもデッドロックやレースコンディションによる例外が発生しないこと
+        [TestMethod]
+        public void Test_93_ConcurrentDisconnect_Stop_AndEventDispatch_NoDeadlock()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "l" } }
+            });
+            var fakeListener = new FakeMidiListener();
+            using var realListener = new MidiListener();
+
+            fakeListener.OnNoteReceived += note => tracker.ProcessNoteEvent(note);
+            fakeListener.OnDeviceDisconnected += data => tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+
+            // 複数回のイテレーションで並行競合を検証
+            for (int iteration = 0; iteration < 20; iteration++)
+            {
+                long gen = tracker.StartConversionSession();
+                fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, gen);
+
+                var startSignal = new ManualResetEventSlim(false);
+                var threads = new List<Thread>();
+                int exceptionsCount = 0;
+
+                // スレッド1: 連続ノートイベント送信
+                threads.Add(new Thread(() =>
+                {
+                    try
+                    {
+                        startSignal.Wait(500);
+                        for (int i = 0; i < 100; i++)
+                        {
+                            fakeListener.FireNote(new MidiNoteData("dev1", "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+                            fakeListener.FireNote(new MidiNoteData("dev1", "nanoKEY2 1 KEYBOARD", 1, 60, 0, false, gen));
+                        }
+                    }
+                    catch { Interlocked.Increment(ref exceptionsCount); }
+                }));
+
+                // スレッド2: デバイス切断通知と解放（FakeListener / MidiListener）
+                threads.Add(new Thread(() =>
+                {
+                    try
+                    {
+                        startSignal.Wait(500);
+                        for (int i = 0; i < 50; i++)
+                        {
+                            fakeListener.CheckDeviceHealth(
+                                activeOsDeviceNames: Array.Empty<string>(),
+                                outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(Array.Empty<string>()));
+                            realListener.CheckDeviceHealth(
+                                activeOsDeviceNames: Array.Empty<string>(),
+                                outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(Array.Empty<string>()));
+                            realListener.SimulateDeviceDisconnected("dummyId");
+                            Thread.Yield();
+                        }
+                    }
+                    catch { Interlocked.Increment(ref exceptionsCount); }
+                }));
+
+                // スレッド3: セッション停止と再開（手動停止・開始）
+                threads.Add(new Thread(() =>
+                {
+                    try
+                    {
+                        startSignal.Wait(500);
+                        for (int i = 0; i < 50; i++)
+                        {
+                            fakeListener.Stop();
+                            realListener.Stop();
+                            tracker.StopSession();
+                            Thread.Yield();
+                            tracker.StartConversionSession();
+                            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" });
+                            realListener.Start(new[] { "NonExistentDevice" });
+                        }
+                    }
+                    catch { Interlocked.Increment(ref exceptionsCount); }
+                }));
+
+                // 一斉スタート
+                foreach (var t in threads) t.Start();
+                startSignal.Set();
+
+                // 全スレッドの終了をタイムアウト付きで待機（デッドロック検知）
+                foreach (var t in threads)
+                {
+                    bool joined = t.Join(3000);
+                    Assert.IsTrue(joined, "スレッドがデッドロックせずに終了すること");
+                }
+
+                Assert.AreEqual(0, exceptionsCount, "並行実行中に例外が発生しないこと");
+            }
         }
     }
 }

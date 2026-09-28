@@ -13,6 +13,25 @@ namespace MidiToKeyApp
 
     public readonly record struct WinMmDeviceInfo(int Index, string Name, ushort Mid, ushort Pid);
 
+    /// <summary>
+    /// 新規独立プロセスのWinMM列挙結果。
+    /// 正常な0件、検出あり、タイムアウト、プロセス起動失敗を明確に区別します。
+    /// </summary>
+    public readonly record struct OutOfProcessWinMmResult(
+        bool Success,
+        IReadOnlyList<string> Ports,
+        string? ErrorMessage = null,
+        int ExitCode = -1,
+        bool TimedOut = false
+    )
+    {
+        public static OutOfProcessWinMmResult Succeeded(IReadOnlyList<string> ports, int exitCode = 0) =>
+            new(true, ports, null, exitCode, false);
+
+        public static OutOfProcessWinMmResult Failed(string error, int exitCode = -1, bool timedOut = false) =>
+            new(false, Array.Empty<string>(), error, exitCode, timedOut);
+    }
+
     public class MidiComparisonReport
     {
         public DateTime Timestamp { get; init; } = DateTime.Now;
@@ -21,7 +40,8 @@ namespace MidiToKeyApp
         public long Generation { get; init; }
         public IReadOnlyList<string> DryWetMidiPorts { get; init; } = Array.Empty<string>();
         public IReadOnlyList<string> InProcessWinMmPorts { get; init; } = Array.Empty<string>();
-        public IReadOnlyList<string> OutOfProcessWinMmPorts { get; init; } = Array.Empty<string>();
+        public OutOfProcessWinMmResult OutOfProcessWinMm { get; init; } = OutOfProcessWinMmResult.Failed("未取得");
+        public IReadOnlyList<string> OutOfProcessWinMmPorts => OutOfProcessWinMm.Ports;
         public IReadOnlyList<WinRtMidiDeviceInfo> WinRtDevices { get; init; } = Array.Empty<WinRtMidiDeviceInfo>();
         public IReadOnlyList<MidiPortInfo> ActiveMonitoredPorts { get; init; } = Array.Empty<MidiPortInfo>();
         public bool HasDiscrepancy { get; init; }
@@ -90,16 +110,15 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 新規の独立プロセスを一時起動してWinMMポート一覧を取得します。
-        /// 既存プロセス内でWinMMキャッシュが更新されない問題（同一プロセス内の静的列挙問題）を識別するために使用します。
+        /// 正常な0件、検出あり、タイムアウト、プロセス起動失敗を明確に区別した結果型を返します。
+        /// 標準出力の非同期読み取りとタイムアウト時の確実なプロセスKillを実施します。
         /// </summary>
-        public static List<string> GetOutOfProcessWinMmPorts(int timeoutMs = 2000)
+        public static OutOfProcessWinMmResult GetOutOfProcessWinMmResult(int timeoutMs = 2000)
         {
-            var ports = new List<string>();
             string? exePath = Environment.ProcessPath;
             if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
             {
-                // テスト実行中等でexeが見つからない場合
-                return ports;
+                return OutOfProcessWinMmResult.Failed("実行可能ファイルが見つかりません (テスト環境または未配置)");
             }
 
             try
@@ -114,34 +133,62 @@ namespace MidiToKeyApp
                     CreateNoWindow = true
                 };
 
-                using var proc = Process.Start(psi);
-                if (proc == null) return ports;
-
-                string output = proc.StandardOutput.ReadToEnd();
-                if (proc.WaitForExit(timeoutMs))
+                using var proc = new Process { StartInfo = psi };
+                if (!proc.Start())
                 {
-                    using var reader = new StringReader(output);
-                    string? line;
-                    while ((line = reader.ReadLine()) != null)
+                    return OutOfProcessWinMmResult.Failed("子プロセスの起動に失敗しました");
+                }
+
+                // 子プロセスの出力と終了待機のデッドロック防止: 非同期で読み取り開始
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
+
+                if (!proc.WaitForExit(timeoutMs))
+                {
+                    try { proc.Kill(true); } catch { }
+                    DiagnosticLogger.Log("MidiDiagnostics", $"OutOfProcess WinMM query timed out ({timeoutMs}ms).");
+                    return OutOfProcessWinMmResult.Failed($"子プロセスの実行がタイムアウトしました ({timeoutMs}ms)", timedOut: true);
+                }
+
+                // プロセス終了後に読み取りタスクの完了を待機
+                Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 500);
+
+                if (proc.ExitCode != 0)
+                {
+                    string err = stderrTask.IsCompleted ? stderrTask.Result : "";
+                    DiagnosticLogger.Log("MidiDiagnostics", $"OutOfProcess WinMM query failed with exit code {proc.ExitCode}: {err}");
+                    return OutOfProcessWinMmResult.Failed($"子プロセスが終了コード {proc.ExitCode} で終了しました: {err}", proc.ExitCode);
+                }
+
+                string output = stdoutTask.IsCompleted ? stdoutTask.Result : "";
+                var ports = new List<string>();
+                using var reader = new StringReader(output);
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("[", StringComparison.Ordinal))
                     {
-                        string trimmed = line.Trim();
-                        if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("[", StringComparison.Ordinal))
-                        {
-                            ports.Add(trimmed);
-                        }
+                        ports.Add(trimmed);
                     }
                 }
-                else
-                {
-                    try { proc.Kill(); } catch { }
-                    DiagnosticLogger.Log("MidiDiagnostics", "OutOfProcess WinMM query timed out.");
-                }
+
+                return OutOfProcessWinMmResult.Succeeded(ports, proc.ExitCode);
             }
             catch (Exception ex)
             {
-                DiagnosticLogger.Log("MidiDiagnostics", $"OutOfProcess WinMM query failed: {ex.Message}");
+                DiagnosticLogger.Log("MidiDiagnostics", $"OutOfProcess WinMM query failed with exception: {ex.Message}");
+                return OutOfProcessWinMmResult.Failed($"子プロセス実行例外: {ex.Message}");
             }
-            return ports;
+        }
+
+        /// <summary>
+        /// 互換用: 新規の独立プロセスを一時起動してWinMMポート一覧を取得します。
+        /// </summary>
+        public static List<string> GetOutOfProcessWinMmPorts(int timeoutMs = 2000)
+        {
+            var result = GetOutOfProcessWinMmResult(timeoutMs);
+            return result.Success ? result.Ports.ToList() : new List<string>();
         }
 
         /// <summary>
@@ -189,13 +236,14 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// 各データソース（DryWetMIDI、プロセス内WinMM、独立プロセスWinMM、WinRT、監視中ポート）の結果を静的に比較・評価します。
+        /// 各データソース（DryWetMIDI、プロセス内WinMM、独立プロセスWinMM結果、WinRT、監視中ポート）の結果を静的に比較・評価します。
+        /// 新規プロセスのWinMM結果を最重要視し、WinRTの0件を「OS上の非存在」と誤断定しないよう厳密に評価します。
         /// </summary>
         public static MidiComparisonReport CompareEndpoints(
             string trigger,
             PortEnumerationResult dryWetResult,
             IReadOnlyList<WinMmDeviceInfo> inProcWinMm,
-            IReadOnlyList<WinMmDeviceInfo> outProcWinMm,
+            OutOfProcessWinMmResult outProcResult,
             IReadOnlyList<WinRtMidiDeviceInfo> winRtDevices,
             IReadOnlyList<MidiPortInfo> activeMonitoredPorts,
             long generation = 0)
@@ -203,33 +251,64 @@ namespace MidiToKeyApp
             string osDesc = RuntimeInformation.OSDescription;
             var dryWetPorts = dryWetResult.Success ? dryWetResult.Ports : Array.Empty<string>();
             var inProcPorts = inProcWinMm.Select(d => d.Name).ToList();
-            var outProcPorts = outProcWinMm.Select(d => d.Name).ToList();
+            var outProcPorts = outProcResult.Ports;
 
             var discrepancies = new List<string>();
 
-            // 1. In-Process WinMM と Out-Of-Process WinMM の不一致検証
-            if (outProcWinMm.Count > 0 && inProcWinMm.Count != outProcWinMm.Count)
+            // 1. 新規プロセスWinMMと親プロセスWinMMの比較（正常に取得できた場合、0件も含めて厳格に比較）
+            if (outProcResult.Success)
             {
-                discrepancies.Add($"同一プロセスWinMM ({inProcWinMm.Count}件) と新規プロセスWinMM ({outProcWinMm.Count}件) のポート数が一致しません。同一プロセス内のWinMM列挙キャッシュが更新されていない可能性があります。");
+                if (inProcWinMm.Count != outProcPorts.Count)
+                {
+                    if (inProcWinMm.Count > 0 && outProcPorts.Count == 0)
+                    {
+                        discrepancies.Add($"親プロセスWinMM ({inProcWinMm.Count}件) に対し、新規プロセスWinMMは0件です。デバイスが物理的に取り外された可能性があります（親プロセスのWinMMキャッシュ残存）。");
+                    }
+                    else if (inProcWinMm.Count == 0 && outProcPorts.Count > 0)
+                    {
+                        discrepancies.Add($"親プロセスWinMMは0件ですが、新規プロセスWinMMで {outProcPorts.Count}件 検出されました。接続は検出されていますが、MIDIバックエンドには未反映です。再起動してください。");
+                    }
+                    else
+                    {
+                        discrepancies.Add($"親プロセスWinMM ({inProcWinMm.Count}件) と新規プロセスWinMM ({outProcPorts.Count}件) のポート数が一致しません。同一プロセス内のWinMM列挙キャッシュが更新されていない可能性があります。");
+                    }
+                }
+            }
+            else
+            {
+                discrepancies.Add($"新規プロセスWinMMの取得に失敗しました: {outProcResult.ErrorMessage}");
             }
 
-            // 2. WinRT (OS認識) と DryWetMIDI/WinMM の不一致検証
+            // 2. WinRT (OS認識) の検証（WinRTが0件のとき「OS側でデバイスが存在しない」と断定しない）
             if (winRtDevices.Count > 0 && dryWetPorts.Count == 0)
             {
-                discrepancies.Add($"WinRT/OSでは {winRtDevices.Count} 件のMIDIデバイスが認識されていますが、DryWetMIDIでは0件です (WinRT/OSとMIDIバックエンドの認識に差異があります: 未反映・要再起動)。");
+                discrepancies.Add($"WinRTでは {winRtDevices.Count}件 認識されていますが、DryWetMIDIでは0件です (WinRT/OSとMIDIバックエンドの認識に差異があります: 未反映・要再起動)。");
             }
             else if (winRtDevices.Count == 0 && dryWetPorts.Count > 0)
             {
-                discrepancies.Add($"DryWetMIDIには {dryWetPorts.Count} 件のポートが残存していますが、WinRT/OSでは0件です (物理切断後の残存キャッシュ: WinRT/OSとMIDIバックエンドの認識に差異があります)。");
+                if (outProcResult.Success && outProcPorts.Count == 0)
+                {
+                    discrepancies.Add($"DryWetMIDIには {dryWetPorts.Count}件 のポートが残存していますが、新規プロセスWinMM・WinRTともに0件です (物理切断後の残存キャッシュの可能性)。");
+                }
+                else
+                {
+                    // WinRTが0件でも新規プロセスで検出されている場合は、WinRT非対応環境の可能性があるため断定しない
+                    discrepancies.Add($"DryWetMIDIに {dryWetPorts.Count}件 のポートがありますが、WinRT MIDI列挙は0件です (※一部のMIDIデバイス・ドライバ環境ではWinRTに現れない場合があります)。");
+                }
             }
 
-            // 3. 監視中インスタンスとOS認識の不一致検証
+            // 3. 監視中ポートの検証
             foreach (var act in activeMonitoredPorts)
             {
-                bool inWinRt = winRtDevices.Any(w => string.Equals(w.Name, act.DeviceName, StringComparison.OrdinalIgnoreCase));
-                if (!inWinRt && winRtDevices.Count > 0)
+                // 新規プロセスWinMMで対象ポートが消えている場合（最も信頼性が高い判定）
+                if (outProcResult.Success && !outProcPorts.Any(p => string.Equals(p, act.DeviceName, StringComparison.OrdinalIgnoreCase)))
                 {
-                    discrepancies.Add($"監視中ポート '{act.DeviceName}' (ID: {act.DeviceId}) はWinRT/OS認識から消失しています（切断の疑い）。");
+                    discrepancies.Add($"監視中ポート '{act.DeviceName}' (ID: {act.DeviceId}) は新規プロセスWinMMから消失しています（物理切断）。");
+                }
+                // WinRTで以前認識されていたがWinRTから消えた場合（WinRTが有効に機能している場合のみ）
+                else if (winRtDevices.Count > 0 && !winRtDevices.Any(w => string.Equals(w.Name, act.DeviceName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    discrepancies.Add($"監視中ポート '{act.DeviceName}' (ID: {act.DeviceId}) はWinRT MIDI列挙から消失しています（切断の疑い）。");
                 }
             }
 
@@ -244,12 +323,28 @@ namespace MidiToKeyApp
                 Generation = generation,
                 DryWetMidiPorts = dryWetPorts,
                 InProcessWinMmPorts = inProcPorts,
-                OutOfProcessWinMmPorts = outProcPorts,
+                OutOfProcessWinMm = outProcResult,
                 WinRtDevices = winRtDevices,
                 ActiveMonitoredPorts = activeMonitoredPorts,
                 HasDiscrepancy = hasDiscrepancy,
                 DiscrepancySummary = summary
             };
+        }
+
+        /// <summary>
+        /// 互換用: 各データソースの結果を静的に比較・評価します。
+        /// </summary>
+        public static MidiComparisonReport CompareEndpoints(
+            string trigger,
+            PortEnumerationResult dryWetResult,
+            IReadOnlyList<WinMmDeviceInfo> inProcWinMm,
+            IReadOnlyList<WinMmDeviceInfo> outProcWinMm,
+            IReadOnlyList<WinRtMidiDeviceInfo> winRtDevices,
+            IReadOnlyList<MidiPortInfo> activeMonitoredPorts,
+            long generation = 0)
+        {
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(outProcWinMm.Select(d => d.Name).ToList());
+            return CompareEndpoints(trigger, dryWetResult, inProcWinMm, outProcResult, winRtDevices, activeMonitoredPorts, generation);
         }
 
         public static Task<MidiComparisonReport> RunComparisonAsync(
@@ -276,41 +371,42 @@ namespace MidiToKeyApp
             // 各APIの列挙を取得
             var dryWetTask = Task.Run(() => GetDryWetMidiPorts());
             var inProcessWinMmTask = Task.Run(() => GetInProcessWinMmPorts());
-            var outProcessWinMmTask = queryOutOfProcess ? Task.Run(() => GetOutOfProcessWinMmPorts()) : Task.FromResult(new List<string>());
+            var outProcessWinMmTask = queryOutOfProcess 
+                ? Task.Run(() => GetOutOfProcessWinMmResult()) 
+                : Task.FromResult(OutOfProcessWinMmResult.Failed("クエリ無効"));
             var winRtTask = GetWinRtDevicesAsync();
 
             await Task.WhenAll(dryWetTask, inProcessWinMmTask, outProcessWinMmTask, winRtTask);
 
             var dryWet = dryWetTask.Result;
             var inProc = inProcessWinMmTask.Result;
-            var outProc = outProcessWinMmTask.Result;
+            var outProcResult = outProcessWinMmTask.Result;
             var winRt = winRtTask.Result;
 
             var inProcDevs = inProc.Select((name, idx) => new WinMmDeviceInfo(idx, name, 0, 0)).ToList();
-            var outProcDevs = outProc.Select((name, idx) => new WinMmDeviceInfo(idx, name, 0, 0)).ToList();
 
             var report = CompareEndpoints(
                 trigger,
                 PortEnumerationResult.Succeeded(dryWet),
                 inProcDevs,
-                outProcDevs,
+                outProcResult,
                 winRt,
                 active,
                 generation);
 
-            // 診断ログへの出力
+            // 診断ログへの出力（第5項目: 取得元を明確に区別し、新規プロセスWinMMの結果を重視）
             string dryWetStr = string.Join(", ", dryWet);
             string inProcStr = string.Join(", ", inProc);
-            string outProcStr = string.Join(", ", outProc);
+            string outProcStr = outProcResult.Success ? string.Join(", ", outProcResult.Ports) : $"(失敗: {outProcResult.ErrorMessage})";
             string winRtStr = string.Join(", ", winRt.Select(w => $"{w.Name} (Id: {w.Id})"));
             string activeStr = string.Join(", ", active.Select(a => $"{a.DeviceName} (DeviceId: {a.DeviceId})"));
 
             DiagnosticLogger.Log("MidiComparison",
                 $"[トリガー: {trigger}] [OS: {osDesc}] [Gen: {generation}]\n" +
                 $"  1. DryWetMIDI           ({dryWet.Count}件): [{dryWetStr}]\n" +
-                $"  2. In-Process WinMM     ({inProc.Count}件): [{inProcStr}]\n" +
-                $"  3. Out-Of-Process WinMM ({outProc.Count}件): [{outProcStr}]\n" +
-                $"  4. WinRT (OS認識)       ({winRt.Count}件): [{winRtStr}]\n" +
+                $"  2. 親プロセスWinMM      ({inProc.Count}件): [{inProcStr}]\n" +
+                $"  3. 新規プロセスWinMM    ({(outProcResult.Success ? $"{outProcResult.Ports.Count}件" : "エラー")}): [{outProcStr}]\n" +
+                $"  4. WinRT MIDI列挙       ({winRt.Count}件): [{winRtStr}]\n" +
                 $"  5. 監視中インスタンス   ({active.Count}件): [{activeStr}]\n" +
                 $"  => 診断結果: {report.DiscrepancySummary}");
 

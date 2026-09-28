@@ -190,13 +190,16 @@ namespace MidiToKeyApp
             deviceDebounceTimer?.Start();
         }
 
-        private void UpdatePortSummaryUi()
+        private void UpdatePortSummaryUi(OutOfProcessWinMmResult? outProcResult = null)
         {
             if (lblPortSummary == null) return;
             int osCount = _winRtWatcher?.Devices.Count ?? -1;
             int backendCount = chkPorts?.Items.Count ?? 0;
-            string osText = osCount >= 0 ? $"{osCount}件" : "非対応/未取得";
-            lblPortSummary.Text = $"OS認識: {osText} | バックエンド: {backendCount}件";
+            string osText = osCount >= 0 ? $"{osCount}件" : "0件";
+            string outProcText = outProcResult.HasValue
+                ? (outProcResult.Value.Success ? $"{outProcResult.Value.Ports.Count}件" : "エラー")
+                : "取得中...";
+            lblPortSummary.Text = $"親プロセス: {backendCount}件 | 新規プロセス: {outProcText} | WinRT: {osText}";
         }
 
         private void RefreshPorts(bool isInitialLoad = false)
@@ -214,16 +217,61 @@ namespace MidiToKeyApp
             }
 
             var availablePorts = enumResult.Ports;
-            chkPorts.Items.Clear();
-            foreach (var port in availablePorts)
-            {
-                int index = chkPorts.Items.Add(port);
-                if (checkedPorts.Contains(port))
+            
+            // 新規プロセスWinMMの結果を非同期で確認
+            _ = System.Threading.Tasks.Task.Run(() => {
+                var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
+                if (IsHandleCreated && !IsDisposed)
                 {
-                    chkPorts.SetItemChecked(index, true);
+                    try
+                    {
+                        BeginInvoke(new Action(() => {
+                            if (IsDisposed) return;
+                            ApplyPortsToUi(availablePorts, checkedPorts, outProcResult);
+                        }));
+                    }
+                    catch { }
+                }
+            });
+        }
+
+        private void ApplyPortsToUi(IReadOnlyList<string> availablePorts, IReadOnlyList<string> checkedPorts, OutOfProcessWinMmResult outProcResult)
+        {
+            chkPorts.Items.Clear();
+
+            // ケース1: 新規プロセスで1件以上検出され、親プロセスDryWetMIDIで0件の場合
+            if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
+            {
+                lblStatus.Text = "ステータス: 停止中 (接続検出・MIDIバックエンド未反映: 再起動してください)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+                foreach (var p in outProcResult.Ports)
+                {
+                    chkPorts.Items.Add($"{p} [未反映: 要再起動]");
                 }
             }
-            UpdatePortSummaryUi();
+            // ケース2: 親プロセスで1件以上あるが、新規プロセスWinMMで0件（正常取得）の場合: 取り外し済みの可能性
+            else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
+            {
+                lblStatus.Text = "ステータス: 停止中 (機器取り外し済みの可能性: 再起動してください)";
+                lblStatus.ForeColor = Color.DarkOrange;
+                foreach (var port in availablePorts)
+                {
+                    chkPorts.Items.Add($"{port} (取り外し済みの可能性)");
+                }
+            }
+            else
+            {
+                foreach (var port in availablePorts)
+                {
+                    int index = chkPorts.Items.Add(port);
+                    if (checkedPorts.Contains(port))
+                    {
+                        chkPorts.SetItemChecked(index, true);
+                    }
+                }
+            }
+
+            UpdatePortSummaryUi(outProcResult);
         }
 
         /// <summary>
@@ -258,20 +306,10 @@ namespace MidiToKeyApp
             }
 
             var availablePorts = enumResult.Ports;
-            DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration result: Count={availablePorts.Count}, Ports=[{string.Join(", ", availablePorts)}]");
+            var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1500);
+            DiagnosticLogger.Log($"[Form1] ReloadPortsManually result: DryWetMIDI={availablePorts.Count}件, 新規プロセスWinMM={(outProcResult.Success ? $"{outProcResult.Ports.Count}件" : "失敗")}");
 
-            chkPorts.Items.Clear();
-            int restoredCount = 0;
-            foreach (var port in availablePorts)
-            {
-                int index = chkPorts.Items.Add(port);
-                if (previousSelected.Contains(port))
-                {
-                    chkPorts.SetItemChecked(index, true);
-                    restoredCount++;
-                }
-            }
-            UpdatePortSummaryUi();
+            ApplyPortsToUi(availablePorts, previousSelected, outProcResult);
 
             // 5系統比較診断をバックグラウンド実行してログ記録
             _ = System.Threading.Tasks.Task.Run(async () => {
@@ -283,30 +321,32 @@ namespace MidiToKeyApp
                 catch { }
             });
 
-            int osCount = _winRtWatcher?.Devices.Count ?? 0;
-            if (availablePorts.Count == 0)
+            // 第3項目のユーザー向け案内
+            if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
             {
-                DiagnosticLogger.Log($"[Form1] ReloadPortsManually: No MIDI ports detected in backend. OS count={osCount}");
-                if (osCount > 0)
-                {
-                    lblStatus.Text = $"ステータス: 停止中 (OS認識中: {osCount}件 / MIDIバックエンド未反映)";
-                    lblStatus.ForeColor = Color.DarkGoldenrod;
-                    MessageBox.Show(
-                        $"OS上では {osCount} 件のMIDIデバイスが認識されていますが、MIDIバックエンド(WinMM)に反映されていません。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                        "MIDIポート更新未反映",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                }
-                else
-                {
-                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
-                    lblStatus.ForeColor = Color.DarkGoldenrod;
-                    MessageBox.Show(
-                        "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
-                        "MIDIポートなし",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Information);
-                }
+                MessageBox.Show(
+                    $"接続は検出されていますが、MIDIバックエンドには未反映です。\n機器を利用するにはmidi2keyを再起動してください。\n\n検出デバイス: {string.Join(", ", outProcResult.Ports)}",
+                    "MIDIポート未反映 (再起動が必要)",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
+            {
+                MessageBox.Show(
+                    "親プロセスのポート一覧には残存していますが、新規プロセスのWinMMでは検出されませんでした。\n機器が物理的に取り外されている可能性があります。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                    "機器取り外し検出",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            else if (availablePorts.Count == 0)
+            {
+                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+                MessageBox.Show(
+                    "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                    "MIDIポートなし",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
             }
             else
             {
@@ -781,18 +821,32 @@ namespace MidiToKeyApp
                     osDeviceNames = _winRtWatcher.Devices.Select(d => d.Name).ToList();
                 }
 
-                // MIDIリスナーの健全性チェック（DryWetMIDIに残存していてもOS(WinRT)に無ければ切断判定）
-                midiListener.CheckDeviceHealth(osDeviceNames);
-                RefreshPorts(false);
-
-                // バックグラウンドで5系統比較診断を実行してログ記録
+                // 新規プロセスWinMMの結果を非同期で取得してCheckDeviceHealthに引き渡す
                 _ = System.Threading.Tasks.Task.Run(async () => {
                     try
                     {
+                        var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1500);
+                        
+                        if (IsHandleCreated && !IsDisposed)
+                        {
+                            try
+                            {
+                                BeginInvoke(new Action(() => {
+                                    if (IsDisposed) return;
+                                    midiListener.CheckDeviceHealth(osDeviceNames, outProcResult);
+                                    RefreshPorts(false);
+                                }));
+                            }
+                            catch { }
+                        }
+
                         var activePorts = midiListener.GetActivePorts();
                         await MidiDeviceDiagnostics.RunComparisonAsync("DeviceChangeDebounce", activePorts);
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        DiagnosticLogger.Log($"[DebounceTimer] Error during health check: {ex.Message}");
+                    }
                 });
             };
         }

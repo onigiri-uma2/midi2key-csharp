@@ -94,7 +94,7 @@ namespace MidiToKeyApp
         MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null);
         void Stop();
         IReadOnlyList<MidiPortInfo> GetActivePorts();
-        void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null);
+        void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null, OutOfProcessWinMmResult? outOfProcessWinMmResult = null);
         void SimulateDeviceDisconnected(string deviceId, string reason = "テストシミュレート");
     }
 
@@ -190,10 +190,8 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 指定されたポート名のMIDIデバイスを開き、イベントの監視を開始します。
+        /// ロック順序のネストを排除し、EventDispatchLock単独でキューフラッシュと新着イベントの直列化を行います。
         /// </summary>
-        /// <param name="portNames">監視対象のポート名リスト</param>
-        /// <param name="specificGeneration">指定するGeneration（省略時は自動インクリメント）</param>
-        /// <returns>ポート開始処理の結果</returns>
         public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null)
         {
             Stop();
@@ -225,7 +223,6 @@ namespace MidiToKeyApp
                 return new MidiPortStartResult(gen, openedPorts, failedPorts);
             }
 
-            // 同名ポートの重複指定や複数接続に対応するため、ポート名ごとに要求された数を管理
             var remainingRequestedPorts = new List<string>(portList);
 
             foreach (var device in allDevices)
@@ -253,7 +250,7 @@ namespace MidiToKeyApp
                         // 1. イベント購読
                         device.EventReceived += OnEventReceived;
 
-                        // 2. 内部管理リストへの登録（Start前に登録してOpening中のイベントを取りこぼさない）
+                        // 2. 内部管理リストへの登録（ネストなしで _lock 単独取得）
                         lock (_lock)
                         {
                             _devices.Add(info);
@@ -262,16 +259,14 @@ namespace MidiToKeyApp
                         // 3. 監視開始
                         device.StartEventsListening();
 
-                        // 4. 成功時にActiveへ遷移し、Opening中に溜まったイベントを EventDispatchLock のもとで順次フラッシュ
+                        // 4. 成功時にActiveへ遷移し、Opening中に溜まったイベントを EventDispatchLock の下でフラッシュ
+                        // （※_lock とはネストしない。デッドロック防止）
                         lock (info.EventDispatchLock)
                         {
-                            lock (_lock)
+                            info.State = DeviceState.Active;
+                            while (info.PendingEvents.Count > 0)
                             {
-                                info.State = DeviceState.Active;
-                                while (info.PendingEvents.Count > 0)
-                                {
-                                    flushedEvents.Add(info.PendingEvents.Dequeue());
-                                }
+                                flushedEvents.Add(info.PendingEvents.Dequeue());
                             }
 
                             // EventDispatchLock 内でフラッシュイベントをディスパッチすることで、
@@ -298,14 +293,16 @@ namespace MidiToKeyApp
                     {
                         DiagnosticLogger.Log("Start", $"ポート {targetPortName} 開始失敗: {ex.Message}");
 
-                        // 失敗時のロールバック
+                        // 失敗時のロールバック（ネストなしで順次処理）
+                        lock (_lock)
+                        {
+                            _devices.Remove(info);
+                        }
+
                         lock (info.EventDispatchLock)
                         {
-                            lock (_lock)
-                            {
-                                _devices.Remove(info);
-                                info.PendingEvents.Clear();
-                            }
+                            info.State = DeviceState.Closed;
+                            info.PendingEvents.Clear();
                         }
 
                         try
@@ -346,6 +343,7 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// すべてのMIDIデバイスの監視を停止し、リソースを解放します。
+        /// _lock と EventDispatchLock のネストを完全に排除してデッドロックを防止します。
         /// </summary>
         public void Stop()
         {
@@ -353,15 +351,17 @@ namespace MidiToKeyApp
             lock (_lock)
             {
                 devicesToStop = new List<OpenDeviceInfo>(_devices);
-                foreach (var d in devicesToStop)
-                {
-                    lock (d.EventDispatchLock)
-                    {
-                        d.State = DeviceState.Closing;
-                        d.PendingEvents.Clear();
-                    }
-                }
                 _devices.Clear();
+            }
+
+            // _lock 解放後に各デバイスの EventDispatchLock を個別に取得
+            foreach (var d in devicesToStop)
+            {
+                lock (d.EventDispatchLock)
+                {
+                    d.State = DeviceState.Closing;
+                    d.PendingEvents.Clear();
+                }
             }
 
             foreach (var info in devicesToStop)
@@ -384,10 +384,11 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// デバイスの接続状態を再確認し、切断されたデバイスがあれば検出して解放・通知します。
-        /// WindowsのWM_DEVICECHANGEやWinRTデバイス監視から呼び出されます。
+        /// WinRTの0件を単独の切断根拠とせず、新規プロセスWinMMの結果を最重要視して判定します。
         /// </summary>
-        /// <param name="activeOsDeviceNames">OS (WinRT等) が認識している最新のポート名一覧。指定時はDryWetMIDIのキャッシュを越えて判定します。</param>
-        public void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null)
+        public void CheckDeviceHealth(
+            IEnumerable<string>? activeOsDeviceNames = null,
+            OutOfProcessWinMmResult? outOfProcessWinMmResult = null)
         {
             int monitoringCount;
             lock (_lock)
@@ -422,7 +423,6 @@ namespace MidiToKeyApp
             catch (Exception ex)
             {
                 DiagnosticLogger.Log("CheckDeviceHealth", $"InputDevice.GetAll()失敗: {ex.Message}");
-                // 列挙自体が失敗した場合は特定できないため、切断元不明として全停止通知
                 OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(string.Empty, string.Empty, CurrentGeneration, $"デバイス再列挙例外: {ex.Message}"));
                 return;
             }
@@ -431,7 +431,11 @@ namespace MidiToKeyApp
                 ? new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase)
                 : null;
 
-            DiagnosticLogger.Log("CheckDeviceHealth", $"再列挙結果: DryWetMIDI=[{string.Join(", ", currentOnlineNames)}], OS(WinRT)=[{ (osNamesSet != null ? string.Join(", ", osNamesSet) : "未指定") }]");
+            string outProcDesc = outOfProcessWinMmResult.HasValue
+                ? (outOfProcessWinMmResult.Value.Success ? $"[{string.Join(", ", outOfProcessWinMmResult.Value.Ports)}]" : $"失敗({outOfProcessWinMmResult.Value.ErrorMessage})")
+                : "未指定";
+
+            DiagnosticLogger.Log("CheckDeviceHealth", $"再列挙結果: DryWetMIDI=[{string.Join(", ", currentOnlineNames)}], 新規プロセスWinMM={outProcDesc}, WinRT=[{(osNamesSet != null ? string.Join(", ", osNamesSet) : "未指定")}]");
 
             List<OpenDeviceInfo> disconnectedDevices = new();
             bool hasAmbiguousDisconnection = false;
@@ -442,7 +446,6 @@ namespace MidiToKeyApp
                 var activeList = _devices.Where(d => d.State == DeviceState.Active).ToList();
                 DiagnosticLogger.Log("CheckDeviceHealth", $"現在Activeなデバイス: [{string.Join(", ", activeList.Select(d => $"{d.DeviceId}({d.DeviceName})"))}]");
 
-                // デバイス名ごとに個数を比較
                 var activeGroups = activeList.GroupBy(d => d.DeviceName, StringComparer.OrdinalIgnoreCase);
 
                 foreach (var group in activeGroups)
@@ -451,59 +454,79 @@ namespace MidiToKeyApp
                     int activeCount = group.Count();
                     int onlineCount = currentOnlineNames.Count(n => string.Equals(n, portName, StringComparison.OrdinalIgnoreCase));
 
-                    // OS(WinRT)認識リストが提供されている場合、OS側で消えていればDryWetMIDIに名前が残っていても切断と判定
-                    bool missingInOs = osNamesSet != null && !osNamesSet.Contains(portName);
+                    // 第1項目の重要判定:
+                    // 1. 新規プロセスWinMMで対象ポートが存在しているか
+                    bool presentInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                                 outOfProcessWinMmResult.Value.Success &&
+                                                 outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, portName, StringComparison.OrdinalIgnoreCase));
 
-                    if (missingInOs)
+                    // 2. 新規プロセスWinMMで対象ポートが消失しているか（正常取得成功かつ存在しない）
+                    bool missingInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                                 outOfProcessWinMmResult.Value.Success &&
+                                                 !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, portName, StringComparison.OrdinalIgnoreCase));
+
+                    // 3. WinRTでの消失判定:
+                    // ※実機KORG nanoKEY2等でWinRTが常に0件を返す環境があるため、WinRT全体が0件の場合は切断判定に使用しない！
+                    // WinRTで1件以上他のデバイスが認識されている実績がある場合に限り、対象ポートの消失を切断根拠とする。
+                    bool missingInWinRt = osNamesSet != null && osNamesSet.Count > 0 && !osNamesSet.Contains(portName);
+
+                    bool isDisconnected = false;
+
+                    if (presentInOutOfProcess)
                     {
-                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' はDryWetMIDIに残存していますが、OS(WinRT)からは消失しています。切断として処理します。");
-                        foreach (var devInfo in group)
-                        {
-                            lock (devInfo.EventDispatchLock)
-                            {
-                                devInfo.State = DeviceState.Closing;
-                            }
-                            _devices.Remove(devInfo);
-                            disconnectedDevices.Add(devInfo);
-                        }
+                        // 新規プロセスWinMMで認識されているため、WinRTが0件であっても切断とは判断しない！
+                        // （無関係なUSBのWM_DEVICECHANGEによる誤切断防止）
+                        isDisconnected = false;
+                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' は新規プロセスWinMMで検出されているため、接続中を維持します。");
+                    }
+                    else if (missingInOutOfProcess)
+                    {
+                        // 新規プロセスWinMMで消失が確認された場合（最も確実な切断根拠）
+                        isDisconnected = true;
+                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' は新規プロセスWinMMから消失しています。切断として処理します。");
+                    }
+                    else if (missingInWinRt)
+                    {
+                        isDisconnected = true;
+                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' はDryWetMIDIに残存していますが、WinRT(OS認識)から消失しています。切断として処理します。");
                     }
                     else if (onlineCount < activeCount)
                     {
                         int lostCount = activeCount - onlineCount;
-                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' が減少検知: Active={activeCount}, Online={onlineCount}, 減少={lostCount}");
+                        DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{portName}' が親プロセス列挙で減少検知: Active={activeCount}, Online={onlineCount}, 減少={lostCount}");
 
                         if (onlineCount == 0)
                         {
-                            // その名前のデバイスが全滅した場合、所属する全インスタンスが切断されたと特定可能
-                            foreach (var devInfo in group)
-                            {
-                                lock (devInfo.EventDispatchLock)
-                                {
-                                    devInfo.State = DeviceState.Closing;
-                                }
-                                _devices.Remove(devInfo);
-                                disconnectedDevices.Add(devInfo);
-                            }
+                            isDisconnected = true;
                         }
                         else
                         {
-                            // 同名デバイスが複数あり、一部のみ減少した場合: どのインスタンスが切断されたか判別不能
+                            // 同名ポート複数時の一部減少
                             hasAmbiguousDisconnection = true;
                             ambiguousPortName = portName;
                             DiagnosticLogger.Log("CheckDeviceHealth", $"同名ポート '{portName}' の切断元特定不能: 安全停止のため全デバイスを解放対象にします");
-
-                            // 安全側として該当グループのActiveデバイスをすべてClosingにする
-                            foreach (var devInfo in group)
-                            {
-                                lock (devInfo.EventDispatchLock)
-                                {
-                                    devInfo.State = DeviceState.Closing;
-                                }
-                                _devices.Remove(devInfo);
-                                disconnectedDevices.Add(devInfo);
-                            }
+                            isDisconnected = true;
                         }
                     }
+
+                    if (isDisconnected)
+                    {
+                        foreach (var devInfo in group)
+                        {
+                            _devices.Remove(devInfo);
+                            disconnectedDevices.Add(devInfo);
+                        }
+                    }
+                }
+            }
+
+            // _lock 解放後に EventDispatchLock を個別に取得して状態変更（デッドロック防止）
+            foreach (var devInfo in disconnectedDevices)
+            {
+                lock (devInfo.EventDispatchLock)
+                {
+                    devInfo.State = DeviceState.Closing;
+                    devInfo.PendingEvents.Clear();
                 }
             }
 
@@ -527,7 +550,6 @@ namespace MidiToKeyApp
 
             if (hasAmbiguousDisconnection)
             {
-                // 同名デバイスのどちらが切断されたか特定できない場合は切断元不明として全停止通知
                 DiagnosticLogger.Log("CheckDeviceHealth", $"同名デバイス切断元不明通知を発行: Port={ambiguousPortName}");
                 OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(string.Empty, ambiguousPortName, CurrentGeneration, "同名デバイスの切断元特定不能（安全全停止）"));
             }
@@ -548,6 +570,7 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// テスト用・疑似イベント用：指定したデバイス（または全デバイス）の切断をシミュレートします。
+        /// _lock と EventDispatchLock のネストを排除しています。
         /// </summary>
         public void SimulateDeviceDisconnected(string deviceId, string reason = "テストシミュレート")
         {
@@ -562,12 +585,18 @@ namespace MidiToKeyApp
 
                 foreach (var t in targets)
                 {
-                    lock (t.EventDispatchLock)
-                    {
-                        t.State = DeviceState.Closing;
-                    }
                     _devices.Remove(t);
                     disconnectedDevices.Add(t);
+                }
+            }
+
+            // _lock 解放後に EventDispatchLock を取得
+            foreach (var t in disconnectedDevices)
+            {
+                lock (t.EventDispatchLock)
+                {
+                    t.State = DeviceState.Closing;
+                    t.PendingEvents.Clear();
                 }
             }
 
@@ -592,7 +621,6 @@ namespace MidiToKeyApp
 
             if (disconnectedDevices.Count == 0 && string.IsNullOrEmpty(deviceId))
             {
-                // 全切断シミュレートでリストが空の場合でも通知
                 OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(string.Empty, string.Empty, gen, reason));
             }
         }
@@ -609,7 +637,7 @@ namespace MidiToKeyApp
             if (targetInfo == null) return;
 
             // EventDispatchLock により、Opening -> Active移行時のキューフラッシュと
-            // 新着イベントの処理を直列化し、新着イベントの追い越しを防止
+            // 新着イベントの処理を直列化し、新着イベントの追い越しを防止（_lock とはネストしない）
             lock (targetInfo.EventDispatchLock)
             {
                 string deviceId = targetInfo.DeviceId;
@@ -617,10 +645,7 @@ namespace MidiToKeyApp
                 long generation = targetInfo.Generation;
                 DeviceState state = targetInfo.State;
 
-                // 登録されていないデバイスや旧Generationのイベントは破棄
                 if (generation != Interlocked.Read(ref _currentGeneration)) return;
-
-                // Closing / Closed 状態のイベントは破棄
                 if (state == DeviceState.Closing || state == DeviceState.Closed) return;
 
                 var midiEvent = e.Event;
@@ -632,7 +657,6 @@ namespace MidiToKeyApp
 
                     if (state == DeviceState.Opening)
                     {
-                        // Opening中はキューイング
                         if (targetInfo.PendingEvents.Count < 256)
                         {
                             targetInfo.PendingEvents.Enqueue(new QueuedMidiEvent(noteData, null));
