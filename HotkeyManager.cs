@@ -109,6 +109,13 @@ namespace MidiToKeyApp
                 return false;
             }
 
+            // F12はシステム予約・デバッガ用のためホットキー候補から除外・拒否
+            if (string.Equals(settings.Key?.Trim(), "F12", StringComparison.OrdinalIgnoreCase))
+            {
+                errorMessage = "F12キーはWindowsシステム・デバッガ予約キーのためホットキーとして設定できません。";
+                return false;
+            }
+
             // 2. 修飾キーとメインキーの検証
             if (!TryParseModifiers(settings.Modifiers, out uint fsModifiers))
             {
@@ -116,9 +123,16 @@ namespace MidiToKeyApp
                 return false;
             }
 
-            if (!TryGetVkCode(settings.Key, layout, out uint vkCode))
+            if (string.IsNullOrWhiteSpace(settings.Key) || !TryGetVkCode(settings.Key, layout, out uint vkCode))
             {
                 errorMessage = $"メインキー '{settings.Key}' が無効です。";
+                return false;
+            }
+
+            const uint VK_F12 = 0x7B;
+            if (vkCode == VK_F12)
+            {
+                errorMessage = "F12キーはWindowsシステム・デバッガ予約キーのためホットキーとして設定できません。";
                 return false;
             }
 

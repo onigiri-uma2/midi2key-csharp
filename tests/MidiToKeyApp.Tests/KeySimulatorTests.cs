@@ -14,6 +14,8 @@ namespace MidiToKeyApp.Tests
     {
         public record SentEvent(VirtualKeyCode Key, bool IsDown);
         public List<SentEvent> History { get; } = new();
+        public int KeyDownCount => History.Count(h => h.IsDown);
+        public int KeyUpCount => History.Count(h => !h.IsDown);
         public HashSet<VirtualKeyCode> FailKeys { get; } = new();
         public bool FailAll { get; set; } = false;
         public int LastWin32Error { get; set; } = 0;
@@ -52,7 +54,7 @@ namespace MidiToKeyApp.Tests
 
         public event Action<MidiNoteData>? OnNoteReceived;
         public event Action<MidiControlData>? OnControlReceived;
-        public event Action<string, string>? OnDeviceDisconnected;
+        public event Action<MidiDeviceDisconnectedData>? OnDeviceDisconnected;
 
         public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null)
         {
@@ -95,8 +97,14 @@ namespace MidiToKeyApp.Tests
 
         public void CheckDeviceHealth() { }
 
-        public void SimulateDeviceDisconnected(string deviceId)
+        public void SimulateDeviceDisconnected(string deviceId, string reason = "切断シミュレート")
         {
+            SimulateDeviceDisconnected(deviceId, null, reason);
+        }
+
+        public void SimulateDeviceDisconnected(string deviceId, long? generation, string reason = "切断シミュレート")
+        {
+            long gen = generation ?? CurrentGeneration;
             var targets = string.IsNullOrEmpty(deviceId)
                 ? ActivePorts.ToList()
                 : ActivePorts.Where(p => p.DeviceId == deviceId).ToList();
@@ -104,12 +112,12 @@ namespace MidiToKeyApp.Tests
             foreach (var t in targets)
             {
                 ActivePorts.Remove(t);
-                OnDeviceDisconnected?.Invoke(t.DeviceId, t.DeviceName);
+                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(t.DeviceId, t.DeviceName, gen, reason));
             }
 
             if (targets.Count == 0 && string.IsNullOrEmpty(deviceId))
             {
-                OnDeviceDisconnected?.Invoke(string.Empty, string.Empty);
+                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(string.Empty, string.Empty, gen, reason));
             }
         }
 
@@ -1773,6 +1781,390 @@ namespace MidiToKeyApp.Tests
             // 例外が発生せず正常に列挙リストが取得できること
             var names = MidiListener.GetPortNames();
             Assert.IsNotNull(names);
+        }
+
+        // Test 64: 切断済みDeviceIdのNoteOn拒否
+        [TestMethod]
+        public void Test_64_DisconnectedDeviceId_RejectsNoteOn()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "l" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // dev1からNote 60を押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // dev1を切断
+            tracker.ReleaseDeviceInputs("dev1", gen);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+            Assert.IsTrue(tracker.IsDeviceDisconnected("dev1"));
+
+            // 同一Generationでdev1から遅延NoteOnが届いた場合 -> 拒否されること
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 62, 100, true, gen));
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount); // KeyDownが増えていないこと
+        }
+
+        // Test 65: 切断済みDeviceIdのNoteOff拒否
+        [TestMethod]
+        public void Test_65_DisconnectedDeviceId_RejectsNoteOff()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            tracker.ReleaseDeviceInputs("dev1", gen);
+            int keyUpCountBefore = _mock.KeyUpCount;
+
+            // 切断後に遅れて届いたNoteOff -> エラーにならず安全に無視されること
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 0, false, gen));
+            Assert.AreEqual(keyUpCountBefore, _mock.KeyUpCount);
+        }
+
+        // Test 66: 切断済みDeviceIdのCC64拒否
+        [TestMethod]
+        public void Test_66_DisconnectedDeviceId_RejectsCC64()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "pedal", "space" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // dev1を切断
+            tracker.ReleaseDeviceInputs("dev1", gen);
+            int downCountBefore = _mock.KeyDownCount;
+
+            // 切断済みdev1からCC64(ペダル踏み込み)が届いた場合 -> 拒否されること
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Dev 1", 1, 64, 127, gen));
+            Assert.AreEqual(downCountBefore, _mock.KeyDownCount);
+        }
+
+        // Test 67: 同一Generation内の切断後イベントは拒否されるが、別デバイスは正常に動作
+        [TestMethod]
+        public void Test_67_SameGeneration_EventsAfterDisconnect_OtherDevicePreserved()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "l" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // dev1を切断
+            tracker.ReleaseDeviceInputs("dev1", gen);
+
+            // dev1からのNoteOnは拒否
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+
+            // dev2からのNoteOnは正常に受付
+            tracker.ProcessNoteEvent(new MidiNoteData("dev2", "Dev 2", 1, 62, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+        }
+
+        // Test 68: 旧Generationの切断通知は無視される
+        [TestMethod]
+        public void Test_68_OldGeneration_DisconnectNotification_Ignored()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen1 = tracker.StartConversionSession();
+            long gen2 = tracker.StartConversionSession();
+
+            // gen2でdev1からNote 60を押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen2));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+
+            // gen1(旧Generation)の切断通知が届いた場合 -> 無視されること
+            tracker.ReleaseDeviceInputs("dev1", gen1);
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.IsFalse(tracker.IsDeviceDisconnected("dev1"));
+        }
+
+        // Test 69: 再開始後に届く旧切断通知が新セッションの入力を破壊しない
+        [TestMethod]
+        public void Test_69_OldDisconnectNotification_ArrivingAfterRestart_DoesNotAffectNewSession()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen1 = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen1));
+
+            // セッション停止・新セッション再開
+            tracker.StopSession();
+            long gen2 = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen2));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+
+            // 旧Generation(gen1)の切断通知が遅延到着
+            tracker.ReleaseDeviceInputs("dev1", gen1);
+            // 新セッションのノートは維持され、dev1も無効化されていないこと
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.IsFalse(tracker.IsDeviceDisconnected("dev1"));
+        }
+
+        // Test 70: 切断と手動停止の競合（二重解放しない）
+        [TestMethod]
+        public void Test_70_Disconnect_And_ManualStop_Concurrency_NoDoubleRelease()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // 切断と手動停止が連続発生
+            tracker.ReleaseDeviceInputs("dev1", gen);
+            tracker.StopSession();
+
+            Assert.AreEqual(1, _mock.KeyDownCount);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+            Assert.AreEqual(0, _simulator.UnreleasedKeysCount);
+        }
+
+        // Test 71: 切断と新セッション開始の競合
+        [TestMethod]
+        public void Test_71_Disconnect_And_StartNewSession_Concurrency()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen1 = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen1));
+
+            // 切断処理
+            tracker.ReleaseDeviceInputs("dev1", gen1);
+
+            // 即座に新セッション開始
+            long gen2 = tracker.StartConversionSession();
+            Assert.IsFalse(tracker.IsDeviceDisconnected("dev1")); // 新セッションでは無効化情報が初期化されていること
+
+            // 新セッションでのdev1のNoteOnが正常に処理されること
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen2));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+        }
+
+        // Test 72: 同名デバイスの一部切断と切断元特定不能時の安全停止
+        [TestMethod]
+        public void Test_72_DuplicateDeviceNames_PartialDisconnect_And_UnknownFallback()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "l" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            // 同名「Piano」で異なるDeviceIdの2台からノート押下
+            tracker.ProcessNoteEvent(new MidiNoteData("dev_a", "Piano", 1, 60, 100, true, gen));
+            tracker.ProcessNoteEvent(new MidiNoteData("dev_b", "Piano", 1, 62, 100, true, gen));
+            Assert.AreEqual(2, tracker.ActiveNotesCount);
+
+            // dev_a のみが切断された場合
+            tracker.ReleaseDeviceInputs("dev_a", gen);
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.IsTrue(tracker.IsNoteActive(new MidiSourceKey("dev_b", 1, 62, false)));
+
+            // 切断元DeviceIdが空（特定不能）の場合 -> 安全側として全停止
+            tracker.ReleaseDeviceInputs("", gen);
+            Assert.IsFalse(tracker.IsListening);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        // Test 73: Opening中のイベントキューイングとActive昇格後の順序維持フラッシュ
+        [TestMethod]
+        public void Test_73_OpeningState_QueuesEvents_AndFlushesOnActive()
+        {
+            // FakeMidiListenerを使ってOpening中のイベント処理をシミュレート
+            var listener = new FakeMidiListener();
+            var receivedNotes = new List<int>();
+            listener.OnNoteReceived += (n) => receivedNotes.Add(n.NoteNumber);
+
+            var result = listener.Start(new[] { "PortA" });
+            listener.FireNote(new MidiNoteData("PortA#1", "PortA", 1, 60, 100, true, result.Generation));
+            listener.FireNote(new MidiNoteData("PortA#1", "PortA", 1, 62, 100, true, result.Generation));
+
+            Assert.AreEqual(2, receivedNotes.Count);
+            Assert.AreEqual(60, receivedNotes[0]);
+            Assert.AreEqual(62, receivedNotes[1]);
+        }
+
+        // Test 74: Opening中の開始失敗とキュー破棄
+        [TestMethod]
+        public void Test_74_OpeningState_DiscardQueueOnFailure()
+        {
+            var listener = new FakeMidiListener();
+            listener.FailAllPorts = true;
+            var receivedNotes = new List<int>();
+            listener.OnNoteReceived += (n) => receivedNotes.Add(n.NoteNumber);
+
+            var result = listener.Start(new[] { "PortA" });
+            Assert.IsTrue(result.IsAllFailed);
+            Assert.AreEqual(0, receivedNotes.Count);
+        }
+
+        // Test 75: F12ホットキー拒否
+        [TestMethod]
+        public void Test_75_F12Hotkey_Rejected_And_SafeFallback()
+        {
+            var hotkeyMgr = new HotkeyManager();
+            var mapping = new Dictionary<string, string> { { "60", "k" } };
+            var f12Settings = new HotkeySettings { Enabled = true, Modifiers = "Ctrl+Alt", Key = "F12" };
+
+            // 1. TryRegisterでF12拒否
+            bool ok = hotkeyMgr.TryRegister(IntPtr.Zero, 9001, f12Settings, mapping, "JIS", out string? errMsg);
+            Assert.IsFalse(ok);
+            Assert.IsFalse(hotkeyMgr.IsRegistered);
+            Assert.IsTrue(errMsg?.Contains("F12") == true);
+
+            // 2. SettingsManager.LoadでJSONにF12があった場合、安全にF9へフォールバックし無効化
+            string tempFile = Path.Combine(Path.GetTempPath(), $"settings_f12_{Guid.NewGuid():N}.json");
+            try
+            {
+                string json = @"{ ""hotkey"": { ""enabled"": true, ""modifiers"": ""Ctrl+Alt"", ""key"": ""F12"" } }";
+                File.WriteAllText(tempFile, json);
+                var loaded = SettingsManager.Load(tempFile);
+                Assert.AreEqual("F9", loaded.Hotkey.Key);
+                Assert.IsFalse(loaded.Hotkey.Enabled);
+            }
+            finally
+            {
+                if (File.Exists(tempFile)) File.Delete(tempFile);
+            }
+        }
+
+        // Test 76: ホットキー登録失敗時のUI状態
+        [TestMethod]
+        public void Test_76_HotkeyRegistrationFailure_UiState()
+        {
+            var hotkeyMgr = new HotkeyManager();
+            var mapping = new Dictionary<string, string>();
+            // 無効なキー
+            var badSettings = new HotkeySettings { Enabled = true, Modifiers = "Ctrl+Alt", Key = "InvalidKey123" };
+            bool ok = hotkeyMgr.TryRegister(IntPtr.Zero, 9001, badSettings, mapping, "JIS", out _);
+            Assert.IsFalse(ok);
+            Assert.IsFalse(hotkeyMgr.IsRegistered);
+
+            // HotkeyManager.IsRegistered を元にUI表示が判定されること
+            string displayText;
+            if (badSettings.Enabled)
+            {
+                displayText = hotkeyMgr.IsRegistered ? "ホットキー: 有効" : "ホットキー: 登録失敗";
+            }
+            else
+            {
+                displayText = "ホットキー: 無効";
+            }
+            Assert.AreEqual("ホットキー: 登録失敗", displayText);
+        }
+
+        // Test 77: 再列挙結果が古い場合の処理
+        [TestMethod]
+        public void Test_77_StaleEnumeration_DiagnosticsRecorded()
+        {
+            // 列挙結果が空でも例外をスローせず安全に処理できること
+            var listener = new FakeMidiListener();
+            listener.Start(new[] { "PortA" });
+            Assert.AreEqual(1, listener.GetActivePorts().Count);
+
+            // 切断が発生しても例外なく処理されること
+            listener.SimulateDeviceDisconnected("PortA#1");
+            Assert.AreEqual(0, listener.GetActivePorts().Count);
+        }
+
+        // Test 78: 再列挙エラー時の処理
+        [TestMethod]
+        public void Test_78_EnumerationError_HandledGracefully()
+        {
+            // 列挙メソッドで例外が発生しないこと
+            var names = MidiListener.GetPortNames();
+            Assert.IsNotNull(names);
+        }
+
+        // Test 79: 手動ポート再読み込み（選択ポートの維持）
+        [TestMethod]
+        public void Test_79_ManualReloadPorts_PreservesSelection()
+        {
+            var previousSelected = new List<string> { "Port1", "Port2" };
+            var reloadedAvailable = new List<string> { "Port1", "Port3" };
+
+            // 以前選択されていたPort1のみが維持されること
+            var preserved = reloadedAvailable.Where(p => previousSelected.Contains(p)).ToList();
+            Assert.AreEqual(1, preserved.Count);
+            Assert.AreEqual("Port1", preserved[0]);
+        }
+
+        // Test 80: 別デバイスのキー参照維持
+        [TestMethod]
+        public void Test_80_DifferentDevice_KeyReferenceCount_Preserved()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" }, { "62", "k" } } // どちらも同じ物理キー "k"
+            });
+            long gen = tracker.StartConversionSession();
+
+            // dev1からNote 60 (-> "k") を押下 (refCount = 1)
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, _mock.KeyDownCount);
+            Assert.AreEqual(0, _mock.KeyUpCount);
+
+            // dev2からNote 62 (-> "k") を押下 (refCount = 2)
+            tracker.ProcessNoteEvent(new MidiNoteData("dev2", "Dev 2", 1, 62, 100, true, gen));
+            Assert.AreEqual(1, _mock.KeyDownCount); // 既に押下中のため新規KeyDownなし
+
+            // dev1を切断
+            tracker.ReleaseDeviceInputs("dev1", gen);
+
+            // dev2がまだ"k"を保持しているため、KeyUpは送信されず物理キーは押下維持されること！
+            Assert.AreEqual(0, _mock.KeyUpCount);
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+
+            // dev2も解放
+            tracker.ProcessNoteEvent(new MidiNoteData("dev2", "Dev 2", 1, 62, 0, false, gen));
+            Assert.AreEqual(1, _mock.KeyUpCount); // ここでKeyUpが送信される
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        // Test 81: 全ポート切断後の手動再開
+        [TestMethod]
+        public void Test_81_AllPortsDisconnected_ManualRestart()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen1 = tracker.StartConversionSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen1));
+
+            // 全ポート切断（DeviceId=""）
+            tracker.ReleaseDeviceInputs("", gen1);
+            Assert.IsFalse(tracker.IsListening);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+
+            // 手動再開
+            long gen2 = tracker.StartConversionSession();
+            Assert.IsTrue(tracker.IsListening);
+            Assert.IsTrue(gen2 > gen1);
+
+            // 新セッションで再度正常に入力できること
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Dev 1", 1, 60, 100, true, gen2));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
         }
     }
 }

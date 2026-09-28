@@ -100,6 +100,15 @@ namespace MidiToKeyApp
                 settings.Hotkey.Enabled = false;
             }
 
+            // ホットキーにF12（システム/デバッガ予約キー）が指定されていた場合の安全処理
+            if (string.Equals(settings.Hotkey.Key?.Trim(), "F12", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("警告: ホットキーに予約キー 'F12' が指定されています。安全のためデフォルトキー(F9)に変更し無効化します。");
+                DiagnosticLogger.Log("[SettingsManager] Hotkey was set to reserved key F12. Disabling hotkey for safety.");
+                settings.Hotkey.Key = "F9";
+                settings.Hotkey.Enabled = false;
+            }
+
             return settings;
         }
 

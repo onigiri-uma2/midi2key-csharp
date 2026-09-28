@@ -51,8 +51,8 @@ namespace MidiToKeyApp
             var lblKey = new Label { Text = "メインキー:", Top = 65, Left = 15, AutoSize = true };
             _cmbKey = new ComboBox { Top = 62, Left = 90, Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
 
-            // 主要なファンクションキーおよび一般キーを候補に追加
-            for (int i = 1; i <= 12; i++)
+            // 主要なファンクションキー（F1〜F11。F12はシステム予約のため除外）および一般キーを候補に追加
+            for (int i = 1; i <= 11; i++)
             {
                 _cmbKey.Items.Add($"F{i}");
             }
@@ -62,16 +62,22 @@ namespace MidiToKeyApp
                 _cmbKey.Items.Add(k);
             }
 
-            // 現在のキーを選択
-            int selectIdx = _cmbKey.FindStringExact(currentSettings.Key);
+            // 現在のキーを選択（F12の場合は予約キーのため安全にF9へフォールバック）
+            string currentKey = currentSettings.Key ?? "F9";
+            if (string.Equals(currentKey.Trim(), "F12", StringComparison.OrdinalIgnoreCase))
+            {
+                currentKey = "F9";
+            }
+
+            int selectIdx = _cmbKey.FindStringExact(currentKey);
             if (selectIdx >= 0)
             {
                 _cmbKey.SelectedIndex = selectIdx;
             }
             else
             {
-                _cmbKey.Items.Add(currentSettings.Key);
-                _cmbKey.SelectedItem = currentSettings.Key;
+                _cmbKey.Items.Add(currentKey);
+                _cmbKey.SelectedItem = currentKey;
             }
 
             // モディファイアの反映
@@ -90,7 +96,7 @@ namespace MidiToKeyApp
 
             _lblWarn = new Label
             {
-                Text = "※Steamやゲーム独自のショートカットと競合する場合があります。\n※MIDIマッピングキーと同じキーは設定できません。",
+                Text = "※Steamやゲーム独自のショートカットと競合する場合があります。\n※MIDIマッピングキーと同じキーおよびF12は設定できません。",
                 Top = 155,
                 Left = 20,
                 Width = 310,
@@ -103,6 +109,14 @@ namespace MidiToKeyApp
             _btnCancel = new Button { Text = "キャンセル", Top = 195, Left = 240, Width = 85, Height = 28, DialogResult = DialogResult.Cancel };
 
             _btnOk.Click += (s, e) => {
+                string selectedKey = _cmbKey.SelectedItem?.ToString() ?? "F9";
+                if (string.Equals(selectedKey.Trim(), "F12", StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show("F12キーはWindowsシステム・デバッガ予約キーのため設定できません。", "キー選択エラー");
+                    this.DialogResult = DialogResult.None;
+                    return;
+                }
+
                 if (_chkEnabled.Checked)
                 {
                     if (!_chkCtrl.Checked && !_chkAlt.Checked && !_chkShift.Checked && !_chkWin.Checked)
@@ -123,7 +137,7 @@ namespace MidiToKeyApp
                 {
                     Enabled = _chkEnabled.Checked,
                     Modifiers = string.Join("+", modParts),
-                    Key = _cmbKey.SelectedItem?.ToString() ?? "F9"
+                    Key = selectedKey
                 };
             };
 

@@ -38,6 +38,9 @@ namespace MidiToKeyApp
         // キャプチャモード中に取得され、対応するNoteOffを受信するまでキー解放を抑止する入力元のセット
         private readonly HashSet<MidiSourceKey> _suppressedSources = new();
 
+        // 現在のセッション内で切断・無効化されたDeviceIdのセット（同一Generation内の遅延イベントを拒否）
+        private readonly HashSet<string> _disconnectedDeviceIds = new();
+
         /// <summary>
         /// キャプチャモード中にノートまたはペダルを取得した際にUIへ通知するコールバック
         /// </summary>
@@ -68,6 +71,7 @@ namespace MidiToKeyApp
                 _activeNotes.Clear();
                 _pedalStates.Clear();
                 _suppressedSources.Clear();
+                _disconnectedDeviceIds.Clear();
                 return newSessionId;
             }
         }
@@ -95,6 +99,7 @@ namespace MidiToKeyApp
                     _activeNotes.Clear();
                     _pedalStates.Clear();
                     _suppressedSources.Clear();
+                    _disconnectedDeviceIds.Clear();
                     return newSessionId;
                 }
             }
@@ -117,6 +122,7 @@ namespace MidiToKeyApp
                     Interlocked.Increment(ref _currentSessionId);
                     _suppressedSources.Clear();
                     _pedalStates.Clear();
+                    _disconnectedDeviceIds.Clear();
                 }
                 // 変換実行中の場合: Generationは変更せず、_suppressedSourcesはNoteOffまで維持
             }
@@ -137,6 +143,7 @@ namespace MidiToKeyApp
                 _activeNotes.Clear();
                 _pedalStates.Clear();
                 _suppressedSources.Clear();
+                _disconnectedDeviceIds.Clear();
             }
         }
 
@@ -165,6 +172,13 @@ namespace MidiToKeyApp
             lock (_stateLock)
             {
                 if (note.Generation != Interlocked.Read(ref _currentSessionId)) return;
+
+                // 切断済みDeviceIdからの遅延イベントを拒否
+                if (_disconnectedDeviceIds.Contains(note.DeviceId))
+                {
+                    DiagnosticLogger.Log($"[InputTracker] Dropped note event from disconnected device '{note.DeviceId}': Note={note.NoteNumber}, IsDown={note.IsDown}, Gen={note.Generation}");
+                    return;
+                }
 
                 if (note.IsDown)
                 {
@@ -258,6 +272,13 @@ namespace MidiToKeyApp
             lock (_stateLock)
             {
                 if (cc.Generation != Interlocked.Read(ref _currentSessionId)) return;
+
+                // 切断済みDeviceIdからの遅延イベントを拒否
+                if (_disconnectedDeviceIds.Contains(cc.DeviceId))
+                {
+                    DiagnosticLogger.Log($"[InputTracker] Dropped CC64 event from disconnected device '{cc.DeviceId}': Val={cc.ControlValue}, Gen={cc.Generation}");
+                    return;
+                }
 
                 _pedalStates.TryGetValue(pedalKey, out bool currentDown);
 
@@ -360,12 +381,14 @@ namespace MidiToKeyApp
         {
             if (generation != Interlocked.Read(ref _currentSessionId))
             {
+                DiagnosticLogger.Log($"[InputTracker] ReleaseDeviceInputs ignored due to generation mismatch: Received Gen={generation}, Current Gen={CurrentSessionId}");
                 return;
             }
 
             if (string.IsNullOrEmpty(deviceId))
             {
                 // 切断元を特定できない場合は安全側として全セッション停止
+                DiagnosticLogger.Log($"[InputTracker] ReleaseDeviceInputs: DeviceId is empty or unknown. Safely stopping full session.");
                 StopSession();
                 return;
             }
@@ -374,9 +397,16 @@ namespace MidiToKeyApp
 
             lock (_stateLock)
             {
-                if (generation != Interlocked.Read(ref _currentSessionId)) return;
+                if (generation != Interlocked.Read(ref _currentSessionId))
+                {
+                    DiagnosticLogger.Log($"[InputTracker] ReleaseDeviceInputs lock entered but generation changed: Received Gen={generation}, Current Gen={CurrentSessionId}");
+                    return;
+                }
 
-                // 1. 切断デバイスのノート入力を抽出・削除
+                // 1. DeviceIdを無効化（以降、同一Generation内の遅延イベントも拒否）
+                _disconnectedDeviceIds.Add(deviceId);
+
+                // 2. 切断デバイスのノート入力を抽出・削除
                 var deviceNotes = new List<MidiSourceKey>();
                 foreach (var kvp in _activeNotes)
                 {
@@ -392,7 +422,7 @@ namespace MidiToKeyApp
                     _activeNotes.Remove(k);
                 }
 
-                // 2. 切断デバイスのペダル状態を削除
+                // 3. 切断デバイスのペダル状態を削除
                 var pedalKeys = new List<string>();
                 foreach (var pk in _pedalStates.Keys)
                 {
@@ -406,15 +436,23 @@ namespace MidiToKeyApp
                     _pedalStates.Remove(pk);
                 }
 
-                // 3. 切断デバイスのキャプチャ抑止状態を削除
+                // 4. 切断デバイスのキャプチャ抑止状態を削除
                 _suppressedSources.RemoveWhere(s => s.DeviceId == deviceId);
-            }
 
-            // ロック外でキーシミュレータのキー解放を実行（他デバイスと競合しているキーは参照カウントにより押下維持される）
-            foreach (var rk in keysToRelease)
-            {
-                _keySimulator.ReleaseResolvedKey(rk);
+                // 5. 排他制御を保ったままキーシミュレータのキー解放を実行
+                // （他デバイスと競合しているキーは参照カウントにより押下維持される）
+                foreach (var rk in keysToRelease)
+                {
+                    _keySimulator.ReleaseResolvedKey(rk);
+                }
+
+                DiagnosticLogger.Log($"[InputTracker] ReleaseDeviceInputs succeeded for DeviceId='{deviceId}', Gen={generation}, ReleasedKeys={keysToRelease.Count}, RemainingActiveNotes={_activeNotes.Count}");
             }
+        }
+
+        public bool IsDeviceDisconnected(string deviceId)
+        {
+            lock (_stateLock) return _disconnectedDeviceIds.Contains(deviceId);
         }
 
         public bool IsNoteActive(MidiSourceKey key)

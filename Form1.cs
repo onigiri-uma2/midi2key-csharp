@@ -21,6 +21,7 @@ namespace MidiToKeyApp
         private bool isCurrentSettingsCorrupted = false;
         
         private CheckedListBox chkPorts = null!;
+        private Button btnReloadPorts = null!;
         private RadioButton rbJIS = null!;
         private RadioButton rbUS = null!;
         private ListView listMapping = null!;
@@ -37,6 +38,7 @@ namespace MidiToKeyApp
         private InputTracker inputTracker = null!;
         private readonly HotkeyManager hotkeyManager = new();
         private System.Windows.Forms.Timer? deviceDebounceTimer;
+        private volatile bool _isTransitioning = false;
 
         // キー送信エラーの通知集約用
         private int lastReportedErrorCode = 0;
@@ -78,15 +80,15 @@ namespace MidiToKeyApp
             midiListener.OnNoteReceived += (data) => inputTracker.ProcessNoteEvent(data);
             midiListener.OnControlReceived += (data) => inputTracker.ProcessControlEvent(data);
 
-            // デバイス切断イベントの処理
-            midiListener.OnDeviceDisconnected += (deviceId, deviceName) => {
+            // デバイス切断イベントの処理（通知元のGenerationを保持したレコードを受け取る）
+            midiListener.OnDeviceDisconnected += (data) => {
                 if (IsHandleCreated && !IsDisposed)
                 {
                     try
                     {
                         BeginInvoke(new Action(() => {
                             if (IsDisposed) return;
-                            HandleDeviceDisconnected(deviceId, deviceName);
+                            HandleDeviceDisconnected(data);
                         }));
                     }
                     catch { }
@@ -147,7 +149,16 @@ namespace MidiToKeyApp
         {
             if (chkPorts == null) return;
             var checkedPorts = isInitialLoad ? settings.SelectedPorts : GetSelectedPorts();
-            var availablePorts = MidiListener.GetPortNames();
+            List<string> availablePorts;
+            try
+            {
+                availablePorts = MidiListener.GetPortNames().ToList();
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {ex.Message}");
+                return;
+            }
             
             chkPorts.Items.Clear();
             foreach (var port in availablePorts)
@@ -157,6 +168,70 @@ namespace MidiToKeyApp
                 {
                     chkPorts.SetItemChecked(index, true);
                 }
+            }
+        }
+
+        /// <summary>
+        /// ユーザー操作による手動ポート再読み込み。
+        /// 変換実行中の場合は安全停止した上で再列挙し、選択状態を可能な範囲で維持します。
+        /// </summary>
+        private void ReloadPortsManually()
+        {
+            DiagnosticLogger.Log($"[Form1] Manual port reload triggered by user. IsListening={inputTracker.IsListening}");
+
+            if (inputTracker.IsListening)
+            {
+                StopConversion();
+                lblStatus.Text = "ステータス: 停止中 (ポート再読み込みのため安全停止)";
+                lblStatus.ForeColor = Color.Red;
+            }
+
+            var previousSelected = GetSelectedPorts();
+            List<string> availablePorts;
+
+            try
+            {
+                availablePorts = MidiListener.GetPortNames().ToList();
+                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration result: Count={availablePorts.Count}, Ports=[{string.Join(", ", availablePorts)}]");
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Log($"[Form1] ReloadPortsManually enumeration failed: {ex.Message}");
+                MessageBox.Show(
+                    $"MIDIポート一覧の再読み込みに失敗しました。\n\n詳細: {ex.Message}\n\nMIDIポートの接続状態を更新できませんでした。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                    "ポート再読み込みエラー",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            chkPorts.Items.Clear();
+            int restoredCount = 0;
+            foreach (var port in availablePorts)
+            {
+                int index = chkPorts.Items.Add(port);
+                if (previousSelected.Contains(port))
+                {
+                    chkPorts.SetItemChecked(index, true);
+                    restoredCount++;
+                }
+            }
+
+            if (availablePorts.Count == 0)
+            {
+                DiagnosticLogger.Log("[Form1] ReloadPortsManually: No MIDI ports detected.");
+                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+                MessageBox.Show(
+                    "利用可能なMIDIポートが検出されませんでした。\n\nMIDIポートの接続状態を更新できませんでした。\n機器を接続し直しても反映されない場合は、midi2keyを再起動してください。",
+                    "MIDIポートなし",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                lblStatus.Text = $"ステータス: 停止中 (ポート再読み込み完了: {availablePorts.Count}件検出)";
+                lblStatus.ForeColor = Color.Blue;
             }
         }
 
@@ -238,6 +313,18 @@ namespace MidiToKeyApp
             var lblPortWarn = new Label { Text = "※機器の抜き差し時は自動検知または再起動してください", ForeColor = Color.DarkSlateGray, Top = 88, Left = 5, AutoSize = true };
             grpPorts.Controls.Add(lblPortWarn);
             this.Controls.Add(grpPorts);
+
+            btnReloadPorts = new Button 
+            { 
+                Text = "🔄 ポート\n再読み込み", 
+                Top = 65, 
+                Left = 295, 
+                Width = 105, 
+                Height = 60, 
+                Font = new Font(this.Font.FontFamily, 8.5f) 
+            };
+            btnReloadPorts.Click += (s, e) => ReloadPortsManually();
+            this.Controls.Add(btnReloadPorts);
 
             var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
             listMapping = new ListView 
@@ -602,6 +689,7 @@ namespace MidiToKeyApp
             deviceDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
             deviceDebounceTimer.Tick += (s, e) => {
                 deviceDebounceTimer.Stop();
+                DiagnosticLogger.Log($"[DebounceTimer] Tick fired. Invoking CheckDeviceHealth(). Gen={inputTracker.CurrentSessionId}");
                 midiListener.CheckDeviceHealth();
                 RefreshPorts(false);
             };
@@ -610,7 +698,15 @@ namespace MidiToKeyApp
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+            DiagnosticLogger.Log("[Form1] OnHandleCreated: Updating hotkey registration.");
             UpdateHotkeyRegistration();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            DiagnosticLogger.Log("[Form1] OnHandleDestroyed: Unregistering hotkey.");
+            hotkeyManager.Unregister();
+            base.OnHandleDestroyed(e);
         }
 
         /// <summary>
@@ -670,6 +766,7 @@ namespace MidiToKeyApp
                 UpdateHotkeyUi();
                 if (!string.IsNullOrEmpty(errMsg))
                 {
+                    DiagnosticLogger.Log($"[Form1] Hotkey registration failed: {errMsg}");
                     Console.WriteLine($"ホットキー登録通知: {errMsg}");
                 }
             }
@@ -681,11 +778,21 @@ namespace MidiToKeyApp
 
             if (settings?.Hotkey != null && settings.Hotkey.Enabled)
             {
-                lblHotkeyInfo.Text = $"ホットキー: 有効 ({settings.Hotkey.Modifiers}+{settings.Hotkey.Key})";
+                if (hotkeyManager.IsRegistered)
+                {
+                    lblHotkeyInfo.Text = $"ホットキー: 有効 ({settings.Hotkey.Modifiers}+{settings.Hotkey.Key})";
+                    lblHotkeyInfo.ForeColor = Color.FromArgb(40, 40, 40);
+                }
+                else
+                {
+                    lblHotkeyInfo.Text = $"ホットキー: 登録失敗 ({settings.Hotkey.Modifiers}+{settings.Hotkey.Key})";
+                    lblHotkeyInfo.ForeColor = Color.Red;
+                }
             }
             else
             {
                 lblHotkeyInfo.Text = "ホットキー: 無効";
+                lblHotkeyInfo.ForeColor = Color.Gray;
             }
         }
 
@@ -694,6 +801,8 @@ namespace MidiToKeyApp
         /// </summary>
         private void ToggleConversion()
         {
+            if (_isTransitioning) return;
+
             if (inputTracker.IsListening)
             {
                 StopConversion();
@@ -709,69 +818,78 @@ namespace MidiToKeyApp
         /// </summary>
         private void StartConversion()
         {
-            if (inputTracker.IsListening) return;
+            if (_isTransitioning || inputTracker.IsListening) return;
+            _isTransitioning = true;
 
-            var ports = GetSelectedPorts();
-            if (ports.Count == 0)
+            try
             {
-                MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
-                return;
+                var ports = GetSelectedPorts();
+                if (ports.Count == 0)
+                {
+                    MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
+                    return;
+                }
+                
+                UpdateSettingsFromUI();
+
+                // 未解放キーの再試行・復旧確認
+                if (!keySimulator.TryPrepareStartConversion())
+                {
+                    MessageBox.Show(
+                        $"キー解放に失敗した未解放キー（{keySimulator.UnreleasedKeysCount} 件）が残っているため、変換を開始できません。\nキー入力を解放してから再度お試しください。",
+                        "未解放キー警告",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                long sessionId = inputTracker.StartConversionSession();
+                DiagnosticLogger.Log($"[Form1] StartConversion invoked. Generated Gen={sessionId}, Ports=[{string.Join(", ", ports)}]");
+                var startResult = midiListener.Start(ports, sessionId);
+
+                if (startResult.IsAllFailed)
+                {
+                    // 全ポート開始失敗時のロールバック
+                    inputTracker.StopSession();
+                    string errDetails = string.Join("\n", startResult.FailedPorts.Select(f => $"・{f.PortName}: {f.Reason}"));
+                    lblStatus.Text = "ステータス: 停止中 (ポート開始失敗)";
+                    lblStatus.ForeColor = Color.Red;
+                    MessageBox.Show(
+                        $"すべてのMIDIポートの開始に失敗しました。\n\n詳細:\n{errDetails}",
+                        "ポート開始エラー",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+
+                // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
+                if (txtNote.Focused)
+                {
+                    inputTracker.SetCapturing(true);
+                }
+
+                if (startResult.IsPartialSuccess)
+                {
+                    // 一部ポート失敗時の正常ポート継続
+                    string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
+                    string openedNames = string.Join(", ", startResult.OpenedPorts.Select(o => o.DeviceName));
+                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中, 失敗: {failedNames})";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    MessageBox.Show(
+                        $"一部のポートの開始に失敗しました:\n・{failedNames}\n\n次の正常なポートで監視を開始しました:\n・{openedNames}",
+                        "一部ポート開始警告",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                else
+                {
+                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中)";
+                    lblStatus.ForeColor = Color.Green;
+                }
             }
-            
-            UpdateSettingsFromUI();
-
-            // 未解放キーの再試行・復旧確認
-            if (!keySimulator.TryPrepareStartConversion())
+            finally
             {
-                MessageBox.Show(
-                    $"キー解放に失敗した未解放キー（{keySimulator.UnreleasedKeysCount} 件）が残っているため、変換を開始できません。\nキー入力を解放してから再度お試しください。",
-                    "未解放キー警告",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
-
-            long sessionId = inputTracker.StartConversionSession();
-            var startResult = midiListener.Start(ports, sessionId);
-
-            if (startResult.IsAllFailed)
-            {
-                // 全ポート開始失敗時のロールバック
-                inputTracker.StopSession();
-                string errDetails = string.Join("\n", startResult.FailedPorts.Select(f => $"・{f.PortName}: {f.Reason}"));
-                lblStatus.Text = "ステータス: 停止中 (ポート開始失敗)";
-                lblStatus.ForeColor = Color.Red;
-                MessageBox.Show(
-                    $"すべてのMIDIポートの開始に失敗しました。\n\n詳細:\n{errDetails}",
-                    "ポート開始エラー",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                return;
-            }
-
-            // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
-            if (txtNote.Focused)
-            {
-                inputTracker.SetCapturing(true);
-            }
-
-            if (startResult.IsPartialSuccess)
-            {
-                // 一部ポート失敗時の正常ポート継続
-                string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
-                string openedNames = string.Join(", ", startResult.OpenedPorts.Select(o => o.DeviceName));
-                lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中, 失敗: {failedNames})";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-                MessageBox.Show(
-                    $"一部のポートの開始に失敗しました:\n・{failedNames}\n\n次の正常なポートで監視を開始しました:\n・{openedNames}",
-                    "一部ポート開始警告",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-            }
-            else
-            {
-                lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート監視中)";
-                lblStatus.ForeColor = Color.Green;
+                _isTransitioning = false;
             }
         }
 
@@ -782,54 +900,78 @@ namespace MidiToKeyApp
         /// </summary>
         private void StopConversion()
         {
-            // (1) 新規キー送信無効化、セッション無効化、全キー解放、内部状態クリア
-            inputTracker.StopSession();
+            if (_isTransitioning) return;
+            _isTransitioning = true;
 
-            // (2) ロック外でMIDIリスナーを停止し、受信スレッドの完了を安全に待機
-            midiListener.Stop();
-
-            // (3) 未解放キーがあれば再試行
-            bool allReleased = keySimulator.RetryReleasePendingKeys();
-
-            // (4) UIステータス更新
-            if (allReleased && !keySimulator.HasUnreleasedKeys)
+            try
             {
-                lblStatus.Text = "ステータス: 停止中";
-                lblStatus.ForeColor = Color.Red;
+                DiagnosticLogger.Log($"[Form1] StopConversion invoked. CurrentGen={inputTracker.CurrentSessionId}");
+
+                // (1) 新規キー送信無効化、セッション無効化、全キー解放、内部状態クリア
+                inputTracker.StopSession();
+
+                // (2) ロック外でMIDIリスナーを停止し、受信スレッドの完了を安全に待機
+                midiListener.Stop();
+
+                // (3) 未解放キーがあれば再試行
+                bool allReleased = keySimulator.RetryReleasePendingKeys();
+
+                // (4) UIステータス更新
+                if (allReleased && !keySimulator.HasUnreleasedKeys)
+                {
+                    lblStatus.Text = "ステータス: 停止中";
+                    lblStatus.ForeColor = Color.Red;
+                }
+                else
+                {
+                    lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
+                    lblStatus.ForeColor = Color.DarkOrange;
+                }
             }
-            else
+            finally
             {
-                lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
-                lblStatus.ForeColor = Color.DarkOrange;
+                _isTransitioning = false;
             }
         }
 
         /// <summary>
         /// デバイス切断イベント発生時のハンドラ。
-        /// 切断されたデバイスの入力のみを解放し、全切断または切断元不明時は変換を安全に停止します。
+        /// 切断通知に含まれる発生元Generationを検証し、旧セッション通知を破棄します。
+        /// 切断元が特定できる場合は該当デバイスの入力のみを解放し、全切断または切断元特定不能時は全変換を安全停止します。
         /// </summary>
-        private void HandleDeviceDisconnected(string deviceId, string deviceName)
+        private void HandleDeviceDisconnected(MidiDeviceDisconnectedData data)
         {
+            DiagnosticLogger.Log($"[Form1] HandleDeviceDisconnected: DeviceId='{data.DeviceId}', Name='{data.DeviceName}', DisconnectGen={data.Generation}, CurrentGen={inputTracker.CurrentSessionId}, Reason='{data.Reason}'");
+
+            // 切断通知が発生した時点のGenerationと、現在のセッションGenerationを検証
+            if (data.Generation != inputTracker.CurrentSessionId)
+            {
+                DiagnosticLogger.Log($"[Form1] Disconnect notification dropped: Generation mismatch (NotificationGen={data.Generation} != CurrentGen={inputTracker.CurrentSessionId})");
+                return;
+            }
+
             // 切断されたデバイスの入力のみを解放（別デバイスの押下状態は維持）
-            inputTracker.ReleaseDeviceInputs(deviceId, inputTracker.CurrentSessionId);
+            inputTracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
             RefreshPorts(false);
 
             var activePorts = midiListener.GetActivePorts();
-            if (activePorts.Count == 0 || string.IsNullOrEmpty(deviceId))
+            if (activePorts.Count == 0 || string.IsNullOrEmpty(data.DeviceId))
             {
-                // 全ポート切断または切断元不明の場合: 安全側として変換全体を停止
+                // 全ポート切断または同名等で切断元特定不能の場合: 安全側として変換全体を停止
+                DiagnosticLogger.Log($"[Form1] Full disconnect or unidentified device disconnect. Stopping conversion safely. RemainingActivePorts={activePorts.Count}");
                 StopConversion();
                 lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断検知)";
                 lblStatus.ForeColor = Color.Red;
                 MessageBox.Show(
-                    $"MIDIデバイスの切断を検知したため、安全のためキーを解放して変換を停止しました。\n切断元: {(string.IsNullOrEmpty(deviceName) ? "不明" : deviceName)}\n\n※再開するには機器を接続し直し、変換開始ボタンまたはトグルホットキーで再開してください。",
+                    $"MIDIデバイスの切断を検知したため、安全のためキーを解放して変換を停止しました。\n切断元: {(string.IsNullOrEmpty(data.DeviceName) ? "特定不能" : data.DeviceName)}\n理由: {data.Reason}\n\n※再開するには機器を接続し直し、変換開始ボタンまたはトグルホットキーで再開してください。",
                     "デバイス切断検知",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
             }
             else
             {
-                lblStatus.Text = $"ステータス: 実行中 (切断: {deviceName}, 残り {activePorts.Count} ポート)";
+                DiagnosticLogger.Log($"[Form1] Partial device disconnected. ActivePorts={activePorts.Count}");
+                lblStatus.Text = $"ステータス: 実行中 (切断: {data.DeviceName}, 残り {activePorts.Count} ポート)";
                 lblStatus.ForeColor = Color.DarkGoldenrod;
             }
         }
@@ -874,6 +1016,9 @@ namespace MidiToKeyApp
             const int WM_HOTKEY = 0x0312;
             const int WM_DEVICECHANGE = 0x0219;
             const int DBT_DEVNODES_CHANGED = 0x0007;
+            const int DBT_DEVICEARRIVAL = 0x8000;
+            const int DBT_DEVICEREMOVEPENDING = 0x8003;
+            const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
 
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HotkeyManager.DEFAULT_HOTKEY_ID)
             {
@@ -883,11 +1028,22 @@ namespace MidiToKeyApp
 
             if (m.Msg == WM_DEVICECHANGE)
             {
-                if (m.WParam.ToInt32() == DBT_DEVNODES_CHANGED)
+                long wParam = m.WParam.ToInt64();
+                DiagnosticLogger.Log($"[WndProc] WM_DEVICECHANGE received: wParam=0x{wParam:X4}, lParam=0x{m.LParam.ToInt64():X}");
+
+                if (wParam == DBT_DEVNODES_CHANGED ||
+                    wParam == DBT_DEVICEARRIVAL ||
+                    wParam == DBT_DEVICEREMOVEPENDING ||
+                    wParam == DBT_DEVICEREMOVECOMPLETE)
                 {
+                    DiagnosticLogger.Log($"[WndProc] Matched device change notification (0x{wParam:X4}). Scheduling CheckDeviceHealth debounce.");
                     // デバイス変更通知をデバウンスして処理
                     deviceDebounceTimer?.Stop();
                     deviceDebounceTimer?.Start();
+                }
+                else
+                {
+                    DiagnosticLogger.Log($"[WndProc] WM_DEVICECHANGE wParam 0x{wParam:X4} ignored (unhandled sub-notification).");
                 }
             }
 

@@ -26,6 +26,7 @@
     <Compile Include="..\..\MidiListener.cs" Link="MidiListener.cs" />
     <Compile Include="..\..\HotkeyManager.cs" Link="HotkeyManager.cs" />
     <Compile Include="..\..\HotkeyConfigDialog.cs" Link="HotkeyConfigDialog.cs" />
+    <Compile Include="..\..\DiagnosticLogger.cs" Link="DiagnosticLogger.cs" />
   </ItemGroup>
 
 </Project>
