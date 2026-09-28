@@ -356,7 +356,7 @@ namespace MidiToKeyApp
         private void InitializeComponentProgrammatically()
         {
             var version = typeof(Form1).Assembly.GetName().Version;
-            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.3";
+            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.1.0";
             this.Text = $"midi2key C#{verStr}";
             this.Width = 430;
             this.Height = 550;
