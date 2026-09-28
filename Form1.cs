@@ -17,6 +17,7 @@ namespace MidiToKeyApp
         private AppSettings settings;
         private string appDir = AppDomain.CurrentDomain.BaseDirectory;
         private string currentSettingsDir = AppDomain.CurrentDomain.BaseDirectory;
+        private string currentSettingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
         
         private CheckedListBox chkPorts;
         private RadioButton rbJIS;
@@ -30,8 +31,8 @@ namespace MidiToKeyApp
         private MidiListener midiListener;
         private KeySimulator keySimulator;
         
-        private bool isListening = false;
-        private bool isCapturingNote = false;
+        private volatile bool isListening = false;
+        private volatile bool isCapturingNote = false;
         
         public Form1()
         {
@@ -45,6 +46,44 @@ namespace MidiToKeyApp
             midiListener = new MidiListener();
             keySimulator = new KeySimulator();
             midiListener.OnNoteChange += MidiListener_OnNoteChange;
+            midiListener.OnControlChange += MidiListener_OnControlChange;
+        }
+
+        /// <summary>
+        /// コントロールチェンジ（サステインペダル CC 64 など）を受け取った際のイベントハンドラ。
+        /// </summary>
+        private void MidiListener_OnControlChange(int controlNumber, int value)
+        {
+            // CC 64 = ダンパー / サステインペダル
+            if (controlNumber == 64)
+            {
+                bool isDown = value >= 64; // 64以上でペダル踏み込み、64未満で解放
+
+                if (isCapturingNote && isDown)
+                {
+                    Invoke((MethodInvoker)delegate {
+                        txtNote.Text = "pedal";
+                    });
+                    return;
+                }
+
+                if (isListening)
+                {
+                    string? mappedKey = null;
+                    lock (settings.MappingLock)
+                    {
+                        if (settings.Mapping.TryGetValue("pedal", out var key))
+                        {
+                            mappedKey = key;
+                        }
+                    }
+
+                    if (mappedKey != null)
+                    {
+                        keySimulator.SendKey(mappedKey, isDown, settings.KeyboardLayout);
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -63,21 +102,32 @@ namespace MidiToKeyApp
                 return;
             }
             
-            if (isListening && settings.Mapping.ContainsKey(noteNumber.ToString()))
+            if (isListening)
             {
-                string mappedKey = settings.Mapping[noteNumber.ToString()];
-                keySimulator.SendKey(mappedKey, isDown, settings.KeyboardLayout);
+                string noteKey = noteNumber.ToString();
+                string? mappedKey = null;
+
+                lock (settings.MappingLock)
+                {
+                    if (settings.Mapping.TryGetValue(noteKey, out var key))
+                    {
+                        mappedKey = key;
+                    }
+                }
+
+                if (mappedKey != null)
+                {
+                    keySimulator.SendKey(mappedKey, isDown, settings.KeyboardLayout);
+                }
             }
         }
 
         private void LoadInitialSettings()
         {
-            string path = Path.Combine(appDir, "settings.json");
-            settings = SettingsManager.Load(path);
+            currentSettingsPath = Path.Combine(appDir, "settings.json");
+            currentSettingsDir = appDir;
+            settings = SettingsManager.Load(currentSettingsPath);
             
-            // Only call RefreshPorts if chkPorts is already initialized.
-            // Wait, LoadInitialSettings is called in constructor AFTER InitializeComponentProgrammatically.
-            // So chkPorts is not null.
             RefreshPorts(true);
 
             if (settings.KeyboardLayout == "US")
@@ -105,12 +155,35 @@ namespace MidiToKeyApp
             }
         }
 
+        /// <summary>
+        /// マッピング辞書の内容をリストボックスに描画します。
+        /// 88鍵盤（21〜108）などのノート番号には対応する音階名（例: C4 / ド）を併記します。
+        /// </summary>
         private void RefreshMappingList()
         {
             listMapping.Items.Clear();
-            foreach (var kvp in settings.Mapping.OrderBy(x => int.Parse(x.Key)))
+            List<KeyValuePair<string, string>> pairs;
+            lock (settings.MappingLock)
             {
-                listMapping.Items.Add($"Note {kvp.Key} → {kvp.Value}");
+                pairs = settings.Mapping
+                    .OrderBy(x => x.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase) ? 9999 : (int.TryParse(x.Key, out int n) ? n : 9998))
+                    .ToList();
+            }
+            foreach (var kvp in pairs)
+            {
+                if (kvp.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
+                {
+                    listMapping.Items.Add($"Pedal (CC64 / サステイン) → {kvp.Value}");
+                }
+                else if (int.TryParse(kvp.Key, out int note))
+                {
+                    string noteName = MidiNoteHelper.GetNoteDisplayName(note);
+                    listMapping.Items.Add($"Note {note} ({noteName}) → {kvp.Value}");
+                }
+                else
+                {
+                    listMapping.Items.Add($"{kvp.Key} → {kvp.Value}");
+                }
             }
         }
         
@@ -120,22 +193,30 @@ namespace MidiToKeyApp
         /// </summary>
         private void InitializeComponentProgrammatically()
         {
-            this.Text = "midi2key C#";
-            this.Width = 420;
-            this.Height = 540;
+            var version = typeof(Form1).Assembly.GetName().Version;
+            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.2";
+            this.Text = $"midi2key C#{verStr}";
+            this.Width = 430;
+            this.Height = 555;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.Font = new Font("Yu Gothic UI", 9);
 
-            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 290, Width = 100, Height = 50 };
-            rbUS = new RadioButton { Text = "US", Top = 20, Left = 50, Width = 45 };
+            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 50 };
+            rbUS = new RadioButton { Text = "US", Top = 20, Left = 55, Width = 45 };
             rbJIS = new RadioButton { Text = "JIS", Top = 20, Left = 10, Width = 45 };
+            rbUS.CheckedChanged += (s, e) => {
+                if (rbUS.Checked) settings.KeyboardLayout = "US";
+            };
+            rbJIS.CheckedChanged += (s, e) => {
+                if (rbJIS.Checked) settings.KeyboardLayout = "JIS";
+            };
             grpLayout.Controls.Add(rbUS);
             grpLayout.Controls.Add(rbJIS);
             this.Controls.Add(grpLayout);
 
-            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 270, Height = 115, Top = 10, Left = 10 };
-            chkPorts = new CheckedListBox { Top = 20, Left = 10, Width = 250, Height = 65, BorderStyle = BorderStyle.None, CheckOnClick = true };
+            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 115, Top = 10, Left = 10 };
+            chkPorts = new CheckedListBox { Top = 20, Left = 10, Width = 255, Height = 65, BorderStyle = BorderStyle.None, CheckOnClick = true };
             chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
             grpPorts.Controls.Add(chkPorts);
 
@@ -144,22 +225,34 @@ namespace MidiToKeyApp
             this.Controls.Add(grpPorts);
             
             var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
-            listMapping = new ListBox { Top = 155, Left = 10, Width = 370, Height = 135 };
+            listMapping = new ListBox { Top = 155, Left = 10, Width = 390, Height = 135 };
             listMapping.SelectedIndexChanged += (s, e) => {
                 if (listMapping.SelectedItem == null) return;
                 var str = listMapping.SelectedItem.ToString();
+                if (string.IsNullOrEmpty(str)) return;
                 var parts = str.Split('→');
                 if (parts.Length == 2)
                 {
-                    txtNote.Text = parts[0].Replace("Note", "").Trim();
+                    var left = parts[0].Trim();
+                    if (left.StartsWith("Pedal", StringComparison.OrdinalIgnoreCase))
+                    {
+                        txtNote.Text = "pedal";
+                    }
+                    else
+                    {
+                        var numPart = left.Replace("Note", "").Trim();
+                        int parenIndex = numPart.IndexOf('(');
+                        if (parenIndex >= 0) numPart = numPart.Substring(0, parenIndex).Trim();
+                        txtNote.Text = numPart;
+                    }
                     txtKey.Text = parts[1].Trim();
                 }
             };
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "🎹 ノート番号", Top = 300, Left = 10, AutoSize = true };
-            txtNote = new TextBox { Top = 320, Left = 10, Width = 60 };
+            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 300, Left = 10, AutoSize = true };
+            txtNote = new TextBox { Top = 320, Left = 10, Width = 75 };
             txtNote.Enter += (s, e) => {
                 isCapturingNote = true;
                 midiListener.Start(GetSelectedPorts());
@@ -169,9 +262,15 @@ namespace MidiToKeyApp
                 if (!isListening) midiListener.Stop();
             };
 
-            var lblKey = new Label { Text = "⌨ キー", Top = 300, Left = 100, AutoSize = true };
-            txtKey = new TextBox { Top = 320, Left = 100, Width = 130, ReadOnly = true, BackColor = SystemColors.Window };
+            var lblKey = new Label { Text = "⌨ キー", Top = 300, Left = 95, AutoSize = true };
+            txtKey = new TextBox { Top = 320, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
+            // ⑥ キー入力欄の「消去」ボタン
+            var btnClearKey = new Button { Text = "消去", Top = 319, Left = 215, Width = 50, Height = 25 };
+            btnClearKey.Click += (s, e) => {
+                txtKey.Text = "";
+            };
+
             txtKey.Enter += (s, e) => {
                 txtKey.Text = "";
                 if (globalHook == null)
@@ -208,24 +307,81 @@ namespace MidiToKeyApp
                 }
             };
 
-            var btnAdd = new Button { Text = "追加", Top = 295, Left = 320, Width = 60, Height = 25 };
+            // ⑤ ノート番号バリデーション（0〜127）および pedal の登録
+            var btnAdd = new Button { Text = "追加", Top = 295, Left = 315, Width = 85, Height = 25 };
             btnAdd.Click += (s, e) => {
-                if (int.TryParse(txtNote.Text, out int note) && !string.IsNullOrEmpty(txtKey.Text))
+                string noteInput = txtNote.Text.Trim();
+                string keyInput = txtKey.Text.Trim();
+
+                if (string.IsNullOrEmpty(noteInput))
                 {
-                    settings.Mapping[note.ToString()] = txtKey.Text;
+                    MessageBox.Show("ノート番号（または pedal）を入力してください。", "入力エラー");
+                    return;
+                }
+                if (string.IsNullOrEmpty(keyInput))
+                {
+                    MessageBox.Show("割り当てるキーを設定してください。", "入力エラー");
+                    return;
+                }
+
+                if (noteInput.Equals("pedal", StringComparison.OrdinalIgnoreCase))
+                {
+                    lock (settings.MappingLock)
+                    {
+                        settings.Mapping["pedal"] = keyInput;
+                    }
+                    RefreshMappingList();
+                    return;
+                }
+
+                if (int.TryParse(noteInput, out int note))
+                {
+                    if (note < 0 || note > 127)
+                    {
+                        MessageBox.Show("MIDIノート番号は 0 〜 127 の範囲で入力してください。\n（一般的な88鍵盤ピアノは 21[A0] 〜 108[C8] です）", "範囲エラー");
+                        return;
+                    }
+
+                    lock (settings.MappingLock)
+                    {
+                        settings.Mapping[note.ToString()] = keyInput;
+                    }
                     RefreshMappingList();
                 }
-                else MessageBox.Show("ノート番号は数値で入力してください。", "エラー");
+                else
+                {
+                    MessageBox.Show("ノート番号は 0〜127 の数値、または「pedal」を入力してください。", "入力エラー");
+                }
             };
             
-            var btnDel = new Button { Text = "削除", Top = 325, Left = 320, Width = 60, Height = 25 };
+            var btnDel = new Button { Text = "削除", Top = 325, Left = 315, Width = 85, Height = 25 };
             btnDel.Click += (s, e) => {
                 if (listMapping.SelectedIndex >= 0)
                 {
-                    var str = listMapping.SelectedItem.ToString();
-                    var note = str.Split('→')[0].Replace("Note", "").Trim();
-                    settings.Mapping.Remove(note);
-                    RefreshMappingList();
+                    var str = listMapping.SelectedItem?.ToString();
+                    if (!string.IsNullOrEmpty(str))
+                    {
+                        var parts = str.Split('→');
+                        var left = parts[0].Trim();
+                        string keyToRemove;
+                        if (left.StartsWith("Pedal", StringComparison.OrdinalIgnoreCase))
+                        {
+                            keyToRemove = "pedal";
+                        }
+                        else
+                        {
+                            var numPart = left.Replace("Note", "").Trim();
+                            int parenIndex = numPart.IndexOf('(');
+                            if (parenIndex >= 0) numPart = numPart.Substring(0, parenIndex).Trim();
+                            keyToRemove = numPart;
+                        }
+
+                        lock (settings.MappingLock)
+                        {
+                            settings.Mapping.Remove(keyToRemove);
+                        }
+                        RefreshMappingList();
+                    }
                 }
             };
 
@@ -233,46 +389,71 @@ namespace MidiToKeyApp
             this.Controls.Add(txtNote);
             this.Controls.Add(lblKey);
             this.Controls.Add(txtKey);
+            this.Controls.Add(btnClearKey);
             this.Controls.Add(btnAdd);
             this.Controls.Add(btnDel);
 
-            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 365, Left = 10, Width = 370, Height = 2 };
+            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 360, Left = 10, Width = 390, Height = 2 };
             this.Controls.Add(sep);
 
-            var btnSave = new Button { Text = "設定保存", Top = 380, Left = 10, Width = 80 };
+            // ⑦ 「上書き保存」ボタン
+            var btnSave = new Button { Text = "上書き保存", Top = 375, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
+                UpdateSettingsFromUI();
+                try
+                {
+                    SettingsManager.Save(currentSettingsPath, settings);
+                    lblStatus.Text = $"保存完了: {Path.GetFileName(currentSettingsPath)}";
+                    lblStatus.ForeColor = Color.Blue;
+                    MessageBox.Show($"設定を保存しました。\n保存先: {currentSettingsPath}", "保存完了");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("設定の保存に失敗しました: " + ex.Message, "エラー");
+                }
+            };
+
+            // ⑦ 「別名保存」ボタン
+            var btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
+            btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
                 {
-                    sfd.InitialDirectory = currentSettingsDir;
+                    sfd.InitialDirectory = Path.GetDirectoryName(currentSettingsPath);
                     sfd.Filter = "JSONファイル (*.json)|*.json|すべてのファイル (*.*)|*.*";
                     sfd.DefaultExt = "json";
-                    sfd.FileName = "settings.json";
+                    sfd.FileName = Path.GetFileName(currentSettingsPath);
                     if (sfd.ShowDialog() == DialogResult.OK)
                     {
-                        currentSettingsDir = Path.GetDirectoryName(sfd.FileName);
-                        SettingsManager.Save(sfd.FileName, settings);
-                        MessageBox.Show("保存完了しました。");
+                        currentSettingsPath = sfd.FileName;
+                        currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
+                        SettingsManager.Save(currentSettingsPath, settings);
+                        MessageBox.Show("別名保存が完了しました。\n保存先: " + currentSettingsPath, "保存完了");
                     }
                 }
             };
             
-            var btnLoad = new Button { Text = "設定読み込み", Top = 380, Left = 290, Width = 90 };
+            var btnLoad = new Button { Text = "設定読込", Top = 375, Left = 305, Width = 95, Height = 28 };
             btnLoad.Click += (s, e) => {
                 using (var ofd = new OpenFileDialog())
                 {
-                    ofd.InitialDirectory = currentSettingsDir;
+                    ofd.InitialDirectory = Path.GetDirectoryName(currentSettingsPath);
                     ofd.Filter = "JSONファイル (*.json)|*.json|すべてのファイル (*.*)|*.*";
                     if (ofd.ShowDialog() == DialogResult.OK)
                     {
                         try 
                         {
-                            currentSettingsDir = Path.GetDirectoryName(ofd.FileName);
-                            settings = SettingsManager.Load(ofd.FileName);
+                            currentSettingsPath = ofd.FileName;
+                            currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
+                            var newSettings = SettingsManager.Load(ofd.FileName);
+                            lock (settings.MappingLock)
+                            {
+                                settings = newSettings;
+                            }
                             RefreshPorts(true);
                             if (settings.KeyboardLayout == "US") rbUS.Checked = true; else rbJIS.Checked = true;
                             RefreshMappingList();
-                            MessageBox.Show("読込み完了しました。");
+                            MessageBox.Show("読込み完了しました: " + Path.GetFileName(currentSettingsPath), "読込完了");
                         }
                         catch (Exception ex)
                         {
@@ -282,7 +463,7 @@ namespace MidiToKeyApp
                 }
             };
 
-            var btnStart = new Button { Text = "変換開始", Top = 420, Left = 10, Width = 80, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => {
                 var ports = GetSelectedPorts();
                 if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください"); return; }
@@ -293,17 +474,20 @@ namespace MidiToKeyApp
                 midiListener.Start(ports);
             };
 
-            var btnStop = new Button { Text = "変換停止", Top = 420, Left = 300, Width = 80, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            // ① 停止時に押下中のすべてのキーを強制解放（ReleaseAllKeys）
+            var btnStop = new Button { Text = "変換停止", Top = 415, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStop.Click += (s, e) => {
                 isListening = false;
                 lblStatus.Text = "ステータス: 停止中";
                 lblStatus.ForeColor = Color.Red;
                 midiListener.Stop();
+                keySimulator.ReleaseAllKeys();
             };
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 465, Left = 10, Width = 370, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 465, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
 
             this.Controls.Add(btnSave);
+            this.Controls.Add(btnSaveAs);
             this.Controls.Add(btnLoad);
             this.Controls.Add(btnStart);
             this.Controls.Add(btnStop);
@@ -425,6 +609,7 @@ namespace MidiToKeyApp
         
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            keySimulator?.ReleaseAllKeys(); // 終了時にもキー押しっぱなしを強制解除
             midiListener?.Dispose();
             if (globalHook != null)
             {
@@ -432,6 +617,25 @@ namespace MidiToKeyApp
                 globalHook.Dispose();
             }
             base.OnFormClosing(e);
+        }
+    }
+
+    /// <summary>
+    /// MIDIノート番号（0-127）から音階名（例: C4 / ド、A0 / ラ）への変換を行うヘルパークラス。
+    /// 88鍵盤ピアノ（21[A0]〜108[C8]）の視覚的把握をサポートします。
+    /// </summary>
+    public static class MidiNoteHelper
+    {
+        private static readonly string[] NoteNames = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+        private static readonly string[] KanaNames = { "ド", "ド#", "レ", "レ#", "ミ", "ファ", "ファ#", "ソ", "ソ#", "ラ", "ラ#", "シ" };
+
+        public static string GetNoteDisplayName(int noteNumber)
+        {
+            if (noteNumber < 0 || noteNumber > 127) return noteNumber.ToString();
+            int octave = (noteNumber / 12) - 1; // MIDI規格: Note 60 = C4, Note 21 = A0
+            string name = NoteNames[noteNumber % 12];
+            string kana = KanaNames[noteNumber % 12];
+            return $"{name}{octave} / {kana}";
         }
     }
 }

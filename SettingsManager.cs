@@ -13,6 +13,12 @@ namespace MidiToKeyApp
     public class AppSettings
     {
         /// <summary>
+        /// マルチスレッド（MIDI受信スレッドとUI操作）でのMapping辞書アクセスを安全に保護するためのロック用オブジェクト
+        /// </summary>
+        [JsonIgnore]
+        public readonly object MappingLock = new object();
+
+        /// <summary>
         /// ユーザーが選択（監視対象としてチェック）したMIDIポート名のリスト
         /// </summary>
         [JsonPropertyName("selected_ports")]

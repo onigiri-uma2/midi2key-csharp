@@ -20,6 +20,13 @@ namespace MidiToKeyApp
         /// 引数2(bool): キーが押された(true)、または離されたか(false)
         /// </summary>
         public event Action<int, bool>? OnNoteChange;
+
+        /// <summary>
+        /// コントロールチェンジ（サステインペダル CC 64 など）を受け取った際に発火するイベント。
+        /// 引数1(int): コントロール番号（サステインペダルは 64）
+        /// 引数2(int): コントロール値（0-127。64以上でペダル踏み込み）
+        /// </summary>
+        public event Action<int, int>? OnControlChange;
         
         /// <summary>
         /// 現在OSが認識しているすべてのMIDI入力ポート名（デバイス名）を取得します。
@@ -99,6 +106,11 @@ namespace MidiToKeyApp
             else if (midiEvent is NoteOffEvent noteOff)
             {
                 OnNoteChange?.Invoke(noteOff.NoteNumber, false);
+            }
+            // コントロールチェンジ（サステインペダル等）の場合
+            else if (midiEvent is ControlChangeEvent controlChange)
+            {
+                OnControlChange?.Invoke(controlChange.ControlNumber, controlChange.ControlValue);
             }
         }
 

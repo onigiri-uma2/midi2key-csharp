@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using WindowsInput.Native; // Just used for VirtualKeyCode Enum
 
@@ -117,44 +118,69 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 物理キー送信コアメソッド。対象キーコードからスキャンコードを算出して送信します。
+        /// スキャンコードが取得できないキーについては仮想キーコード直接送信にフォールバックします。
         /// </summary>
         private void SendRawKey(VirtualKeyCode vk, bool isDown)
         {
             ushort scanCode = (ushort)MapVirtualKey((uint)vk, MAPVK_VK_TO_VSC);
 
-            uint flags = KEYEVENTF_SCANCODE;
+            uint flags = 0;
             if (!isDown) flags |= KEYEVENTF_KEYUP;
-
-            // 拡張キーの判定（矢印キーなど）
-            switch (vk)
-            {
-                case VirtualKeyCode.UP:
-                case VirtualKeyCode.DOWN:
-                case VirtualKeyCode.LEFT:
-                case VirtualKeyCode.RIGHT:
-                case VirtualKeyCode.HOME:
-                case VirtualKeyCode.END:
-                case VirtualKeyCode.PRIOR:
-                case VirtualKeyCode.NEXT:
-                case VirtualKeyCode.INSERT:
-                case VirtualKeyCode.DELETE:
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                    break;
-            }
 
             INPUT input = new INPUT();
             input.type = INPUT_KEYBOARD;
-            input.U.ki.wVk = 0; // スキャンコード指定時は wVk を0にするのがDirectInput対策として有効
-            input.U.ki.wScan = scanCode;
-            input.U.ki.dwFlags = flags;
             input.U.ki.time = 0;
             input.U.ki.dwExtraInfo = IntPtr.Zero;
+
+            if (scanCode != 0)
+            {
+                // ハードウェアスキャンコードで送信（DirectInput・ゲーム対応）
+                flags |= KEYEVENTF_SCANCODE;
+
+                // 拡張キーの判定（矢印キー、テンキー記号等）
+                switch (vk)
+                {
+                    case VirtualKeyCode.UP:
+                    case VirtualKeyCode.DOWN:
+                    case VirtualKeyCode.LEFT:
+                    case VirtualKeyCode.RIGHT:
+                    case VirtualKeyCode.HOME:
+                    case VirtualKeyCode.END:
+                    case VirtualKeyCode.PRIOR:
+                    case VirtualKeyCode.NEXT:
+                    case VirtualKeyCode.INSERT:
+                    case VirtualKeyCode.DELETE:
+                    case VirtualKeyCode.DIVIDE:
+                    case VirtualKeyCode.RCONTROL:
+                    case VirtualKeyCode.RMENU:
+                        flags |= KEYEVENTF_EXTENDEDKEY;
+                        break;
+                }
+
+                input.U.ki.wVk = 0; // スキャンコード指定時は wVk を0にするのがDirectInput対策として有効
+                input.U.ki.wScan = scanCode;
+                input.U.ki.dwFlags = flags;
+            }
+            else
+            {
+                // スキャンコードが存在しない特殊仮想キーへの安全なフォールバック
+                input.U.ki.wVk = (ushort)vk;
+                input.U.ki.wScan = 0;
+                input.U.ki.dwFlags = flags;
+            }
 
             SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT)));
         }
 
+        // キーごとの押下回数を管理する辞書（同じキーの重複押下や和音演奏時に途中でキーが離されるのを防止）
+        private readonly Dictionary<VirtualKeyCode, int> _keyRefCount = new Dictionary<VirtualKeyCode, int>();
+        // Shiftキー専用の参照カウント
+        private int _shiftRefCount = 0;
+        private readonly object _keyLock = new object();
+
         /// <summary>
         /// 指定されたキー文字に対応するキーコードをOSに送信します。
+        /// 参照カウントにより、和音や連打時にもキーが途中で誤って離されないよう制御します。
         /// </summary>
         public void SendKey(string keyName, bool isDown, string layout)
         {
@@ -182,17 +208,83 @@ namespace MidiToKeyApp
                 }
             }
 
-            if (baseKey != VirtualKeyCode.NONAME)
+            if (baseKey == VirtualKeyCode.NONAME) return;
+
+            lock (_keyLock)
             {
                 if (isDown)
                 {
-                    if (shiftRequired) SendRawKey(VirtualKeyCode.SHIFT, true);
-                    SendRawKey(baseKey, true);
+                    // Shiftキーの押下管理（0→1になった時のみ物理KeyDown）
+                    if (shiftRequired)
+                    {
+                        if (_shiftRefCount == 0)
+                        {
+                            SendRawKey(VirtualKeyCode.SHIFT, true);
+                        }
+                        _shiftRefCount++;
+                    }
+
+                    // ベースキーの押下管理（0→1になった時のみ物理KeyDown）
+                    _keyRefCount.TryGetValue(baseKey, out int count);
+                    if (count == 0)
+                    {
+                        SendRawKey(baseKey, true);
+                    }
+                    _keyRefCount[baseKey] = count + 1;
                 }
                 else
                 {
-                    SendRawKey(baseKey, false);
-                    if (shiftRequired) SendRawKey(VirtualKeyCode.SHIFT, false);
+                    // ベースキーの解放管理（カウントが0になった時のみ物理KeyUp）
+                    if (_keyRefCount.TryGetValue(baseKey, out int count) && count > 0)
+                    {
+                        count--;
+                        if (count == 0)
+                        {
+                            SendRawKey(baseKey, false);
+                            _keyRefCount.Remove(baseKey);
+                        }
+                        else
+                        {
+                            _keyRefCount[baseKey] = count;
+                        }
+                    }
+                    else
+                    {
+                        SendRawKey(baseKey, false);
+                        _keyRefCount.Remove(baseKey);
+                    }
+
+                    // Shiftキーの解放管理（カウントが0になった時のみ物理KeyUp）
+                    if (shiftRequired)
+                    {
+                        if (_shiftRefCount > 0) _shiftRefCount--;
+                        if (_shiftRefCount == 0)
+                        {
+                            SendRawKey(VirtualKeyCode.SHIFT, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 現在押下状態にあるすべてのキー（Shiftを含む）を強制的に解放します。
+        /// 変換停止時やアプリ終了時にキーがOS上で押しっぱなしになるのを完全に防止します。
+        /// </summary>
+        public void ReleaseAllKeys()
+        {
+            lock (_keyLock)
+            {
+                foreach (var vk in _keyRefCount.Keys.ToList())
+                {
+                    SendRawKey(vk, false);
+                }
+                _keyRefCount.Clear();
+
+                if (_shiftRefCount > 0)
+                {
+                    SendRawKey(VirtualKeyCode.SHIFT, false);
+                    _shiftRefCount = 0;
                 }
             }
         }
@@ -201,13 +293,21 @@ namespace MidiToKeyApp
         {
             key = key.ToLowerInvariant();
             
-            if (Enum.TryParse<VirtualKeyCode>(key, true, out var vk)) return vk;
-            
-            if (key.Length == 1 && key[0] >= 'a' && key[0] <= 'z') return (VirtualKeyCode)((int)VirtualKeyCode.VK_A + (key[0] - 'a'));
+            // 1文字の数字（0-9）と英字（a-z）を Enum.TryParse より先に判定する
+            // ※ Enum.TryParse に "1" などを渡すと数値文字列として扱われ、
+            //    (VirtualKeyCode)1 （= VK_LBUTTON マウス左ボタン）等に誤変換されてキー入力が効かなくなるのを防ぐため
             if (key.Length == 1 && key[0] >= '0' && key[0] <= '9') return (VirtualKeyCode)((int)VirtualKeyCode.VK_0 + (key[0] - '0'));
+            if (key.Length == 1 && key[0] >= 'a' && key[0] <= 'z') return (VirtualKeyCode)((int)VirtualKeyCode.VK_A + (key[0] - 'a'));
+
+            if (Enum.TryParse<VirtualKeyCode>(key, true, out var vk)) return vk;
 
             return key switch
             {
+                "esc" => VirtualKeyCode.ESCAPE,
+                "escape" => VirtualKeyCode.ESCAPE,
+                "pageup" => VirtualKeyCode.PRIOR,
+                "pagedown" => VirtualKeyCode.NEXT,
+                "tab" => VirtualKeyCode.TAB,
                 "enter" => VirtualKeyCode.RETURN,
                 "space" => VirtualKeyCode.SPACE,
                 "shift" => VirtualKeyCode.SHIFT,
