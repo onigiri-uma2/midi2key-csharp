@@ -22,7 +22,7 @@ namespace MidiToKeyApp
         private CheckedListBox chkPorts;
         private RadioButton rbJIS;
         private RadioButton rbUS;
-        private ListBox listMapping;
+        private ListView listMapping;
         private TextBox txtNote;
         private TextBox txtKey;
         private Label lblStatus;
@@ -171,19 +171,27 @@ namespace MidiToKeyApp
             }
             foreach (var kvp in pairs)
             {
+                ListViewItem item;
                 if (kvp.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
                 {
-                    listMapping.Items.Add($"Pedal (CC64 / サステイン) → {kvp.Value}");
+                    item = new ListViewItem("pedal");
+                    item.SubItems.Add("サステイン (CC64)");
+                    item.SubItems.Add(kvp.Value);
                 }
                 else if (int.TryParse(kvp.Key, out int note))
                 {
                     string noteName = MidiNoteHelper.GetNoteDisplayName(note);
-                    listMapping.Items.Add($"Note {note} ({noteName}) → {kvp.Value}");
+                    item = new ListViewItem(note.ToString());
+                    item.SubItems.Add(noteName);
+                    item.SubItems.Add(kvp.Value);
                 }
                 else
                 {
-                    listMapping.Items.Add($"{kvp.Key} → {kvp.Value}");
+                    item = new ListViewItem(kvp.Key);
+                    item.SubItems.Add("-");
+                    item.SubItems.Add(kvp.Value);
                 }
+                listMapping.Items.Add(item);
             }
         }
         
@@ -225,28 +233,27 @@ namespace MidiToKeyApp
             this.Controls.Add(grpPorts);
             
             var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
-            listMapping = new ListBox { Top = 155, Left = 10, Width = 390, Height = 135 };
+            listMapping = new ListView 
+            { 
+                Top = 155, 
+                Left = 10, 
+                Width = 390, 
+                Height = 135,
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                MultiSelect = false,
+                HideSelection = false
+            };
+            listMapping.Columns.Add("ノート/信号", 85, HorizontalAlignment.Center);
+            listMapping.Columns.Add("音名 / 種類", 145, HorizontalAlignment.Left);
+            listMapping.Columns.Add("変換キー", 135, HorizontalAlignment.Left);
+
             listMapping.SelectedIndexChanged += (s, e) => {
-                if (listMapping.SelectedItem == null) return;
-                var str = listMapping.SelectedItem.ToString();
-                if (string.IsNullOrEmpty(str)) return;
-                var parts = str.Split('→');
-                if (parts.Length == 2)
-                {
-                    var left = parts[0].Trim();
-                    if (left.StartsWith("Pedal", StringComparison.OrdinalIgnoreCase))
-                    {
-                        txtNote.Text = "pedal";
-                    }
-                    else
-                    {
-                        var numPart = left.Replace("Note", "").Trim();
-                        int parenIndex = numPart.IndexOf('(');
-                        if (parenIndex >= 0) numPart = numPart.Substring(0, parenIndex).Trim();
-                        txtNote.Text = numPart;
-                    }
-                    txtKey.Text = parts[1].Trim();
-                }
+                if (listMapping.SelectedItems.Count == 0) return;
+                var item = listMapping.SelectedItems[0];
+                txtNote.Text = item.Text;
+                txtKey.Text = item.SubItems.Count > 2 ? item.SubItems[2].Text : "";
             };
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
@@ -356,32 +363,14 @@ namespace MidiToKeyApp
             
             var btnDel = new Button { Text = "削除", Top = 325, Left = 315, Width = 85, Height = 25 };
             btnDel.Click += (s, e) => {
-                if (listMapping.SelectedIndex >= 0)
+                if (listMapping.SelectedItems.Count > 0)
                 {
-                    var str = listMapping.SelectedItem?.ToString();
-                    if (!string.IsNullOrEmpty(str))
+                    var keyToRemove = listMapping.SelectedItems[0].Text;
+                    lock (settings.MappingLock)
                     {
-                        var parts = str.Split('→');
-                        var left = parts[0].Trim();
-                        string keyToRemove;
-                        if (left.StartsWith("Pedal", StringComparison.OrdinalIgnoreCase))
-                        {
-                            keyToRemove = "pedal";
-                        }
-                        else
-                        {
-                            var numPart = left.Replace("Note", "").Trim();
-                            int parenIndex = numPart.IndexOf('(');
-                            if (parenIndex >= 0) numPart = numPart.Substring(0, parenIndex).Trim();
-                            keyToRemove = numPart;
-                        }
-
-                        lock (settings.MappingLock)
-                        {
-                            settings.Mapping.Remove(keyToRemove);
-                        }
-                        RefreshMappingList();
+                        settings.Mapping.Remove(keyToRemove);
                     }
+                    RefreshMappingList();
                 }
             };
 
