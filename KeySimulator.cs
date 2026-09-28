@@ -214,7 +214,7 @@ namespace MidiToKeyApp
             key = key.ToLowerInvariant();
 
             // 1文字の数字（0-9）と英字（a-z）を Enum.TryParse より先に判定
-            // ※ "1" が (VirtualKeyCode)1 (= VK_LBUTTON マウス左ボタン) に誤変換されるのを完全に防止
+            // ※ "1" が (VirtualKeyCode)1 (= VK_LBUTTON マウス左ボタン) に誤変換されるのを防止
             if (key.Length == 1 && key[0] >= '0' && key[0] <= '9') return (VirtualKeyCode)((int)VirtualKeyCode.VK_0 + (key[0] - '0'));
             if (key.Length == 1 && key[0] >= 'a' && key[0] <= 'z') return (VirtualKeyCode)((int)VirtualKeyCode.VK_A + (key[0] - 'a'));
 
@@ -267,12 +267,14 @@ namespace MidiToKeyApp
 
     /// <summary>
     /// キーボード入力をシミュレートし、全キーの押下状態を一元化された参照カウントで管理するクラス。
-    /// Shiftキーも例外扱いせず同一カウントで管理し、和音・連打・重複押下時のキー消失を防止します。
+    /// Shiftキーのロールバック保証、KeyUp失敗時の状態保持と再試行をサポートします。
     /// </summary>
     public class KeySimulator
     {
         private readonly IKeyboardOutput _output;
         private readonly Dictionary<VirtualKeyCode, int> _keyRefCount = new();
+        // 物理KeyUp送信に失敗し、OS上で物理KeyDownのままになっているキーの追跡セット
+        private readonly HashSet<VirtualKeyCode> _unreleasedKeys = new();
         private readonly object _keyLock = new();
 
         public KeySimulator(IKeyboardOutput? output = null)
@@ -282,8 +284,7 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 指定された解決済みキー（BaseKeyおよびShift要求）を押下状態にします。
-        /// 参照カウントが0→1になったキーのみ物理KeyDownを送信します。
-        /// 送信失敗時はカウントを増やさず、直前のShift要求もロールバックします。
+        /// ベースキー送信失敗時は、直前に追加したShift参照を必ずロールバックします。
         /// </summary>
         public bool PressResolvedKey(ResolvedKey key)
         {
@@ -291,23 +292,24 @@ namespace MidiToKeyApp
 
             lock (_keyLock)
             {
-                bool shiftPressedHere = false;
+                bool shiftRefAdded = false;
 
-                // Shiftが必要な場合、先にShiftを押下
+                // Shiftが必要な場合、先にShiftの参照を追加
                 if (key.ShiftRequired)
                 {
-                    if (!SendInternal(VirtualKeyCode.SHIFT, true, out bool stateChanged))
+                    if (!SendInternal(VirtualKeyCode.SHIFT, true, out _))
                     {
                         return false;
                     }
-                    shiftPressedHere = stateChanged;
+                    shiftRefAdded = true;
                 }
 
                 // ベースキーを押下
                 if (!SendInternal(key.BaseKey, true, out _))
                 {
-                    // ベースキー送信失敗時のロールバック
-                    if (key.ShiftRequired && shiftPressedHere)
+                    // ベースキー送信失敗時は、今回追加したShift参照を必ず取り消す！
+                    // （以前からShiftが押されていた場合でもカウントを1減らし、新規押下だった場合はKeyUpも送信）
+                    if (shiftRefAdded)
                     {
                         SendInternal(VirtualKeyCode.SHIFT, false, out _);
                     }
@@ -320,7 +322,6 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 指定された解決済みキー（BaseKeyおよびShift要求）を解放状態にします。
-        /// 参照カウントが1→0になったキーのみ物理KeyUpを送信します。
         /// </summary>
         public bool ReleaseResolvedKey(ResolvedKey key)
         {
@@ -342,7 +343,8 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// 内部で単一の仮想キーコードの参照カウント管理と物理キー送信を行います。
+        /// 単一の仮想キーコードの参照カウント管理と物理キー送信を行います。
+        /// KeyUp送信失敗時は未解放状態として記録し、キーの追跡を維持します。
         /// </summary>
         private bool SendInternal(VirtualKeyCode vk, bool isDown, out bool stateChanged)
         {
@@ -353,6 +355,16 @@ namespace MidiToKeyApp
             {
                 if (count == 0)
                 {
+                    // もし以前のKeyUpが失敗してOS上で未解放のまま残っている場合
+                    if (_unreleasedKeys.Contains(vk))
+                    {
+                        // 物理的には既に押下状態なので、再送信せずに未解放追跡から論理参照へ復旧
+                        _unreleasedKeys.Remove(vk);
+                        _keyRefCount[vk] = 1;
+                        stateChanged = true;
+                        return true;
+                    }
+
                     // 0 → 1: 物理KeyDownを送信
                     if (!_output.SendHardwareKey(vk, true))
                     {
@@ -366,6 +378,7 @@ namespace MidiToKeyApp
                 {
                     // 既に押下中: カウントのみ加算
                     _keyRefCount[vk] = count + 1;
+                    stateChanged = true;
                     return true;
                 }
             }
@@ -374,7 +387,6 @@ namespace MidiToKeyApp
                 if (count <= 0)
                 {
                     // 押されていないキーに対する不要なKeyUpは送信しない（負数防止）
-                    _keyRefCount.Remove(vk);
                     return false;
                 }
                 else if (count == 1)
@@ -382,7 +394,18 @@ namespace MidiToKeyApp
                     // 1 → 0: 物理KeyUpを送信
                     _keyRefCount.Remove(vk);
                     stateChanged = true;
-                    return _output.SendHardwareKey(vk, false);
+
+                    if (!_output.SendHardwareKey(vk, false))
+                    {
+                        // KeyUp送信失敗！OS側で押下状態のままになっているため、未解放キーとして追跡
+                        _unreleasedKeys.Add(vk);
+                        return false;
+                    }
+                    else
+                    {
+                        _unreleasedKeys.Remove(vk);
+                        return true;
+                    }
                 }
                 else
                 {
@@ -394,22 +417,57 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
-        /// 現在押下状態にあるすべてのキーを物理的に解放し、参照カウントを初期化します。
+        /// KeyUp送信に失敗して未解放状態にあるキーの解放を再試行します。
         /// </summary>
-        public void ReleaseAllKeys()
+        public bool RetryReleasePendingKeys()
         {
             lock (_keyLock)
             {
-                foreach (var vk in _keyRefCount.Keys.ToList())
+                foreach (var vk in _unreleasedKeys.ToList())
                 {
-                    _output.SendHardwareKey(vk, false);
+                    if (_output.SendHardwareKey(vk, false))
+                    {
+                        _unreleasedKeys.Remove(vk);
+                    }
                 }
-                _keyRefCount.Clear();
+                return _unreleasedKeys.Count == 0;
             }
         }
 
         /// <summary>
-        /// 従来のSendKeyメソッド（互換用）。キー文字列と配列からキーを解決して押下/解放します。
+        /// 現在押下状態にあるすべてのキー（未解放キーを含む）を物理的に解放します。
+        /// </summary>
+        /// <returns>全キーの解放に成功した場合はtrue、失敗したキーが残っている場合はfalse</returns>
+        public bool ReleaseAllKeys()
+        {
+            lock (_keyLock)
+            {
+                var keysToRelease = new HashSet<VirtualKeyCode>(_keyRefCount.Keys);
+                foreach (var vk in _unreleasedKeys)
+                {
+                    keysToRelease.Add(vk);
+                }
+
+                _keyRefCount.Clear();
+
+                foreach (var vk in keysToRelease)
+                {
+                    if (_output.SendHardwareKey(vk, false))
+                    {
+                        _unreleasedKeys.Remove(vk);
+                    }
+                    else
+                    {
+                        _unreleasedKeys.Add(vk);
+                    }
+                }
+
+                return _unreleasedKeys.Count == 0;
+            }
+        }
+
+        /// <summary>
+        /// 従来のSendKeyメソッド（互換用）。
         /// </summary>
         public void SendKey(string keyName, bool isDown, string layout)
         {
@@ -430,6 +488,31 @@ namespace MidiToKeyApp
             lock (_keyLock)
             {
                 return _keyRefCount.TryGetValue(vk, out int count) ? count : 0;
+            }
+        }
+
+        /// <summary>
+        /// テスト用: 指定キーが未解放（KeyUp失敗）状態として追跡されているか確認します。
+        /// </summary>
+        public bool IsKeyUnreleased(VirtualKeyCode vk)
+        {
+            lock (_keyLock)
+            {
+                return _unreleasedKeys.Contains(vk);
+            }
+        }
+
+        /// <summary>
+        /// テスト用: 未解放キーのコレクションを取得します。
+        /// </summary>
+        public IReadOnlyCollection<VirtualKeyCode> UnreleasedKeys
+        {
+            get
+            {
+                lock (_keyLock)
+                {
+                    return _unreleasedKeys.ToList();
+                }
             }
         }
     }

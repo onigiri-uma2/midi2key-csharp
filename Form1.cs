@@ -10,7 +10,7 @@ namespace MidiToKeyApp
 {
     /// <summary>
     /// メインとなるUIおよびアプリケーションロジックを管理するフォームクラス。
-    /// MIDIの入力を受けた際の処理フローの制御や、キー入力キャプチャのグローバルフックの管理を行います。
+    /// 安定したMIDI入力状態管理、セッションIDによる遅延イベント遮断、および原子的設定保存を統合します。
     /// </summary>
     public partial class Form1 : Form
     {
@@ -62,9 +62,9 @@ namespace MidiToKeyApp
                 }
             };
 
-            // MIDIリスナーのイベントをInputTrackerへ中継
-            midiListener.OnNoteReceived += (data) => inputTracker.ProcessNoteEvent(data, inputTracker.CurrentSessionId);
-            midiListener.OnControlReceived += (data) => inputTracker.ProcessControlEvent(data, inputTracker.CurrentSessionId);
+            // イベント自身に保持されたGenerationを検証して処理
+            midiListener.OnNoteReceived += (data) => inputTracker.ProcessNoteEvent(data);
+            midiListener.OnControlReceived += (data) => inputTracker.ProcessControlEvent(data);
         }
 
         private void LoadInitialSettings()
@@ -142,46 +142,50 @@ namespace MidiToKeyApp
             }
         }
 
+        /// <summary>
+        /// UIコントロールの生成と配置（コミット 6a0af51 のデザインを完全復元）。
+        /// </summary>
         private void InitializeComponentProgrammatically()
         {
-            this.Text = "MIDI to Key Mapper v1.0.2";
-            this.Size = new Size(430, 560);
-            this.FormBorderStyle = FormBorderStyle.FixedSingle;
+            var version = typeof(Form1).Assembly.GetName().Version;
+            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.0.2";
+            this.Text = $"midi2key C#{verStr}";
+            this.Width = 430;
+            this.Height = 555;
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
+            this.Font = new Font("Yu Gothic UI", 9);
 
-            var lblPorts = new Label { Text = "🎹 MIDI ポート選択", Top = 10, Left = 10, AutoSize = true };
-            chkPorts = new CheckedListBox { Top = 30, Left = 10, Width = 390, Height = 70 };
-            
-            var btnRefresh = new Button { Text = "再読込", Top = 105, Left = 325, Width = 75, Height = 25 };
-            btnRefresh.Click += (s, e) => RefreshPorts();
-
-            this.Controls.Add(lblPorts);
-            this.Controls.Add(chkPorts);
-            this.Controls.Add(btnRefresh);
-
-            var gbLayout = new GroupBox { Text = "⌨ キーボード配列", Top = 100, Left = 10, Width = 200, Height = 45 };
-            rbJIS = new RadioButton { Text = "日本語 (JIS)", Left = 10, Top = 18, AutoSize = true, Checked = true };
-            rbUS = new RadioButton { Text = "英語 (US)", Left = 110, Top = 18, AutoSize = true };
-            
-            rbJIS.CheckedChanged += (s, e) => {
-                if (rbJIS.Checked) UpdateSettingsFromUI();
-            };
+            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 50 };
+            rbUS = new RadioButton { Text = "US", Top = 20, Left = 55, Width = 45 };
+            rbJIS = new RadioButton { Text = "JIS", Top = 20, Left = 10, Width = 45 };
             rbUS.CheckedChanged += (s, e) => {
-                if (rbUS.Checked) UpdateSettingsFromUI();
+                if (rbUS.Checked) settings.KeyboardLayout = "US";
             };
+            rbJIS.CheckedChanged += (s, e) => {
+                if (rbJIS.Checked) settings.KeyboardLayout = "JIS";
+            };
+            grpLayout.Controls.Add(rbUS);
+            grpLayout.Controls.Add(rbJIS);
+            this.Controls.Add(grpLayout);
 
-            gbLayout.Controls.Add(rbJIS);
-            gbLayout.Controls.Add(rbUS);
-            this.Controls.Add(gbLayout);
+            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 115, Top = 10, Left = 10 };
+            chkPorts = new CheckedListBox { Top = 20, Left = 10, Width = 255, Height = 65, BorderStyle = BorderStyle.None, CheckOnClick = true };
+            chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
+            grpPorts.Controls.Add(chkPorts);
 
-            var lblList = new Label { Text = "🗺 マッピング設定一覧", Top = 150, Left = 10, AutoSize = true };
-            
-            listMapping = new ListView { 
-                Top = 170, 
+            var lblPortWarn = new Label { Text = "※機器の抜き差し時はアプリを再起動してください", ForeColor = Color.Red, Top = 88, Left = 5, AutoSize = true };
+            grpPorts.Controls.Add(lblPortWarn);
+            this.Controls.Add(grpPorts);
+
+            var lblList = new Label { Text = "📄 マッピング一覧", Top = 135, Left = 10, AutoSize = true };
+            listMapping = new ListView 
+            { 
+                Top = 155, 
                 Left = 10, 
                 Width = 390, 
-                Height = 120,
+                Height = 135,
                 View = View.Details,
                 FullRowSelect = true,
                 GridLines = true,
@@ -193,7 +197,7 @@ namespace MidiToKeyApp
             listMapping.Columns.Add("音名 / 種類", 145, HorizontalAlignment.Left);
             listMapping.Columns.Add("変換キー", 135, HorizontalAlignment.Left);
 
-            // カラムヘッダーのカスタム描画（淡いブルーグレー背景・濃紺太字）
+            // カラムヘッダーに上品な淡いブルーグレーの背景と境界線、濃紺の太字を設定
             listMapping.DrawColumnHeader += (s, e) => {
                 if (e.Header == null) return;
                 using (var bgBrush = new SolidBrush(Color.FromArgb(228, 236, 246)))
@@ -230,10 +234,10 @@ namespace MidiToKeyApp
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 295, Left = 10, AutoSize = true };
-            txtNote = new TextBox { Top = 315, Left = 10, Width = 75 };
+            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 300, Left = 10, AutoSize = true };
+            txtNote = new TextBox { Top = 320, Left = 10, Width = 75 };
             
-            // ノート取得モードと変換モードの分離
+            // ノート取得モードと変換モードのライフサイクル分離
             txtNote.Enter += (s, e) => {
                 inputTracker.SetCapturing(true);
                 // 変換停止中であれば、ノート取得専用にMIDIリスナーを開始
@@ -251,10 +255,11 @@ namespace MidiToKeyApp
                 }
             };
 
-            var lblKey = new Label { Text = "⌨ キー", Top = 295, Left = 95, AutoSize = true };
-            txtKey = new TextBox { Top = 315, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
+            var lblKey = new Label { Text = "⌨ キー", Top = 300, Left = 95, AutoSize = true };
+            txtKey = new TextBox { Top = 320, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
-            var btnClearKey = new Button { Text = "消去", Top = 314, Left = 215, Width = 50, Height = 25 };
+            // キー入力欄の「消去」ボタン
+            var btnClearKey = new Button { Text = "消去", Top = 319, Left = 215, Width = 50, Height = 25 };
             btnClearKey.Click += (s, e) => {
                 txtKey.Text = "";
             };
@@ -295,6 +300,7 @@ namespace MidiToKeyApp
                 }
             };
 
+            // ノート番号バリデーション（0〜127）および pedal の登録
             var btnAdd = new Button { Text = "追加", Top = 295, Left = 315, Width = 85, Height = 25 };
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
@@ -362,11 +368,11 @@ namespace MidiToKeyApp
             this.Controls.Add(btnAdd);
             this.Controls.Add(btnDel);
 
-            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 355, Left = 10, Width = 390, Height = 2 };
+            var sep = new Label { BorderStyle = BorderStyle.Fixed3D, Top = 360, Left = 10, Width = 390, Height = 2 };
             this.Controls.Add(sep);
 
             // 「上書き保存」ボタン
-            var btnSave = new Button { Text = "上書き保存", Top = 370, Left = 10, Width = 85, Height = 28 };
+            var btnSave = new Button { Text = "上書き保存", Top = 375, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 try
@@ -383,7 +389,7 @@ namespace MidiToKeyApp
             };
 
             // 「別名保存」ボタン
-            var btnSaveAs = new Button { Text = "別名保存", Top = 370, Left = 105, Width = 85, Height = 28 };
+            var btnSaveAs = new Button { Text = "別名保存", Top = 375, Left = 105, Width = 85, Height = 28 };
             btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
@@ -397,7 +403,7 @@ namespace MidiToKeyApp
                         string targetPath = sfd.FileName;
                         try
                         {
-                            // 候補パスへの保存を先に実行
+                            // 候補パスへの原子的保存を先に実行
                             SettingsManager.Save(targetPath, settings);
                             // 保存成功後にのみファイルパスを更新
                             currentSettingsPath = targetPath;
@@ -413,7 +419,7 @@ namespace MidiToKeyApp
             };
             
             // 「設定読込」ボタン
-            var btnLoad = new Button { Text = "設定読込", Top = 370, Left = 305, Width = 95, Height = 28 };
+            var btnLoad = new Button { Text = "設定読込", Top = 375, Left = 305, Width = 95, Height = 28 };
             btnLoad.Click += (s, e) => {
                 using (var ofd = new OpenFileDialog())
                 {
@@ -424,7 +430,7 @@ namespace MidiToKeyApp
                         string targetPath = ofd.FileName;
                         try 
                         {
-                            // 先に解析と検証を実行（失敗時は例外発生で現設定を維持）
+                            // 先に解析と内容検証を実行（失敗時は例外発生で現設定を維持）
                             var newSettings = SettingsManager.Load(targetPath);
 
                             // 変換実行中であれば、安全に全キー解放・停止した上で新設定を適用
@@ -454,7 +460,7 @@ namespace MidiToKeyApp
                 }
             };
 
-            var btnStart = new Button { Text = "変換開始", Top = 410, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => {
                 if (inputTracker.IsListening) return; // 連打防止
 
@@ -462,19 +468,19 @@ namespace MidiToKeyApp
                 if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください", "ポート未選択"); return; }
                 
                 UpdateSettingsFromUI();
-                inputTracker.StartSession();
-                midiListener.Start(ports);
+                long sessionId = inputTracker.StartSession();
+                midiListener.Start(ports, sessionId);
 
                 lblStatus.Text = "ステータス: 実行中";
                 lblStatus.ForeColor = Color.Green;
             };
 
-            var btnStop = new Button { Text = "変換停止", Top = 410, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStop = new Button { Text = "変換停止", Top = 415, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStop.Click += (s, e) => {
                 StopConversion();
             };
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 460, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 465, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red };
 
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
@@ -496,14 +502,14 @@ namespace MidiToKeyApp
             // (2) ロック外でMIDIリスナーを停止し、受信スレッドの完了を安全に待機
             midiListener.Stop();
 
-            // (3) UIステータス更新
+            // (3) 未解放キーがあれば再試行
+            keySimulator.RetryReleasePendingKeys();
+
+            // (4) UIステータス更新
             lblStatus.Text = "ステータス: 停止中";
             lblStatus.ForeColor = Color.Red;
         }
 
-        /// <summary>
-        /// ユーザーのキーボード入力をOSレベルで捕獲（フック）し、「キー設定の入力欄」にキー名称を反映させる処理。
-        /// </summary>
         private void GlobalHook_KeyDown(object? sender, KeyEventArgs e)
         {
             bool isUS = false;
@@ -528,9 +534,6 @@ namespace MidiToKeyApp
             }
         }
 
-        /// <summary>
-        /// 生キー入力イベントから人間が直感的に理解できるキー名称文字列を生成します。
-        /// </summary>
         private string FormatKey(KeyEventArgs e, bool isUS)
         {
             bool shift = e.Shift;
