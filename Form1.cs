@@ -243,11 +243,43 @@ namespace MidiToKeyApp
                 FullRowSelect = true,
                 GridLines = true,
                 MultiSelect = false,
-                HideSelection = false
+                HideSelection = false,
+                OwnerDraw = true
             };
             listMapping.Columns.Add("ノート/信号", 85, HorizontalAlignment.Center);
             listMapping.Columns.Add("音名 / 種類", 145, HorizontalAlignment.Left);
             listMapping.Columns.Add("変換キー", 135, HorizontalAlignment.Left);
+
+            // カラムヘッダーに上品な淡いブルーグレーの背景と境界線、濃紺の太字を設定
+            listMapping.DrawColumnHeader += (s, e) => {
+                if (e.Header == null) return;
+                // ヘッダー背景（淡いスレートブルー）
+                using (var bgBrush = new SolidBrush(Color.FromArgb(228, 236, 246)))
+                {
+                    e.Graphics.FillRectangle(bgBrush, e.Bounds);
+                }
+                // 区切り線
+                using (var borderPen = new Pen(Color.FromArgb(200, 212, 228)))
+                {
+                    e.Graphics.DrawLine(borderPen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+                    e.Graphics.DrawLine(borderPen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+                }
+                // テキスト描画
+                var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.LeftAndRightPadding;
+                if (e.Header.TextAlign == HorizontalAlignment.Center)
+                    flags |= TextFormatFlags.HorizontalCenter;
+                else if (e.Header.TextAlign == HorizontalAlignment.Right)
+                    flags |= TextFormatFlags.Right;
+                else
+                    flags |= TextFormatFlags.Left;
+
+                using (var headerFont = new Font(this.Font, FontStyle.Bold))
+                {
+                    TextRenderer.DrawText(e.Graphics, e.Header.Text, headerFont, e.Bounds, Color.FromArgb(35, 55, 85), flags);
+                }
+            };
+            listMapping.DrawItem += (s, e) => e.DrawDefault = true;
+            listMapping.DrawSubItem += (s, e) => e.DrawDefault = true;
 
             listMapping.SelectedIndexChanged += (s, e) => {
                 if (listMapping.SelectedItems.Count == 0) return;
