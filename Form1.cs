@@ -513,15 +513,23 @@ namespace MidiToKeyApp
 
             var btnStart = new Button { Text = "変換開始", Top = 415, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => {
-                if (inputTracker.IsListening) return; // 連打防止
+                if (inputTracker.IsListening) return; // 既に実行中なら処理終了
 
                 var ports = GetSelectedPorts();
                 if (ports.Count == 0) { MessageBox.Show("MIDIポートを選択してください", "ポート未選択"); return; }
                 
                 UpdateSettingsFromUI();
 
-                // 未解放キーの再試行
-                keySimulator.RetryReleasePendingKeys();
+                // 未解放キーの再試行・復旧確認
+                if (!keySimulator.TryPrepareStartConversion())
+                {
+                    MessageBox.Show(
+                        $"キー解放に失敗した未解放キー（{keySimulator.UnreleasedKeysCount} 件）が残っているため、変換を開始できません。\nキー入力を解放してから再度お試しください。",
+                        "未解放キー警告",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return; // 変換開始を中止
+                }
 
                 long sessionId = inputTracker.StartConversionSession();
                 midiListener.Start(ports, sessionId);
@@ -554,6 +562,7 @@ namespace MidiToKeyApp
         /// <summary>
         /// 変換処理を安全に停止します。
         /// デッドロック防止のため、ロック外でMIDIリスナーを停止した上で全キーを解放します。
+        /// 未解放キーが残っている場合はUIに警告表示を行います。
         /// </summary>
         private void StopConversion()
         {
@@ -564,11 +573,19 @@ namespace MidiToKeyApp
             midiListener.Stop();
 
             // (3) 未解放キーがあれば再試行
-            keySimulator.RetryReleasePendingKeys();
+            bool allReleased = keySimulator.RetryReleasePendingKeys();
 
             // (4) UIステータス更新
-            lblStatus.Text = "ステータス: 停止中";
-            lblStatus.ForeColor = Color.Red;
+            if (allReleased && !keySimulator.HasUnreleasedKeys)
+            {
+                lblStatus.Text = "ステータス: 停止中";
+                lblStatus.ForeColor = Color.Red;
+            }
+            else
+            {
+                lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
+                lblStatus.ForeColor = Color.DarkOrange;
+            }
         }
 
         private void GlobalHook_KeyDown(object? sender, KeyEventArgs e)
@@ -681,6 +698,7 @@ namespace MidiToKeyApp
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             StopConversion();
+            keySimulator.RetryReleasePendingKeys();
             midiListener?.Dispose();
             if (globalHook != null)
             {

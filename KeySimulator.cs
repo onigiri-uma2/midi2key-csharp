@@ -503,6 +503,48 @@ namespace MidiToKeyApp
         }
 
         /// <summary>
+        /// 未解放キーが存在するかどうかを取得します。
+        /// </summary>
+        public bool HasUnreleasedKeys
+        {
+            get
+            {
+                lock (_keyLock)
+                {
+                    return _unreleasedKeys.Count > 0;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 現在追跡されている未解放キーの個数を取得します。
+        /// </summary>
+        public int UnreleasedKeysCount
+        {
+            get
+            {
+                lock (_keyLock)
+                {
+                    return _unreleasedKeys.Count;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 変換開始前の準備として未解放キーの解放を再試行し、開始可能かどうかを判定します。
+        /// すべての未解放キーが解放された場合はtrue、未解放キーが残っている場合はfalseを返します。
+        /// </summary>
+        public bool TryPrepareStartConversion()
+        {
+            lock (_keyLock)
+            {
+                if (_unreleasedKeys.Count == 0) return true;
+                RetryReleasePendingKeys();
+                return _unreleasedKeys.Count == 0;
+            }
+        }
+
+        /// <summary>
         /// テスト用: 未解放キーのコレクションを取得します。
         /// </summary>
         public IReadOnlyCollection<VirtualKeyCode> UnreleasedKeys
