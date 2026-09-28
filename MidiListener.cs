@@ -119,6 +119,7 @@ namespace MidiToKeyApp
 
         private readonly List<OpenDeviceInfo> _devices = new();
         private readonly object _lock = new();
+        private readonly HashSet<string> _portsSeenInWinRt = new(StringComparer.OrdinalIgnoreCase);
         private long _currentGeneration = 0;
         private int _instanceCounter = 0;
 
@@ -352,6 +353,7 @@ namespace MidiToKeyApp
             {
                 devicesToStop = new List<OpenDeviceInfo>(_devices);
                 _devices.Clear();
+                _portsSeenInWinRt.Clear();
             }
 
             // _lock 解放後に各デバイスの EventDispatchLock を個別に取得
@@ -465,10 +467,17 @@ namespace MidiToKeyApp
                                                  outOfProcessWinMmResult.Value.Success &&
                                                  !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, portName, StringComparison.OrdinalIgnoreCase));
 
+                    // WinRTで認識された実績のあるポートを記録
+                    if (osNamesSet != null && osNamesSet.Contains(portName))
+                    {
+                        _portsSeenInWinRt.Add(portName);
+                    }
+
                     // 3. WinRTでの消失判定:
-                    // ※実機KORG nanoKEY2等でWinRTが常に0件を返す環境があるため、WinRT全体が0件の場合は切断判定に使用しない！
-                    // WinRTで1件以上他のデバイスが認識されている実績がある場合に限り、対象ポートの消失を切断根拠とする。
-                    bool missingInWinRt = osNamesSet != null && osNamesSet.Count > 0 && !osNamesSet.Contains(portName);
+                    // ※実機KORG nanoKEY2等でWinRTが常に0件を返す環境があるため、対象機器をWinRTで以前認識していた実績がない限り切断根拠にしない！
+                    // 以前WinRTで認識されていた機器が、最新のWinRT一覧から不在となった場合のみ消失と判定する。
+                    bool wasSeenInWinRt = _portsSeenInWinRt.Contains(portName);
+                    bool missingInWinRt = wasSeenInWinRt && osNamesSet != null && !osNamesSet.Contains(portName);
 
                     bool isDisconnected = false;
 

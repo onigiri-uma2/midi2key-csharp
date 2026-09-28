@@ -57,8 +57,8 @@ namespace MidiToKeyApp
         public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null)
         {
             InitializeComponentProgrammatically();
-            LoadInitialSettings();
             SetupDependencies(output, listener);
+            LoadInitialSettings();
             InitWinRtWatcher();
         }
         
@@ -143,8 +143,6 @@ namespace MidiToKeyApp
                     MessageBoxIcon.Warning);
             }
             
-            RefreshPorts(true);
-
             if (settings.KeyboardLayout == "US")
                 rbUS.Checked = true;
             else
@@ -229,7 +227,7 @@ namespace MidiToKeyApp
             {
                 DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
                 chkPorts.Items.Clear();
-                if (!inputTracker.IsListening)
+                if (inputTracker == null || !inputTracker.IsListening)
                 {
                     lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
@@ -300,7 +298,7 @@ namespace MidiToKeyApp
 
             // ステータス表示の更新（接続不一致はステータス欄で案内）
             // 変換中（inputTracker.IsListening == true）はステータスを「停止中」へ書き換えない
-            if (!inputTracker.IsListening)
+            if (inputTracker == null || !inputTracker.IsListening)
             {
                 if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
                 {
@@ -830,6 +828,13 @@ namespace MidiToKeyApp
                     }
                 });
             };
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            DiagnosticLogger.Log("[Form1] OnShown: Performing initial port refresh.");
+            RefreshPorts(true);
         }
 
         protected override void OnHandleCreated(EventArgs e)

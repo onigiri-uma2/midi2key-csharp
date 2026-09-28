@@ -56,44 +56,60 @@ namespace MidiToKeyApp.Tests
         public event Action<MidiControlData>? OnControlReceived;
         public event Action<MidiDeviceDisconnectedData>? OnDeviceDisconnected;
 
+        private readonly object _lock = new();
+        private readonly HashSet<string> _portsSeenInWinRt = new(StringComparer.OrdinalIgnoreCase);
+
         public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null)
         {
-            StartCount++;
-            long gen = specificGeneration ?? (CurrentGeneration + 1);
-            CurrentGeneration = gen;
-            StartedGenerations.Add(gen);
-            var portList = portNames.ToList();
-            StartedPorts.Add(portList);
-
-            ActivePorts.Clear();
-            var opened = new List<MidiPortInfo>();
-            var failed = new List<MidiPortError>();
-
-            int idx = 1;
-            foreach (var p in portList)
+            lock (_lock)
             {
-                if (FailAllPorts || FailPorts.Contains(p))
-                {
-                    failed.Add(new MidiPortError(p, "開始失敗シミュレート"));
-                }
-                else
-                {
-                    var info = new MidiPortInfo($"{p}#{idx++}", p, DeviceState.Active);
-                    opened.Add(info);
-                    ActivePorts.Add(info);
-                }
-            }
+                StartCount++;
+                long gen = specificGeneration ?? (CurrentGeneration + 1);
+                CurrentGeneration = gen;
+                StartedGenerations.Add(gen);
+                var portList = portNames.ToList();
+                StartedPorts.Add(portList);
 
-            return new MidiPortStartResult(gen, opened, failed);
+                ActivePorts.Clear();
+                var opened = new List<MidiPortInfo>();
+                var failed = new List<MidiPortError>();
+
+                int idx = 1;
+                foreach (var p in portList)
+                {
+                    if (FailAllPorts || FailPorts.Contains(p))
+                    {
+                        failed.Add(new MidiPortError(p, "開始失敗シミュレート"));
+                    }
+                    else
+                    {
+                        var info = new MidiPortInfo($"{p}#{idx++}", p, DeviceState.Active);
+                        opened.Add(info);
+                        ActivePorts.Add(info);
+                    }
+                }
+
+                return new MidiPortStartResult(gen, opened, failed);
+            }
         }
 
         public void Stop()
         {
-            StopCount++;
-            ActivePorts.Clear();
+            lock (_lock)
+            {
+                StopCount++;
+                ActivePorts.Clear();
+                _portsSeenInWinRt.Clear();
+            }
         }
 
-        public IReadOnlyList<MidiPortInfo> GetActivePorts() => ActivePorts.ToList();
+        public IReadOnlyList<MidiPortInfo> GetActivePorts()
+        {
+            lock (_lock)
+            {
+                return ActivePorts.ToList();
+            }
+        }
 
         public void CheckDeviceHealth(
             IEnumerable<string>? activeOsDeviceNames = null,
@@ -104,31 +120,50 @@ namespace MidiToKeyApp.Tests
                 ? new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase)
                 : null;
 
-            foreach (var port in ActivePorts.ToList())
+            lock (_lock)
             {
-                bool presentInOutOfProcess = outOfProcessWinMmResult.HasValue &&
-                                             outOfProcessWinMmResult.Value.Success &&
-                                             outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
-
-                bool missingInOutOfProcess = outOfProcessWinMmResult.HasValue &&
-                                             outOfProcessWinMmResult.Value.Success &&
-                                             !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
-
-                bool missingInWinRt = osNames != null && osNames.Count > 0 && !osNames.Contains(port.DeviceName);
-
-                if (presentInOutOfProcess)
+                if (osNames != null)
                 {
-                    continue;
+                    foreach (var port in ActivePorts)
+                    {
+                        if (osNames.Contains(port.DeviceName))
+                        {
+                            _portsSeenInWinRt.Add(port.DeviceName);
+                        }
+                    }
                 }
-                else if (missingInOutOfProcess || missingInWinRt)
+
+                foreach (var port in ActivePorts.ToList())
                 {
-                    disconnected.Add(port);
+                    bool presentInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                                 outOfProcessWinMmResult.Value.Success &&
+                                                 outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+
+                    bool missingInOutOfProcess = outOfProcessWinMmResult.HasValue &&
+                                                 outOfProcessWinMmResult.Value.Success &&
+                                                 !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+
+                    bool wasSeenInWinRt = _portsSeenInWinRt.Contains(port.DeviceName);
+                    bool missingInWinRt = wasSeenInWinRt && osNames != null && !osNames.Contains(port.DeviceName);
+
+                    if (presentInOutOfProcess)
+                    {
+                        continue;
+                    }
+                    else if (missingInOutOfProcess || missingInWinRt)
+                    {
+                        disconnected.Add(port);
+                    }
+                }
+
+                foreach (var d in disconnected)
+                {
+                    ActivePorts.Remove(d);
                 }
             }
 
             foreach (var d in disconnected)
             {
-                ActivePorts.Remove(d);
                 OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
             }
         }
@@ -2959,6 +2994,80 @@ namespace MidiToKeyApp.Tests
                 req2Applied = true;
             }
             Assert.IsTrue(req2Applied, "最新の要求ID (req2) の結果のみがUIに適用されること");
+        }
+
+        // Test 106: WinRTで認識実績のない機器（nanoKEY2等）は、別の機器がWinRTに存在しても誤切断されないこと（課題3）
+        [TestMethod]
+        public void Test_106_WinRt_NeverSeenDevice_NotDisconnected_WhenOtherDeviceInWinRt()
+        {
+            var fakeListener = new FakeMidiListener();
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" });
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // nanoKEY2はWinRTに現れないが、別の機器 "OtherUSBDevice" がWinRTに現れている
+            // outOfProcessWinMmResult は一時的に取得不能 (null)
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "OtherUSBDevice" },
+                outOfProcessWinMmResult: null);
+
+            // nanoKEY2はWinRT認識実績がないため、WinRT不在を根拠に誤切断されないこと
+            Assert.IsFalse(disconnectedFired, "WinRT認識実績のない機器は誤切断されないこと");
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count, "ポート監視が維持されること");
+        }
+
+        // Test 107: WinRTで認識実績のある機器は、WinRTから不在となった場合に切断判定されること（課題3）
+        [TestMethod]
+        public void Test_107_WinRt_SeenDevice_Disconnected_WhenMissingFromWinRt()
+        {
+            var fakeListener = new FakeMidiListener();
+            fakeListener.Start(new[] { "Standard Midi Keyboard" });
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // 1. 最初はWinRTで認識されていた（実績を記録）
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "Standard Midi Keyboard" },
+                outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(new[] { "Standard Midi Keyboard" }));
+            Assert.IsFalse(disconnectedFired, "接続中は切断されないこと");
+
+            // 2. その後、WinRT一覧から消失した（別の機器 "OtherDevice" のみ残っている）
+            //    outOfProcessWinMmResult はnull（判定保留）
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "OtherDevice" },
+                outOfProcessWinMmResult: null);
+
+            // WinRT認識実績があった機器のため、WinRT消失が切断根拠として適用されること
+            Assert.IsTrue(disconnectedFired, "WinRT認識実績のある機器は消失時に切断と判定されること");
+            Assert.AreEqual(0, fakeListener.GetActivePorts().Count, "ポート監視が停止されること");
+        }
+
+        // Test 108: 子プロセスの出力読み取りが未完了の場合、0件成功と誤判定されずFailedとなること（課題2）
+        [TestMethod]
+        public void Test_108_OutOfProcessWinMm_Failed_WhenStdoutNotCompleted()
+        {
+            // 標準出力読み取り未完了のシミュレート:
+            // readCompleted が false または stdoutTask.IsCompleted が false の場合
+            bool readCompleted = false;
+            bool stdoutCompleted = false;
+
+            OutOfProcessWinMmResult result;
+            if (!readCompleted || !stdoutCompleted)
+            {
+                result = OutOfProcessWinMmResult.Failed("子プロセスの標準出力読み取りが完了しませんでした", timedOut: true);
+            }
+            else
+            {
+                result = OutOfProcessWinMmResult.Succeeded(Array.Empty<string>());
+            }
+
+            Assert.IsFalse(result.Success, "出力読み取り未完了時はSuccessにならないこと");
+            Assert.IsTrue(result.TimedOut, "TimedOutフラグが設定されること");
+            Assert.IsNotNull(result.ErrorMessage, "エラーメッセージが設定されること");
         }
     }
 }

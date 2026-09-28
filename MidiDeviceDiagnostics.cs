@@ -151,7 +151,7 @@ namespace MidiToKeyApp
                 }
 
                 // プロセス終了後に読み取りタスクの完了を待機
-                Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 500);
+                bool readCompleted = Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 1000);
 
                 if (proc.ExitCode != 0)
                 {
@@ -160,7 +160,14 @@ namespace MidiToKeyApp
                     return OutOfProcessWinMmResult.Failed($"子プロセスが終了コード {proc.ExitCode} で終了しました: {err}", proc.ExitCode);
                 }
 
-                string output = stdoutTask.IsCompleted ? stdoutTask.Result : "";
+                // 読み取りタスクが完了しなかった場合は、空文字を0件と誤判定しないようFailedを返す
+                if (!readCompleted || !stdoutTask.IsCompleted)
+                {
+                    DiagnosticLogger.Log("MidiDiagnostics", "OutOfProcess WinMM standard output read timed out or failed to complete.");
+                    return OutOfProcessWinMmResult.Failed("子プロセスの標準出力読み取りが完了しませんでした", timedOut: true);
+                }
+
+                string output = stdoutTask.Result;
                 var ports = new List<string>();
                 using var reader = new StringReader(output);
                 string? line;
