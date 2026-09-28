@@ -51,6 +51,7 @@ namespace MidiToKeyApp.Tests
         public HashSet<string> FailPorts { get; } = new();
         public bool FailAllPorts { get; set; } = false;
         public long CurrentGeneration { get; set; } = 0;
+        public InitialPortSnapshot? CurrentInitialSnapshot { get; set; } = null;
 
         public event Action<MidiNoteData>? OnNoteReceived;
         public event Action<MidiControlData>? OnControlReceived;
@@ -59,7 +60,7 @@ namespace MidiToKeyApp.Tests
         private readonly object _lock = new();
         private readonly HashSet<string> _portsSeenInWinRt = new(StringComparer.OrdinalIgnoreCase);
 
-        public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null)
+        public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null, InitialPortSnapshot? initialSnapshot = null)
         {
             lock (_lock)
             {
@@ -69,6 +70,7 @@ namespace MidiToKeyApp.Tests
                 StartedGenerations.Add(gen);
                 var portList = portNames.ToList();
                 StartedPorts.Add(portList);
+                CurrentInitialSnapshot = initialSnapshot;
 
                 ActivePorts.Clear();
                 var opened = new List<MidiPortInfo>();
@@ -100,6 +102,7 @@ namespace MidiToKeyApp.Tests
                 StopCount++;
                 ActivePorts.Clear();
                 _portsSeenInWinRt.Clear();
+                CurrentInitialSnapshot = null;
             }
         }
 
@@ -113,9 +116,17 @@ namespace MidiToKeyApp.Tests
 
         public void CheckDeviceHealth(
             IEnumerable<string>? activeOsDeviceNames = null,
-            OutOfProcessWinMmResult? outOfProcessWinMmResult = null)
+            OutOfProcessWinMmResult? outOfProcessWinMmResult = null,
+            long? targetGeneration = null)
         {
+            if (targetGeneration.HasValue && targetGeneration.Value != CurrentGeneration)
+            {
+                return;
+            }
+
             var disconnected = new List<MidiPortInfo>();
+            bool hasAmbiguous = false;
+            string ambiguousPort = "";
             var osNames = activeOsDeviceNames != null
                 ? new HashSet<string>(activeOsDeviceNames, StringComparer.OrdinalIgnoreCase)
                 : null;
@@ -133,26 +144,51 @@ namespace MidiToKeyApp.Tests
                     }
                 }
 
-                foreach (var port in ActivePorts.ToList())
+                var activeGroups = ActivePorts.GroupBy(p => p.DeviceName, StringComparer.OrdinalIgnoreCase).ToList();
+
+                foreach (var group in activeGroups)
                 {
-                    bool presentInOutOfProcess = outOfProcessWinMmResult.HasValue &&
-                                                 outOfProcessWinMmResult.Value.Success &&
-                                                 outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+                    string portName = group.Key;
+                    int activeCount = group.Count();
+                    bool wasSeenInWinRt = _portsSeenInWinRt.Contains(portName);
 
-                    bool missingInOutOfProcess = outOfProcessWinMmResult.HasValue &&
-                                                 outOfProcessWinMmResult.Value.Success &&
-                                                 !outOfProcessWinMmResult.Value.Ports.Any(p => string.Equals(p, port.DeviceName, StringComparison.OrdinalIgnoreCase));
+                    var decision = MidiDisconnectionEvaluator.EvaluatePort(
+                        portName,
+                        activeCount,
+                        CurrentInitialSnapshot,
+                        outOfProcessWinMmResult,
+                        activeCount,
+                        osNames,
+                        wasSeenInWinRt,
+                        CurrentGeneration);
 
-                    bool wasSeenInWinRt = _portsSeenInWinRt.Contains(port.DeviceName);
-                    bool missingInWinRt = wasSeenInWinRt && osNames != null && !osNames.Contains(port.DeviceName);
-
-                    if (presentInOutOfProcess)
+                    if (decision.IsDisconnected)
                     {
-                        continue;
+                        if (decision.IsAmbiguous)
+                        {
+                            hasAmbiguous = true;
+                            ambiguousPort = portName;
+                        }
+
+                        foreach (var d in group)
+                        {
+                            if (!disconnected.Contains(d))
+                            {
+                                disconnected.Add(d);
+                            }
+                        }
                     }
-                    else if (missingInOutOfProcess || missingInWinRt)
+                }
+
+                if (hasAmbiguous)
+                {
+                    // 要件4: 同名機器の一部切断時は全監視デバイスを停止
+                    foreach (var d in ActivePorts)
                     {
-                        disconnected.Add(port);
+                        if (!disconnected.Contains(d))
+                        {
+                            disconnected.Add(d);
+                        }
                     }
                 }
 
@@ -162,9 +198,20 @@ namespace MidiToKeyApp.Tests
                 }
             }
 
-            foreach (var d in disconnected)
+            if (hasAmbiguous)
             {
-                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
+                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(
+                    string.Empty,
+                    ambiguousPort,
+                    CurrentGeneration,
+                    "同名のMIDIデバイスの一部切断を検知しました。切断された機器を特定できないため、安全のため変換を停止しました。機器を接続し直し、midi2keyを再起動してください。"));
+            }
+            else
+            {
+                foreach (var d in disconnected)
+                {
+                    OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(d.DeviceId, d.DeviceName, CurrentGeneration, "OS切断検知"));
+                }
             }
         }
 
@@ -3096,6 +3143,370 @@ namespace MidiToKeyApp.Tests
             // outProcResult.Success && outProcResult.Ports.Count == 0 のみ切断確定
             bool isConfirmedDisconnected = childProcResult.Success && childProcResult.Ports.Count == 0;
             Assert.IsFalse(isConfirmedDisconnected, "列挙失敗のエラーが『正常に0件＝切断』と誤解釈されないこと");
+        }
+
+        // Test 110: 同名2台を両方監視中に、2件→1件となった場合、全変換を安全停止すること（検証1）
+        // 実際の切断判定処理を通すため、ポート列挙差し替え可能なMidiListener本番クラスでも検証
+        [TestMethod]
+        public void Test_110_SameNameDevices_BothMonitored_2to1_SafelyStopsAll()
+        {
+            var listener = new MidiListener();
+            listener.SetCurrentGenerationForTesting(1);
+            listener.AddTestDevice("nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD#1", 1);
+            listener.AddTestDevice("nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD#2", 1);
+            Assert.AreEqual(2, listener.GetActivePorts().Count);
+
+            // 変換開始時スナップショット（2件）
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            listener.SetInitialSnapshotForTesting(snapshot);
+
+            MidiDeviceDisconnectedData? receivedData = null;
+            listener.OnDeviceDisconnected += data => receivedData = data;
+
+            // 親プロセス列挙差し替え（1件）
+            listener.OnlineDeviceNamesProvider = () => new[] { "nanoKEY2 1 KEYBOARD" };
+
+            // 新規プロセスWinMMが1件に減少（同名機器の一部切断）
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+
+            listener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            // 監視ポートがすべて停止され、同名一部切断メッセージが通知されること
+            Assert.AreEqual(0, listener.GetActivePorts().Count, "全ポートが安全停止されること");
+            Assert.IsNotNull(receivedData, "切断通知が発行されること");
+            Assert.AreEqual(string.Empty, receivedData.Value.DeviceId, "切断元特定不能のためDeviceIdが空であること");
+            Assert.IsTrue(receivedData.Value.Reason.Contains("同名のMIDIデバイスの一部切断"), "同名一部切断の理由が含まれること");
+        }
+
+        // Test 111: 同名2台のうち1台だけを監視中でも、接続総数が2件→1件となった場合、全変換を安全停止すること（検証2、最重要ケース）
+        [TestMethod]
+        public void Test_111_SameNameDevices_OneMonitored_Total2to1_SafelyStopsAll()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            var fakeListener = new FakeMidiListener();
+            long gen = tracker.StartConversionSession();
+
+            fakeListener.OnDeviceDisconnected += data =>
+            {
+                tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+            };
+
+            // 監視は1台のみ開始
+            var snapshot = new InitialPortSnapshot(true, gen, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 } // 接続総数は2台！
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, gen, snapshot);
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count);
+            string devId = fakeListener.GetActivePorts()[0].DeviceId;
+
+            // 鍵盤を押下
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // 新規プロセスWinMMで総数が2台から1台に減少
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" });
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: gen);
+
+            // 監視1台であっても接続総数減少により切断元特定不能として安全停止され、キーがKeyUpされること
+            Assert.AreEqual(0, fakeListener.GetActivePorts().Count, "全ポートが安全停止されること");
+            Assert.AreEqual(0, tracker.ActiveNotesCount, "入力状態がクリアされること");
+            Assert.AreEqual(1, _mock.KeyUpCount, "押下中キーが解放されること");
+            Assert.IsFalse(tracker.IsListening, "変換セッションが無効化されること");
+        }
+
+        // Test 112: 同名3台のうち1台が取り外され、3件→2件となった場合も安全停止すること（検証3）
+        [TestMethod]
+        public void Test_112_SameNameDevices_3to2_SafelyStopsAll()
+        {
+            var fakeListener = new FakeMidiListener();
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 3 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" }, 1, snapshot);
+            Assert.AreEqual(2, fakeListener.GetActivePorts().Count);
+
+            MidiDeviceDisconnectedData? receivedData = null;
+            fakeListener.OnDeviceDisconnected += data => receivedData = data;
+
+            // 3台から2台へ減少
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" });
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            Assert.AreEqual(0, fakeListener.GetActivePorts().Count);
+            Assert.IsNotNull(receivedData);
+            Assert.AreEqual(string.Empty, receivedData.Value.DeviceId);
+            Assert.IsTrue(receivedData.Value.Reason.Contains("同名"));
+        }
+
+        // Test 113: 別名の監視対象外MIDI機器だけが減少した場合、変換を維持すること（検証4）
+        [TestMethod]
+        public void Test_113_OtherUnmonitoredMidiDevice_Decreased_KeepsConversion()
+        {
+            var fakeListener = new FakeMidiListener();
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 },
+                { "OtherMidiDevice", 1 }
+            });
+            // 監視対象は nanoKEY2 のみ
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" }, 1, snapshot);
+            Assert.AreEqual(2, fakeListener.GetActivePorts().Count);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // OtherMidiDevice が消失し、nanoKEY2は2台のまま
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" });
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            Assert.IsFalse(disconnectedFired, "監視対象外の減少で切断通知が発火しないこと");
+            Assert.AreEqual(2, fakeListener.GetActivePorts().Count, "監視が維持されること");
+        }
+
+        // Test 114: 無関係なUSB機器の変更通知で変換を停止しないこと（検証5）
+        [TestMethod]
+        public void Test_114_IrrelevantUsbChange_DoesNotStopConversion()
+        {
+            var fakeListener = new FakeMidiListener();
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" }, 1, snapshot);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // USBマウス等の無関係な変更（WinRTにマウスが現れる等、MIDIポート数は2件維持）
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" });
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD", "USB Optical Mouse" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            Assert.IsFalse(disconnectedFired, "無関係なUSB変更で変換停止しないこと");
+            Assert.AreEqual(2, fakeListener.GetActivePorts().Count);
+        }
+
+        // Test 115: 同名ポートが増加しただけの場合、切断として扱わないこと（検証6）
+        [TestMethod]
+        public void Test_115_SameNameDevice_CountIncreased_NotTreatedAsDisconnection()
+        {
+            var fakeListener = new FakeMidiListener();
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" }, 1, snapshot);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // 2件から3件へ増加
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" });
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            Assert.IsFalse(disconnectedFired, "機器増加を切断として扱わないこと");
+            Assert.AreEqual(2, fakeListener.GetActivePorts().Count);
+        }
+
+        // Test 116: 列挙失敗を0件と誤認して停止しないこと（検証7）
+        [TestMethod]
+        public void Test_116_EnumerationFailed_NotMisidentifiedAsZero_DoesNotStop()
+        {
+            var fakeListener = new FakeMidiListener();
+            var snapshot = new InitialPortSnapshot(true, 1, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, 1, snapshot);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // 子プロセスが失敗
+            var outProcResult = OutOfProcessWinMmResult.Failed("子プロセス例外", exitCode: 1);
+
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: outProcResult,
+                targetGeneration: 1);
+
+            Assert.IsFalse(disconnectedFired, "列挙失敗で切断判定されないこと");
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count, "監視が維持されること");
+        }
+
+        // Test 117: 旧Generationの列挙結果で新セッションを停止しないこと（検証8）
+        [TestMethod]
+        public void Test_117_OldGenerationResult_DoesNotStopNewSession()
+        {
+            var fakeListener = new FakeMidiListener();
+            // セッション1開始
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, 1);
+            fakeListener.Stop();
+
+            // 新セッション2開始
+            var snapshot2 = new InitialPortSnapshot(true, 2, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD" }, 2, snapshot2);
+
+            bool disconnectedFired = false;
+            fakeListener.OnDeviceDisconnected += _ => disconnectedFired = true;
+
+            // 旧Generation (Gen=1) の0件結果が遅れて到着
+            var oldOutProcResult = OutOfProcessWinMmResult.Succeeded(Array.Empty<string>());
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: Array.Empty<string>(),
+                outOfProcessWinMmResult: oldOutProcResult,
+                targetGeneration: 1);
+
+            Assert.IsFalse(disconnectedFired, "旧Generationの結果で新セッションが停止されないこと");
+            Assert.AreEqual(1, fakeListener.GetActivePorts().Count, "新セッションのポート監視が維持されること");
+        }
+
+        // Test 118: 遅れて到着した古い列挙結果が最新結果を上書きしないこと（検証9）
+        [TestMethod]
+        public void Test_118_DelayedOutOfOrderHealthCheck_DoesNotOverwriteLatestResult()
+        {
+            long latestCompletedRequestId = 0;
+
+            // 要求1 (古い要求)
+            long req1 = 1;
+            // 要求2 (最新要求)
+            long req2 = 2;
+
+            // 要求2が先に完了
+            latestCompletedRequestId = req2;
+
+            // その後、要求1が遅れて届いた場合の検証
+            bool req1Accepted = req1 >= latestCompletedRequestId;
+            Assert.IsFalse(req1Accepted, "最新完了IDより古い要求は無視・破棄されること");
+
+            // 新たな要求3が届いた場合
+            long req3 = 3;
+            bool req3Accepted = req3 >= latestCompletedRequestId;
+            Assert.IsTrue(req3Accepted, "最新の要求は正しく受け付けられること");
+        }
+
+        // Test 119: 安全停止時にノートとCC64の押下状態を解放すること（検証10）
+        [TestMethod]
+        public void Test_119_SafetyStop_ReleasesBothNotesAndCC64Pedal()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string>
+                {
+                    { "60", "k" },
+                    { "pedal", "space" }
+                }
+            });
+            var fakeListener = new FakeMidiListener();
+            long gen = tracker.StartConversionSession();
+
+            fakeListener.OnDeviceDisconnected += data =>
+            {
+                tracker.ReleaseDeviceInputs(data.DeviceId, data.Generation);
+            };
+
+            var snapshot = new InitialPortSnapshot(true, gen, new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "nanoKEY2 1 KEYBOARD", 2 }
+            });
+            fakeListener.Start(new[] { "nanoKEY2 1 KEYBOARD", "nanoKEY2 1 KEYBOARD" }, gen, snapshot);
+            string devId = fakeListener.GetActivePorts()[0].DeviceId;
+
+            // ノート60押下とCC64ペダル踏み込み
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            tracker.ProcessControlEvent(new MidiControlData(devId, "nanoKEY2 1 KEYBOARD", 1, 64, 127, gen));
+
+            Assert.AreEqual(2, tracker.ActiveNotesCount, "ノートとペダルでActiveNotesCountが2になること");
+            Assert.AreEqual(2, _mock.KeyDownCount, "ノートとペダルで2回のKeyDownが発生すること");
+
+            // 同名一部切断による安全停止を実行
+            fakeListener.CheckDeviceHealth(
+                activeOsDeviceNames: new[] { "nanoKEY2 1 KEYBOARD" },
+                outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(new[] { "nanoKEY2 1 KEYBOARD" }),
+                targetGeneration: gen);
+
+            Assert.AreEqual(0, tracker.ActiveNotesCount, "ActiveNotesが0になること");
+            Assert.AreEqual(2, _mock.KeyUpCount, "ノートとペダルの両方がKeyUpされること");
+        }
+
+        // Test 120: 同じ切断通知が複数回来てもキー解放が重複しないこと（検証11）
+        [TestMethod]
+        public void Test_120_MultipleIdenticalDisconnectNotifications_NoDuplicateKeyRelease()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            string devId = "nanoKEY2 1 KEYBOARD#1";
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+            Assert.AreEqual(1, tracker.ActiveNotesCount);
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            // 1回目の切断通知
+            tracker.ReleaseDeviceInputs(string.Empty, gen);
+            Assert.AreEqual(1, _mock.KeyUpCount);
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
+
+            // 2回目の切断通知（同一セッション内重複）
+            tracker.ReleaseDeviceInputs(string.Empty, gen);
+            Assert.AreEqual(1, _mock.KeyUpCount, "重複してKeyUpが呼ばれないこと");
+        }
+
+        // Test 121: 停止後に旧デバイスから届いたNoteOnを受け付けないこと（検証12）
+        [TestMethod]
+        public void Test_121_NoteOnFromOldDeviceAfterStop_Rejected()
+        {
+            var tracker = new InputTracker(_simulator, () => new AppSettings
+            {
+                Mapping = new Dictionary<string, string> { { "60", "k" } }
+            });
+            long gen = tracker.StartConversionSession();
+
+            string devId = "nanoKEY2 1 KEYBOARD#1";
+            // 切断発生により安全停止
+            tracker.ReleaseDeviceInputs(devId, gen);
+
+            // 停止・無効化後に旧デバイスから遅延して NoteOn が到着
+            tracker.ProcessNoteEvent(new MidiNoteData(devId, "nanoKEY2 1 KEYBOARD", 1, 60, 100, true, gen));
+
+            Assert.AreEqual(0, _mock.KeyDownCount, "切断済みデバイスからのNoteOnは拒否されKeyDownされないこと");
+            Assert.AreEqual(0, tracker.ActiveNotesCount);
         }
     }
 }

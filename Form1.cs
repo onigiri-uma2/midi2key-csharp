@@ -43,6 +43,10 @@ namespace MidiToKeyApp
         // ポート一覧の非同期更新競合防止用
         private long _refreshPortsRequestId = 0;
 
+        // デバイスヘルスチェックの非同期更新競合防止用（要件5）
+        private long _healthCheckRequestId = 0;
+        private long _latestCompletedHealthCheckRequestId = 0;
+
         // 接続変更・切断警告の通知集約用（同一メッセージの重複抑止）
         private string? _lastAlertMessage = null;
         private DateTime _lastAlertTime = DateTime.MinValue;
@@ -765,7 +769,9 @@ namespace MidiToKeyApp
             deviceDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
             deviceDebounceTimer.Tick += (s, e) => {
                 deviceDebounceTimer.Stop();
-                DiagnosticLogger.Log($"[DebounceTimer] Tick fired. Invoking CheckDeviceHealth(). Gen={inputTracker.CurrentSessionId}");
+                long triggerGen = inputTracker.CurrentSessionId;
+                long requestId = Interlocked.Increment(ref _healthCheckRequestId);
+                DiagnosticLogger.Log($"[DebounceTimer] Tick fired. Invoking CheckDeviceHealth(). Gen={triggerGen}, RequestId={requestId}");
                 
                 // WinRTが認識している最新のデバイス名一覧を取得
                 List<string>? osDeviceNames = null;
@@ -786,8 +792,24 @@ namespace MidiToKeyApp
                             {
                                 BeginInvoke(new Action(() => {
                                     if (IsDisposed) return;
+
+                                    // 要件5: Generation検証（セッションが変わっているか停止していれば古い結果を破棄）
+                                    if (triggerGen != inputTracker.CurrentSessionId || !inputTracker.IsListening)
+                                    {
+                                        DiagnosticLogger.Log($"[DebounceTimer] Ignored outdated health check result: TriggerGen={triggerGen}, CurrentGen={inputTracker.CurrentSessionId}, IsListening={inputTracker.IsListening}");
+                                        return;
+                                    }
+
+                                    // 要件5: 同一セッション内での古い列挙結果の後着上書き防止
+                                    if (requestId < _latestCompletedHealthCheckRequestId)
+                                    {
+                                        DiagnosticLogger.Log($"[DebounceTimer] Ignored out-of-order health check result: RequestId={requestId}, LatestCompleted={_latestCompletedHealthCheckRequestId}");
+                                        return;
+                                    }
+                                    _latestCompletedHealthCheckRequestId = requestId;
+
                                     var beforeActive = midiListener.GetActivePorts();
-                                    midiListener.CheckDeviceHealth(osDeviceNames, outProcResult);
+                                    midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
                                     var afterActive = midiListener.GetActivePorts();
                                     RefreshPorts(false);
 
@@ -1029,7 +1051,8 @@ namespace MidiToKeyApp
 
                 long sessionId = inputTracker.StartConversionSession();
                 DiagnosticLogger.Log($"[Form1] StartConversion invoked. Generated Gen={sessionId}, Ports=[{string.Join(", ", ports)}]");
-                var startResult = midiListener.Start(ports, sessionId);
+                var snapshot = InitialPortSnapshot.FromOutOfProcessResult(sessionId, outProc);
+                var startResult = midiListener.Start(ports, sessionId, snapshot);
 
                 if (startResult.IsAllFailed)
                 {
@@ -1142,10 +1165,15 @@ namespace MidiToKeyApp
             if (activePorts.Count == 0 || string.IsNullOrEmpty(data.DeviceId))
             {
                 // 全ポート切断または同名等で切断元特定不能の場合: 安全側として変換全体を停止
-                DiagnosticLogger.Log($"[Form1] Full disconnect or unidentified device disconnect. Stopping conversion safely. RemainingActivePorts={activePorts.Count}");
+                DiagnosticLogger.Log($"[Form1] Full disconnect or unidentified device disconnect. Stopping conversion safely. RemainingActivePorts={activePorts.Count}, Reason='{data.Reason}', UnreleasedKeys={keySimulator.UnreleasedKeysCount}");
                 StopConversion();
+
+                string warningMsg = data.Reason.Contains("同名のMIDIデバイスの一部切断") || data.Reason.Contains("同名")
+                    ? "同名のMIDIデバイスの一部切断を検知しました。切断された機器を特定できないため、安全のため変換を停止しました。機器を接続し直し、midi2keyを再起動してください。"
+                    : "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。";
+
                 ShowAggregatedWarning(
-                    "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。",
+                    warningMsg,
                     "MIDIデバイス切断検知");
             }
             else
