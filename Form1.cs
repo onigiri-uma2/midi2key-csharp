@@ -226,20 +226,22 @@ namespace MidiToKeyApp
         {
             var currentPorts = MidiListener.GetPortNames();
 
-            // 1. 新規プロセスでポートが検出されたが親プロセスに未反映の場合
-            if (outProcResult.Success && outProcResult.Ports.Count > 0 &&
+            // 1. 親プロセス側または新規プロセス側のいずれかで状態取得・列挙に失敗している場合
+            if (!currentPorts.Success || !outProcResult.Success)
+            {
+                ShowAggregatedWarning(
+                    "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。",
+                    "MIDIデバイス状態確認");
+                return;
+            }
+
+            // 2. 新規プロセスでポートが検出されたが親プロセスに未反映の場合（新規接続の検知）
+            if (outProcResult.Ports.Count > 0 &&
                 (currentPorts.Ports.Count == 0 || outProcResult.Ports.Any(p => !currentPorts.Ports.Contains(p, StringComparer.OrdinalIgnoreCase))))
             {
                 ShowAggregatedWarning(
                     "MIDIデバイスの接続を検知しました。利用するにはmidi2keyを再起動してください。",
                     "MIDIデバイス接続検知");
-            }
-            // 2. 接続状態を確認できない場合（タイムアウトまたは取得失敗）
-            else if (!outProcResult.Success)
-            {
-                ShowAggregatedWarning(
-                    "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。",
-                    "MIDIデバイス状態確認");
             }
             // 3. 無関係なUSB機器の変更等（ポート変化なし）: 警告を表示しない
         }
