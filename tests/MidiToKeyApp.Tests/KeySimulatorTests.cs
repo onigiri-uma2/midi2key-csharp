@@ -3069,5 +3069,33 @@ namespace MidiToKeyApp.Tests
             Assert.IsTrue(result.TimedOut, "TimedOutフラグが設定されること");
             Assert.IsNotNull(result.ErrorMessage, "エラーメッセージが設定されること");
         }
+
+        // Test 109: WinMmEnumerationResultでAPIエラー発生時はSuccess=falseとなり0件正常と区別されること
+        [TestMethod]
+        public void Test_109_WinMmEnumeration_FailedResult_DistinguishedFromEmptySuccess()
+        {
+            // 1. 正常な0件のケース
+            var emptySuccess = WinMmEnumerationResult.Succeeded(Array.Empty<WinMmDeviceInfo>());
+            Assert.IsTrue(emptySuccess.Success, "正常な0件はSuccess=trueであること");
+            Assert.AreEqual(0, emptySuccess.Devices.Count);
+
+            // 2. 列挙エラー発生のケース
+            var apiFailed = WinMmEnumerationResult.Failed("midiInGetDevCaps がデバイスID 0 に対しエラーコード 2 を返しました");
+            Assert.IsFalse(apiFailed.Success, "APIエラー時はSuccess=falseであること");
+            Assert.IsNotNull(apiFailed.ErrorMessage);
+
+            // 3. 子プロセスが列挙失敗で終了コード1を返した場合、親プロセスがFailedと判定して切断確定と誤判定しないこと
+            var childProcResult = OutOfProcessWinMmResult.Failed(
+                $"子プロセスが終了コード 1 で終了しました: {apiFailed.ErrorMessage}",
+                exitCode: 1);
+
+            Assert.IsFalse(childProcResult.Success, "子プロセス列挙失敗時はSuccess=falseであること");
+            Assert.AreEqual(1, childProcResult.ExitCode);
+
+            // 親プロセスの切断判定ロジック:
+            // outProcResult.Success && outProcResult.Ports.Count == 0 のみ切断確定
+            bool isConfirmedDisconnected = childProcResult.Success && childProcResult.Ports.Count == 0;
+            Assert.IsFalse(isConfirmedDisconnected, "列挙失敗のエラーが『正常に0件＝切断』と誤解釈されないこと");
+        }
     }
 }

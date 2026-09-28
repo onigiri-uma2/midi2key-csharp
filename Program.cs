@@ -11,14 +11,22 @@ namespace MidiToKeyApp
         [STAThread]
         static void Main(string[] args)
         {
-            // 1. 診断用子プロセスの場合はWinMM列挙だけを実行して終了（debug_device.logは上書き・初期化しない）
+            // 1. 診断用子プロセスの場合はWinMM列挙だけを実行して終了（debug_device.logは上書き・初期化・削除しない）
             if (args != null && args.Length > 0 && Array.Exists(args, a => string.Equals(a, "--enum-winmm", StringComparison.OrdinalIgnoreCase)))
             {
-                var ports = MidiDeviceDiagnostics.GetInProcessWinMmPorts();
-                foreach (var p in ports)
+                var result = MidiDeviceDiagnostics.GetInProcessWinMmPortsResult();
+                if (!result.Success)
+                {
+                    Console.Error.WriteLine(result.ErrorMessage ?? "WinMM列挙失敗");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+
+                foreach (var p in result.Ports)
                 {
                     Console.WriteLine(p);
                 }
+                Environment.ExitCode = 0;
                 return;
             }
 

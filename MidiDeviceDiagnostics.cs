@@ -14,6 +14,24 @@ namespace MidiToKeyApp
     public readonly record struct WinMmDeviceInfo(int Index, string Name, ushort Mid, ushort Pid);
 
     /// <summary>
+    /// プロセス内WinMM列挙の結果型。
+    /// 正常な0件とAPIエラー・例外を明確に区別します。
+    /// </summary>
+    public readonly record struct WinMmEnumerationResult(
+        bool Success,
+        IReadOnlyList<WinMmDeviceInfo> Devices,
+        string? ErrorMessage = null,
+        Exception? Exception = null
+    )
+    {
+        public static WinMmEnumerationResult Succeeded(IReadOnlyList<WinMmDeviceInfo> devices) =>
+            new(true, devices);
+
+        public static WinMmEnumerationResult Failed(string error, Exception? ex = null) =>
+            new(false, Array.Empty<WinMmDeviceInfo>(), error, ex);
+    }
+
+    /// <summary>
     /// 新規独立プロセスのWinMM列挙結果。
     /// 正常な0件、検出あり、タイムアウト、プロセス起動失敗を明確に区別します。
     /// </summary>
@@ -75,8 +93,9 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 同一プロセス内でWinMM (winmm.dll) を直接叩いてポート詳細一覧を取得します。
+        /// 正常な0件とAPIエラー・例外を明確に区別した結果型を返します。
         /// </summary>
-        public static List<WinMmDeviceInfo> GetInProcessWinMmDevices()
+        public static WinMmEnumerationResult GetInProcessWinMmDevicesResult()
         {
             var list = new List<WinMmDeviceInfo>();
             try
@@ -84,20 +103,49 @@ namespace MidiToKeyApp
                 uint count = midiInGetNumDevs();
                 for (uint i = 0; i < count; i++)
                 {
-                    if (midiInGetDevCaps((UIntPtr)i, out var caps, (uint)Marshal.SizeOf<MIDIINCAPS>()) == 0)
+                    uint mmr = midiInGetDevCaps((UIntPtr)i, out var caps, (uint)Marshal.SizeOf<MIDIINCAPS>());
+                    if (mmr != 0)
                     {
-                        if (!string.IsNullOrEmpty(caps.szPname))
-                        {
-                            list.Add(new WinMmDeviceInfo((int)i, caps.szPname, caps.wMid, caps.wPid));
-                        }
+                        string err = $"midiInGetDevCaps がデバイスID {i} に対しエラーコード {mmr} を返しました";
+                        DiagnosticLogger.Log("MidiDiagnostics", err);
+                        return WinMmEnumerationResult.Failed(err);
+                    }
+
+                    if (!string.IsNullOrEmpty(caps.szPname))
+                    {
+                        list.Add(new WinMmDeviceInfo((int)i, caps.szPname, caps.wMid, caps.wPid));
                     }
                 }
+                return WinMmEnumerationResult.Succeeded(list);
             }
             catch (Exception ex)
             {
-                DiagnosticLogger.Log("MidiDiagnostics", $"InProcess WinMM query failed: {ex.Message}");
+                string err = $"InProcess WinMM query failed: {ex.Message}";
+                DiagnosticLogger.Log("MidiDiagnostics", err);
+                return WinMmEnumerationResult.Failed(err, ex);
             }
-            return list;
+        }
+
+        /// <summary>
+        /// 同一プロセス内でWinMM (winmm.dll) を直接叩いてポート詳細一覧を取得します（互換用）。
+        /// </summary>
+        public static List<WinMmDeviceInfo> GetInProcessWinMmDevices()
+        {
+            var result = GetInProcessWinMmDevicesResult();
+            return result.Success ? result.Devices.ToList() : new List<WinMmDeviceInfo>();
+        }
+
+        /// <summary>
+        /// 同一プロセス内でWinMM (winmm.dll) を直接叩いてポート名一覧を取得します（結果型）。
+        /// </summary>
+        public static PortEnumerationResult GetInProcessWinMmPortsResult()
+        {
+            var devResult = GetInProcessWinMmDevicesResult();
+            if (!devResult.Success)
+            {
+                return PortEnumerationResult.Failed(devResult.ErrorMessage ?? "WinMM列挙に失敗しました", devResult.Exception);
+            }
+            return PortEnumerationResult.Succeeded(devResult.Devices.Select(d => d.Name).ToList());
         }
 
         /// <summary>
@@ -105,7 +153,8 @@ namespace MidiToKeyApp
         /// </summary>
         public static List<string> GetInProcessWinMmPorts()
         {
-            return GetInProcessWinMmDevices().Select(d => d.Name).ToList();
+            var result = GetInProcessWinMmPortsResult();
+            return result.Success ? result.Ports.ToList() : new List<string>();
         }
 
         /// <summary>
