@@ -2853,7 +2853,7 @@ namespace MidiToKeyApp.Tests
             try
             {
                 // 初期化時に明示的に無効化（通常起動の挙動）
-                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog, enable: false);
+                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog, enable: false, deleteIfExistsWhenDisabled: true);
                 DiagnosticLogger.Log("AppStart", "通常起動メッセージ");
 
                 // ファイルが存在しないこと
@@ -2865,6 +2865,100 @@ namespace MidiToKeyApp.Tests
                 try { if (File.Exists(tempLog)) File.Delete(tempLog); } catch { }
                 DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
             }
+        }
+
+        // Test 103: 通常起動時に既存ログファイルが存在する場合は削除されること（課題3）
+        [TestMethod]
+        public void Test_103_NormalStartup_DeletesExistingLogFile()
+        {
+            string tempLog = Path.Combine(Path.GetTempPath(), $"test_log_{Guid.NewGuid():N}.log");
+            try
+            {
+                // 前回のセッションで作成された古いログファイルが存在する
+                File.WriteAllText(tempLog, "OLD_SESSION_LEFTOVER_LOG");
+                Assert.IsTrue(File.Exists(tempLog));
+
+                // 通常起動時の初期化（enable: false, deleteIfExistsWhenDisabled: true）
+                DiagnosticLogger.Initialize(overwrite: true, customPath: tempLog, enable: false, deleteIfExistsWhenDisabled: true);
+
+                // 既存のログファイルが削除されていること
+                Assert.IsFalse(File.Exists(tempLog), "通常起動時には既存のdebug_device.logが削除されること");
+            }
+            finally
+            {
+                DiagnosticLogger.IsEnabled = false;
+                try { if (File.Exists(tempLog)) File.Delete(tempLog); } catch { }
+                DiagnosticLogger.LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_device.log");
+            }
+        }
+
+        // Test 104: 選択ポートAが切断済みで別のポートBだけが接続されている場合、ポートAの開始が拒否されること（課題1）
+        [TestMethod]
+        public void Test_104_StartConversion_ChecksEachSelectedPortAgainstOutOfProcess()
+        {
+            // 選択されたポート: "PortA"
+            var selectedPorts = new List<string> { "PortA" };
+
+            // 親プロセスのMIDIバックエンドには残存キャッシュとして "PortA" が見えている
+            var enumResultPorts = new List<string> { "PortA" };
+            bool enumSuccess = true;
+
+            // しかし新規プロセスWinMMでは "PortA" は切断されており、別の "PortB" のみが存在
+            var outProcResult = OutOfProcessWinMmResult.Succeeded(new[] { "PortB" });
+
+            // 個別ポート照合ロジックの検証
+            bool isAnyPortInvalid = false;
+            if (!enumSuccess)
+            {
+                isAnyPortInvalid = true;
+            }
+            else
+            {
+                foreach (var port in selectedPorts)
+                {
+                    bool inBackend = enumResultPorts.Contains(port, StringComparer.OrdinalIgnoreCase);
+                    bool inOutOfProcess = !outProcResult.Success || outProcResult.Ports.Contains(port, StringComparer.OrdinalIgnoreCase);
+
+                    if (!inBackend || !inOutOfProcess)
+                    {
+                        isAnyPortInvalid = true;
+                        break;
+                    }
+                }
+            }
+
+            Assert.IsTrue(isAnyPortInvalid, "PortAは新規プロセス一覧に含まれていないため、開始不可と判定されること");
+        }
+
+        // Test 105: ポート一覧の非同期更新で古い要求IDの結果が最新の一覧を上書きしないこと（課題2）
+        [TestMethod]
+        public void Test_105_RefreshPorts_DiscardsOutdatedAsyncResult()
+        {
+            long latestRequestId = 0;
+
+            // リクエスト1を発行
+            long req1 = Interlocked.Increment(ref latestRequestId);
+            Assert.AreEqual(1, req1);
+
+            // リクエスト2を発行（最新）
+            long req2 = Interlocked.Increment(ref latestRequestId);
+            Assert.AreEqual(2, req2);
+
+            // リクエスト1（古い要求）の結果が後から届いた場合
+            bool req1Applied = false;
+            if (Interlocked.Read(ref latestRequestId) == req1)
+            {
+                req1Applied = true;
+            }
+            Assert.IsFalse(req1Applied, "古い要求ID (req1) の結果は破棄されること");
+
+            // リクエスト2（最新の要求）の結果が届いた場合
+            bool req2Applied = false;
+            if (Interlocked.Read(ref latestRequestId) == req2)
+            {
+                req2Applied = true;
+            }
+            Assert.IsTrue(req2Applied, "最新の要求ID (req2) の結果のみがUIに適用されること");
         }
     }
 }

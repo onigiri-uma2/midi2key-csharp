@@ -35,10 +35,11 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// ログ機能を初期化します。
-        /// 普段は debug_device.log を出力せず、明示的に有効化（--debug 引数等）された場合のみ出力します。
+        /// 普段は debug_device.log を出力せず、通常起動時は既存ログファイルを削除します。
+        /// 明示的に有効化（--debug 引数等）された場合のみ出力します。
         /// 診断用子プロセス（--enum-winmm）からは呼び出さないでください。
         /// </summary>
-        public static void Initialize(bool overwrite = true, string? customPath = null, bool? enable = null)
+        public static void Initialize(bool overwrite = true, string? customPath = null, bool? enable = null, bool deleteIfExistsWhenDisabled = false)
         {
             lock (_lock)
             {
@@ -54,6 +55,20 @@ namespace MidiToKeyApp
 
                 if (!_isEnabled)
                 {
+                    if (deleteIfExistsWhenDisabled)
+                    {
+                        try
+                        {
+                            if (File.Exists(_logFilePath))
+                            {
+                                File.Delete(_logFilePath);
+                            }
+                        }
+                        catch
+                        {
+                            // 削除失敗時もクラッシュさせない
+                        }
+                    }
                     return;
                 }
 

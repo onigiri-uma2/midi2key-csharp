@@ -40,6 +40,9 @@ namespace MidiToKeyApp
         private WinRtMidiWatcher? _winRtWatcher;
         private volatile bool _isTransitioning = false;
 
+        // ポート一覧の非同期更新競合防止用
+        private long _refreshPortsRequestId = 0;
+
         // 接続変更・切断警告の通知集約用（同一メッセージの重複抑止）
         private string? _lastAlertMessage = null;
         private DateTime _lastAlertTime = DateTime.MinValue;
@@ -218,6 +221,7 @@ namespace MidiToKeyApp
         private void RefreshPorts(bool isInitialLoad = false)
         {
             if (chkPorts == null) return;
+            long currentRequestId = Interlocked.Increment(ref _refreshPortsRequestId);
             var checkedPorts = isInitialLoad ? settings.SelectedPorts : GetSelectedPorts();
             var enumResult = MidiListener.GetPortNames();
 
@@ -225,8 +229,11 @@ namespace MidiToKeyApp
             {
                 DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
                 chkPorts.Items.Clear();
-                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
+                if (!inputTracker.IsListening)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                }
                 return;
             }
 
@@ -241,6 +248,12 @@ namespace MidiToKeyApp
                     {
                         BeginInvoke(new Action(() => {
                             if (IsDisposed) return;
+                            // 要求IDが最新でない古い非同期結果は破棄して競合を防止
+                            if (Interlocked.Read(ref _refreshPortsRequestId) != currentRequestId)
+                            {
+                                DiagnosticLogger.Log($"[Form1] RefreshPorts: Discarded outdated result (req={currentRequestId}, latest={Interlocked.Read(ref _refreshPortsRequestId)})");
+                                return;
+                            }
                             ApplyPortsToUi(availablePorts, checkedPorts, outProcResult);
                         }));
                     }
@@ -286,25 +299,29 @@ namespace MidiToKeyApp
             }
 
             // ステータス表示の更新（接続不一致はステータス欄で案内）
-            if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
+            // 変換中（inputTracker.IsListening == true）はステータスを「停止中」へ書き換えない
+            if (!inputTracker.IsListening)
             {
-                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス未反映: 再起動してください)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-            }
-            else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
-            {
-                lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断: 再起動してください)";
-                lblStatus.ForeColor = Color.DarkOrange;
-            }
-            else if (validPorts.Count == 0)
-            {
-                lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-            }
-            else if (!inputTracker.IsListening)
-            {
-                lblStatus.Text = "ステータス: 停止中";
-                lblStatus.ForeColor = Color.Red;
+                if (availablePorts.Count == 0 && outProcResult.Success && outProcResult.Ports.Count > 0)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (MIDIデバイス未反映: 再起動してください)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                }
+                else if (availablePorts.Count > 0 && outProcResult.Success && outProcResult.Ports.Count == 0)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (MIDIデバイス切断: 再起動してください)";
+                    lblStatus.ForeColor = Color.DarkOrange;
+                }
+                else if (validPorts.Count == 0)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                }
+                else
+                {
+                    lblStatus.Text = "ステータス: 停止中";
+                    lblStatus.ForeColor = Color.Red;
+                }
             }
         }
 
@@ -950,13 +967,37 @@ namespace MidiToKeyApp
                     return;
                 }
 
-                // 変換開始直前にも選択ポートが現在有効か検証（要件4）
+                // 変換開始直前にも選択ポートが現在有効か検証（要件4・課題1）
+                // 選択ポートごとに親プロセス（DryWetMIDI）および新規プロセスWinMMの両方の一覧と照合する
                 var enumResult = MidiListener.GetPortNames();
                 var outProc = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
-                bool isRemovedInOutOfProcess = outProc.Success && outProc.Ports.Count == 0;
-                bool isMissingInBackend = !enumResult.Success || !ports.All(p => enumResult.Ports.Contains(p, StringComparer.OrdinalIgnoreCase));
 
-                if (isRemovedInOutOfProcess || isMissingInBackend)
+                bool isAnyPortInvalid = false;
+                if (!enumResult.Success)
+                {
+                    isAnyPortInvalid = true;
+                }
+                else
+                {
+                    foreach (var port in ports)
+                    {
+                        // 1. 親プロセスのMIDIバックエンドに含まれているか
+                        bool inBackend = enumResult.Ports.Contains(port, StringComparer.OrdinalIgnoreCase);
+
+                        // 2. 新規プロセスWinMMに含まれているか（新規プロセス照合が成功している場合）
+                        //    新規プロセスWinMMの一覧に対象ポートが存在しない場合は無効と判定
+                        bool inOutOfProcess = !outProc.Success || outProc.Ports.Contains(port, StringComparer.OrdinalIgnoreCase);
+
+                        if (!inBackend || !inOutOfProcess)
+                        {
+                            DiagnosticLogger.Log($"[Form1] StartConversion: Port verification failed for '{port}'. inBackend={inBackend}, inOutOfProcess={inOutOfProcess}");
+                            isAnyPortInvalid = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isAnyPortInvalid)
                 {
                     lblStatus.Text = "ステータス: 停止中 (MIDIポート開始不可)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;

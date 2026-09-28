@@ -23,6 +23,7 @@ namespace MidiToKeyApp
             }
 
             // 2. 普段はdebug_device.logを出力しない。
+            //    通常起動時はディスク上の既存ログファイルを削除してクリーンにする（子プロセスでは削除しない）。
             //    引数で --debug, --log, -d が指定された場合のみログ出力を有効化して上書き初期化する。
             bool enableDebugLog = args != null && args.Length > 0 && Array.Exists(args, a =>
                 string.Equals(a, "--debug", StringComparison.OrdinalIgnoreCase) ||
@@ -30,7 +31,7 @@ namespace MidiToKeyApp
                 string.Equals(a, "-d", StringComparison.OrdinalIgnoreCase)
             );
 
-            DiagnosticLogger.Initialize(overwrite: true, enable: enableDebugLog);
+            DiagnosticLogger.Initialize(overwrite: true, enable: enableDebugLog, deleteIfExistsWhenDisabled: true);
             if (enableDebugLog)
             {
                 DiagnosticLogger.Log("AppStart", "midi2key デバッグログセッションを開始しました。");
