@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Gma.System.MouseKeyHook; 
 
@@ -39,6 +41,8 @@ namespace MidiToKeyApp
         private System.Windows.Forms.Timer? deviceDebounceTimer;
         private WinRtMidiWatcher? _winRtWatcher;
         private volatile bool _isTransitioning = false;
+        private volatile bool _isClosing;
+        private CancellationTokenSource? _startCancellation;
 
         // ポート一覧の非同期更新競合防止用
         private long _refreshPortsRequestId = 0;
@@ -153,6 +157,7 @@ namespace MidiToKeyApp
                 rbJIS.Checked = true;
 
             RefreshMappingList();
+            inputTracker.PublishResolvedMapping(settings);
             UpdateHotkeyUi();
         }
 
@@ -222,10 +227,8 @@ namespace MidiToKeyApp
         /// <summary>
         /// デバイスの接続変更（新規接続や状態取得失敗）を検知し、必要に応じて集約警告ダイアログを表示します。
         /// </summary>
-        private void CheckConnectionChangeAndNotify(OutOfProcessWinMmResult outProcResult)
+        private void CheckConnectionChangeAndNotify(OutOfProcessWinMmResult outProcResult, PortEnumerationResult currentPorts)
         {
-            var currentPorts = MidiListener.GetPortNames();
-
             // 1. 親プロセス側または新規プロセス側のいずれかで状態取得・列挙に失敗している場合
             if (!currentPorts.Success || !outProcResult.Success)
             {
@@ -248,41 +251,36 @@ namespace MidiToKeyApp
 
         private void RefreshPorts(bool isInitialLoad = false)
         {
-            if (chkPorts == null) return;
+            if (chkPorts == null || _isClosing) return;
             long currentRequestId = Interlocked.Increment(ref _refreshPortsRequestId);
             var checkedPorts = isInitialLoad ? settings.SelectedPorts : GetSelectedPorts();
-            var enumResult = MidiListener.GetPortNames();
-
-            if (!enumResult.Success)
-            {
-                DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
-                chkPorts.Items.Clear();
-                if (inputTracker == null || !inputTracker.IsListening)
-                {
-                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
-                    lblStatus.ForeColor = Color.DarkGoldenrod;
-                }
-                return;
-            }
-
-            var availablePorts = enumResult.Ports;
-            
-            // 新規プロセスWinMMの結果を非同期で確認し、真に利用可能なポートのみをUIに反映
-            _ = System.Threading.Tasks.Task.Run(() => {
-                var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
-                if (IsHandleCreated && !IsDisposed)
+            // Both WinMM subprocess and DryWetMIDI enumeration can block for seconds.
+            _ = Task.Run(() => {
+                var (enumResult, outProcResult) = MidiPortProbeService.Probe(1000);
+                if (IsHandleCreated && !IsDisposed && !_isClosing)
                 {
                     try
                     {
                         BeginInvoke(new Action(() => {
-                            if (IsDisposed) return;
+                            if (IsDisposed || _isClosing) return;
                             // 要求IDが最新でない古い非同期結果は破棄して競合を防止
                             if (Interlocked.Read(ref _refreshPortsRequestId) != currentRequestId)
                             {
                                 DiagnosticLogger.Log($"[Form1] RefreshPorts: Discarded outdated result (req={currentRequestId}, latest={Interlocked.Read(ref _refreshPortsRequestId)})");
                                 return;
                             }
-                            ApplyPortsToUi(availablePorts, checkedPorts, outProcResult);
+                            if (!enumResult.Success)
+                            {
+                                DiagnosticLogger.Log($"[Form1] RefreshPorts failed to enumerate: {enumResult.ErrorMessage}");
+                                chkPorts.Items.Clear();
+                                if (!inputTracker.IsListening)
+                                {
+                                    lblStatus.Text = "ステータス: 停止中 (利用可能なMIDIポートがありません)";
+                                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                                }
+                                return;
+                            }
+                            ApplyPortsToUi(enumResult.Ports, checkedPorts, outProcResult);
                         }));
                     }
                     catch { }
@@ -360,38 +358,41 @@ namespace MidiToKeyApp
         private void RefreshMappingList()
         {
             if (listMapping == null) return;
-            listMapping.Items.Clear();
-
+            KeyValuePair<string, string>[] mappingSnapshot;
             lock (settings.MappingLock)
             {
-                var sortedKeys = settings.Mapping.Keys.OrderBy(k => {
-                    if (k.Equals("pedal", StringComparison.OrdinalIgnoreCase)) return -1;
-                    return int.TryParse(k, out int n) ? n : 999;
-                });
+                mappingSnapshot = settings.Mapping.ToArray();
+            }
 
-                foreach (var key in sortedKeys)
+            listMapping.Items.Clear();
+            var sortedEntries = mappingSnapshot.OrderBy(entry => {
+                if (entry.Key.Equals("pedal", StringComparison.OrdinalIgnoreCase)) return -1;
+                return int.TryParse(entry.Key, out int n) ? n : 999;
+            });
+
+            foreach (var entry in sortedEntries)
+            {
+                string key = entry.Key;
+                string targetKey = entry.Value;
+                string typeOrNoteName;
+
+                if (key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
                 {
-                    string targetKey = settings.Mapping[key];
-                    string typeOrNoteName;
-
-                    if (key.Equals("pedal", StringComparison.OrdinalIgnoreCase))
-                    {
-                        typeOrNoteName = "サステインペダル";
-                    }
-                    else if (int.TryParse(key, out int note))
-                    {
-                        typeOrNoteName = MidiNoteHelper.GetNoteDisplayName(note);
-                    }
-                    else
-                    {
-                        typeOrNoteName = "-";
-                    }
-
-                    var item = new ListViewItem(key);
-                    item.SubItems.Add(typeOrNoteName);
-                    item.SubItems.Add(targetKey);
-                    listMapping.Items.Add(item);
+                    typeOrNoteName = "サステインペダル";
                 }
+                else if (int.TryParse(key, out int note))
+                {
+                    typeOrNoteName = MidiNoteHelper.GetNoteDisplayName(note);
+                }
+                else
+                {
+                    typeOrNoteName = "-";
+                }
+
+                var item = new ListViewItem(key);
+                item.SubItems.Add(typeOrNoteName);
+                item.SubItems.Add(targetKey);
+                listMapping.Items.Add(item);
             }
         }
 
@@ -423,10 +424,10 @@ namespace MidiToKeyApp
             rbJIS = new RadioButton { Text = "JIS", Top = 25, Left = 20, Width = 65 };
             rbUS = new RadioButton { Text = "US", Top = 55, Left = 20, Width = 65 };
             rbUS.CheckedChanged += (s, e) => {
-                if (settings != null && rbUS.Checked) settings.KeyboardLayout = "US";
+                if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); }
             };
             rbJIS.CheckedChanged += (s, e) => {
-                if (settings != null && rbJIS.Checked) settings.KeyboardLayout = "JIS";
+                if (settings != null && rbJIS.Checked) { settings.KeyboardLayout = "JIS"; inputTracker.PublishResolvedMapping(settings); }
             };
             grpLayout.Controls.Add(rbJIS);
             grpLayout.Controls.Add(rbUS);
@@ -613,6 +614,7 @@ namespace MidiToKeyApp
                     {
                         settings.Mapping["pedal"] = keyInput;
                     }
+                    inputTracker.PublishResolvedMapping(settings);
                     RefreshMappingList();
                     return;
                 }
@@ -629,6 +631,7 @@ namespace MidiToKeyApp
                     {
                         settings.Mapping[note.ToString()] = keyInput;
                     }
+                    inputTracker.PublishResolvedMapping(settings);
                     RefreshMappingList();
                 }
                 else
@@ -646,6 +649,7 @@ namespace MidiToKeyApp
                     {
                         settings.Mapping.Remove(keyToRemove);
                     }
+                    inputTracker.PublishResolvedMapping(settings);
                     RefreshMappingList();
                 }
             };
@@ -758,6 +762,7 @@ namespace MidiToKeyApp
                             RefreshPorts(true);
                             if (settings.KeyboardLayout == "US") rbUS.Checked = true; else rbJIS.Checked = true;
                             RefreshMappingList();
+                            inputTracker.PublishResolvedMapping(settings);
                             UpdateHotkeyRegistration();
                             MessageBox.Show("読込み完了しました: " + Path.GetFileName(currentSettingsPath), "読込完了");
                         }
@@ -810,14 +815,14 @@ namespace MidiToKeyApp
                 _ = System.Threading.Tasks.Task.Run(async () => {
                     try
                     {
-                        var outProcResult = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1500);
+                        var (parentPorts, outProcResult) = MidiPortProbeService.Probe(1500);
                         
-                        if (IsHandleCreated && !IsDisposed)
+                        if (IsHandleCreated && !IsDisposed && !_isClosing)
                         {
                             try
                             {
                                 BeginInvoke(new Action(() => {
-                                    if (IsDisposed) return;
+                                    if (IsDisposed || _isClosing) return;
 
                                     // 要件5: 同一セッション内での古い列挙結果の後着上書き防止
                                     if (requestId < _latestCompletedHealthCheckRequestId)
@@ -839,7 +844,10 @@ namespace MidiToKeyApp
                                         }
 
                                         var beforeActive = midiListener.GetActivePorts();
-                                        midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
+                                        if (parentPorts.Success && midiListener is MidiListener concreteListener)
+                                            concreteListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen, parentPorts.Ports);
+                                        else if (parentPorts.Success)
+                                            midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
                                         var afterActive = midiListener.GetActivePorts();
                                         RefreshPorts(false);
 
@@ -847,7 +855,7 @@ namespace MidiToKeyApp
                                         // 切断が発生しなかった場合の接続変更判定:
                                         if (beforeActive.Count == afterActive.Count)
                                         {
-                                            CheckConnectionChangeAndNotify(outProcResult);
+                                            CheckConnectionChangeAndNotify(outProcResult, parentPorts);
                                         }
                                     }
                                     else
@@ -855,7 +863,7 @@ namespace MidiToKeyApp
                                         // ① 変換停止中:
                                         // リスナー監視はないためCheckDeviceHealthは不要だが、ポート一覧更新と接続変更（再起動案内）を実行する
                                         RefreshPorts(false);
-                                        CheckConnectionChangeAndNotify(outProcResult);
+                                        CheckConnectionChangeAndNotify(outProcResult, parentPorts);
                                     }
                                 }));
                             }
@@ -1001,14 +1009,18 @@ namespace MidiToKeyApp
         /// <summary>
         /// 変換処理を開始します。ポート開始結果（全成功・一部成功・全失敗）に応じた適切な処理とロールバックを行います。
         /// </summary>
-        private void StartConversion()
+        private async void StartConversion()
         {
-            if (_isTransitioning || inputTracker.IsListening) return;
+            if (_isClosing || _isTransitioning || inputTracker.IsListening) return;
             _isTransitioning = true;
+            using var startCancellation = new CancellationTokenSource();
+            _startCancellation = startCancellation;
+            bool sessionStarted = false;
 
             try
             {
                 var ports = GetSelectedPorts();
+                var settingsAtStart = settings;
                 if (ports.Count == 0)
                 {
                     MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
@@ -1017,8 +1029,19 @@ namespace MidiToKeyApp
 
                 // 変換開始直前にも選択ポートが現在有効か検証（要件4・課題1）
                 // 選択ポートごとに親プロセス（DryWetMIDI）および新規プロセスWinMMの両方の一覧と照合する
-                var enumResult = MidiListener.GetPortNames();
-                var outProc = MidiDeviceDiagnostics.GetOutOfProcessWinMmResult(1000);
+                lblStatus.Text = "ステータス: MIDIポート確認中";
+                var (enumResult, outProc) = await Task.Run(() =>
+                    MidiPortProbeService.Probe(1000),
+                    startCancellation.Token);
+                if (_isClosing || IsDisposed) return;
+                if (startCancellation.IsCancellationRequested ||
+                    !ReferenceEquals(settings, settingsAtStart) ||
+                    !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
+                {
+                    lblStatus.Text = "ステータス: 停止中";
+                    lblStatus.ForeColor = Color.Red;
+                    return;
+                }
 
                 bool isAnyPortInvalid = false;
                 if (!enumResult.Success)
@@ -1059,6 +1082,41 @@ namespace MidiToKeyApp
 
                 UpdateSettingsFromUI();
 
+                if (InputWarmup.Enabled)
+                {
+                    var warmupSnapshot = inputTracker.GetResolvedMappingSnapshot()
+                        ?? throw new InvalidOperationException("入力マッピングを取得できませんでした。");
+                    lblStatus.Text = "ステータス: 入力処理を準備中";
+                    LatencyMeasurement.RecordInputWarmupAttempt();
+                    try
+                    {
+                        await Task.Run(() => InputWarmup.Run(warmupSnapshot, startCancellation.Token),
+                            startCancellation.Token);
+                        LatencyMeasurement.RecordInputWarmupCompleted();
+                    }
+                    catch (OperationCanceledException) when (startCancellation.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception warmupError)
+                    {
+                        // Warmup is an optimization. Its isolated state cannot affect a real session.
+                        LatencyMeasurement.RecordInputWarmupFailure();
+                        DiagnosticLogger.Log("InputWarmup", $"入力処理の事前準備に失敗: {warmupError}");
+                    }
+
+                    if (_isClosing || IsDisposed) return;
+                    if (startCancellation.IsCancellationRequested ||
+                        !ReferenceEquals(settings, settingsAtStart) ||
+                        !ReferenceEquals(inputTracker.GetResolvedMappingSnapshot(), warmupSnapshot) ||
+                        !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
+                    {
+                        lblStatus.Text = "ステータス: 停止中";
+                        lblStatus.ForeColor = Color.Red;
+                        return;
+                    }
+                }
+
                 // 未解放キーの再試行・復旧確認
                 if (!keySimulator.TryPrepareStartConversion())
                 {
@@ -1071,6 +1129,7 @@ namespace MidiToKeyApp
                 }
 
                 long sessionId = inputTracker.StartConversionSession();
+                sessionStarted = true;
                 DiagnosticLogger.Log($"[Form1] StartConversion invoked. Generated Gen={sessionId}, Ports=[{string.Join(", ", ports)}]");
                 var snapshot = InitialPortSnapshot.FromOutOfProcessResult(sessionId, outProc);
                 var startResult = midiListener.Start(ports, sessionId, snapshot);
@@ -1115,8 +1174,34 @@ namespace MidiToKeyApp
                     lblStatus.ForeColor = Color.Green;
                 }
             }
+            catch (OperationCanceledException) when (startCancellation.IsCancellationRequested)
+            {
+                if (!_isClosing && !IsDisposed)
+                {
+                    lblStatus.Text = "ステータス: 停止中";
+                    lblStatus.ForeColor = Color.Red;
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Log("StartConversion", $"開始処理失敗: {ex}");
+                if (sessionStarted)
+                {
+                    try { inputTracker.StopSession(); }
+                    catch (Exception cleanupEx) { DiagnosticLogger.Log("StartConversion", $"入力状態の復旧失敗: {cleanupEx}"); }
+                    try { midiListener.Stop(); }
+                    catch (Exception cleanupEx) { DiagnosticLogger.Log("StartConversion", $"ポート停止失敗: {cleanupEx}"); }
+                }
+                if (!_isClosing && !IsDisposed)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (開始失敗)";
+                    lblStatus.ForeColor = Color.Red;
+                    MessageBox.Show($"変換を開始できませんでした: {ex.Message}", "開始エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
             finally
             {
+                if (ReferenceEquals(_startCancellation, startCancellation)) _startCancellation = null;
                 _isTransitioning = false;
             }
         }
@@ -1126,9 +1211,13 @@ namespace MidiToKeyApp
         /// デッドロック防止のため、ロック外でMIDIリスナーを停止した上で全キーを解放します。
         /// 未解放キーが残っている場合はUIに警告表示を行います。
         /// </summary>
-        private void StopConversion()
+        private void StopConversion(bool force = false)
         {
-            if (_isTransitioning) return;
+            if (_isTransitioning && !force)
+            {
+                _startCancellation?.Cancel();
+                return;
+            }
             _isTransitioning = true;
 
             try
@@ -1382,15 +1471,20 @@ namespace MidiToKeyApp
         {
             settings.SelectedPorts = GetSelectedPorts();
             settings.KeyboardLayout = rbUS.Checked ? "US" : "JIS";
+            inputTracker.PublishResolvedMapping(settings);
         }
         
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            _isClosing = true;
+            _startCancellation?.Cancel();
+            Interlocked.Increment(ref _refreshPortsRequestId);
+            Interlocked.Increment(ref _healthCheckRequestId);
             hotkeyManager.Unregister();
             _winRtWatcher?.Dispose();
             deviceDebounceTimer?.Stop();
             deviceDebounceTimer?.Dispose();
-            StopConversion();
+            StopConversion(force: true);
             keySimulator.RetryReleasePendingKeys();
             midiListener?.Dispose();
             if (globalHook != null)

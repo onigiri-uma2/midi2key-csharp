@@ -47,6 +47,43 @@ namespace MidiToKeyApp
         public HotkeySettings Hotkey { get; set; } = new HotkeySettings();
     }
 
+    /// <summary>入力処理用の解決済みマッピング。生成後は変更しません。</summary>
+    public sealed class ResolvedMappingSnapshot
+    {
+        private readonly ResolvedKey[] _notes;
+        public ResolvedKey Pedal { get; }
+
+        private ResolvedMappingSnapshot(ResolvedKey[] notes, ResolvedKey pedal)
+        {
+            _notes = notes;
+            Pedal = pedal;
+        }
+
+        public ResolvedKey GetNote(int number) =>
+            (uint)number < (uint)_notes.Length ? _notes[number] : ResolvedKey.None;
+
+        public static ResolvedMappingSnapshot Create(AppSettings settings)
+        {
+            if (settings == null) throw new ArgumentNullException(nameof(settings));
+            var notes = new ResolvedKey[128];
+            Array.Fill(notes, ResolvedKey.None);
+            ResolvedKey pedal = ResolvedKey.None;
+            lock (settings.MappingLock)
+            {
+                var mapping = settings.Mapping;
+                var layout = settings.KeyboardLayout;
+                for (int i = 0; i < notes.Length; i++)
+                {
+                    if (mapping.TryGetValue(i.ToString(), out var target))
+                        notes[i] = KeyResolver.Resolve(target, layout);
+                }
+                if (mapping.TryGetValue("pedal", out var pedalTarget))
+                    pedal = KeyResolver.Resolve(pedalTarget, layout);
+            }
+            return new ResolvedMappingSnapshot(notes, pedal);
+        }
+    }
+
     /// <summary>
     /// 設定ファイル（settings.json）の読み込み、検証、および原子的保存を管理する静的ユーティリティクラス。
     /// </summary>

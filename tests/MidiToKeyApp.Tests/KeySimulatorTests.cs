@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -637,7 +639,7 @@ namespace MidiToKeyApp.Tests
             // KeyUpの送信を失敗させる
             _mock.FailKeys.Add(VirtualKeyCode.VK_X);
             bool success = _simulator.ReleaseResolvedKey(resolved);
-            Assert.IsTrue(success);
+            Assert.IsFalse(success, "A failed hardware KeyUp must be reported to the caller.");
 
             // 論理参照は0だが、未解放キーとして追跡されていること
             Assert.AreEqual(0, _simulator.GetRefCount(VirtualKeyCode.VK_X));
@@ -3507,6 +3509,227 @@ namespace MidiToKeyApp.Tests
 
             Assert.AreEqual(0, _mock.KeyDownCount, "切断済みデバイスからのNoteOnは拒否されKeyDownされないこと");
             Assert.AreEqual(0, tracker.ActiveNotesCount);
+        }
+
+        [TestMethod]
+        public void NoteMappingCache_UsesUpdatedValueForNextNoteOn()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session));
+            lock (settings.MappingLock) settings.Mapping["60"] = "b";
+            _mock.Clear();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.VK_B, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+        }
+
+        [TestMethod]
+        public void PedalMappingCache_UsesUpdatedValueAfterPedalCycle()
+        {
+            var settings = new AppSettings { Mapping = new() { { "pedal", "space" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartSession();
+
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 0, session));
+            lock (settings.MappingLock) settings.Mapping["pedal"] = "tab";
+            _mock.Clear();
+
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.TAB, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+        }
+
+        [TestMethod]
+        public void KeyboardLayoutCache_UsesUpdatedLayoutForNextNoteOn()
+        {
+            var settings = new AppSettings
+            {
+                KeyboardLayout = "JIS",
+                Mapping = new() { { "60", ";" } }
+            };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.AreEqual(VirtualKeyCode.OEM_PLUS, _mock.History[0].Key);
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session));
+            settings.KeyboardLayout = "US";
+            _mock.Clear();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.OEM_1, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+        }
+
+        [TestMethod]
+        public void InputCapturedCallback_RunsOutsideTrackerStateLock()
+        {
+            var settings = new AppSettings();
+            var tracker = new InputTracker(_simulator, () => settings);
+            long session = tracker.StartCaptureSession();
+            bool queryCompleted = false;
+            tracker.OnInputCaptured += _ =>
+            {
+                var query = Task.Run(() => tracker.IsNoteActive(new MidiSourceKey("dev1", 0, 60, false)));
+                queryCompleted = query.Wait(TimeSpan.FromSeconds(2));
+            };
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+
+            Assert.IsTrue(queryCompleted, "A callback must not hold the lock needed by another tracker query.");
+            Assert.AreEqual(0, _mock.History.Count);
+        }
+
+        [TestMethod]
+        public void PublishedMappingSnapshot_IsStableUntilRepublishedAndReleasesHeldKey()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            tracker.PublishResolvedMapping(settings);
+            long session = tracker.StartSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            lock (settings.MappingLock) settings.Mapping["60"] = "b";
+            _mock.Clear();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 0, false, session));
+            Assert.AreEqual(VirtualKeyCode.VK_A, _mock.History.Single().Key);
+            Assert.IsFalse(_mock.History.Single().IsDown);
+
+            tracker.PublishResolvedMapping(settings);
+            _mock.Clear();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            Assert.AreEqual(VirtualKeyCode.VK_B, _mock.History.Single().Key);
+            Assert.IsTrue(_mock.History.Single().IsDown);
+        }
+
+        [TestMethod]
+        public void PublishedMappingLookup_DoesNotWaitForMutableMappingLock()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            tracker.PublishResolvedMapping(settings);
+            long session = tracker.StartSession();
+            Task processing;
+
+            lock (settings.MappingLock)
+            {
+                processing = Task.Run(() => tracker.ProcessNoteEvent(
+                    new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session)));
+                Assert.IsTrue(processing.Wait(TimeSpan.FromSeconds(2)),
+                    "Published snapshot lookup should not acquire MappingLock on the input path.");
+            }
+
+            Assert.AreEqual(VirtualKeyCode.VK_A, _mock.History.Single().Key);
+        }
+
+        [TestMethod]
+        public void PublishedMappingSnapshot_MissingInvalidAndOutOfRangeEntriesSendNoKeys()
+        {
+            var settings = new AppSettings { Mapping = new() { { "61", "not-a-key" }, { "128", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            tracker.PublishResolvedMapping(settings);
+            long session = tracker.StartSession();
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, session));
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 61, 100, true, session));
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 128, 100, true, session));
+            tracker.ProcessControlEvent(new MidiControlData("dev1", "Piano", 0, 64, 127, session));
+
+            Assert.AreEqual(0, _mock.History.Count, "An absent/invalid mapping must not inject VK=0 or another key.");
+        }
+
+        [TestMethod]
+        public void LateNoteFromStoppedSession_IsIgnoredAfterRestart()
+        {
+            var settings = new AppSettings { Mapping = new() { { "60", "a" } } };
+            var tracker = new InputTracker(_simulator, () => settings);
+            long stoppedSession = tracker.StartSession();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, stoppedSession));
+            Assert.AreEqual(1, _mock.KeyDownCount);
+
+            tracker.StopSession();
+            long restartedSession = tracker.StartSession();
+            Assert.AreNotEqual(stoppedSession, restartedSession);
+            _mock.Clear();
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, stoppedSession));
+            Assert.AreEqual(0, _mock.History.Count, "A queued callback from the stopped generation must be dropped.");
+
+            tracker.ProcessNoteEvent(new MidiNoteData("dev1", "Piano", 0, 60, 100, true, restartedSession));
+            Assert.AreEqual(1, _mock.History.Count);
+            Assert.AreEqual(VirtualKeyCode.VK_A, _mock.History[0].Key);
+            Assert.IsTrue(_mock.History[0].IsDown);
+        }
+
+        [TestMethod]
+        public void LatencyMeasurement_IsDisabledBoundedAndKeepsOverlappingTraceIds()
+        {
+            ResetLatencyMeasurement();
+            string tempDir = Path.Combine(Path.GetTempPath(), $"midi2key-latency-{Guid.NewGuid():N}");
+            string path = Path.Combine(tempDir, "trace.json");
+            try
+            {
+                Assert.AreEqual(0L, LatencyMeasurement.RecordMidiCallback());
+                LatencyMeasurement.Enable(path);
+                Assert.IsTrue(LatencyMeasurement.Enabled);
+
+                var first = Task.Run(() =>
+                {
+                    using var scope = LatencyMeasurement.BeginInput(101);
+                    LatencyMeasurement.RecordTrackerEntry(101);
+                    LatencyMeasurement.RecordSendInputBefore();
+                    LatencyMeasurement.RecordSendInputAfter(true);
+                });
+                var second = Task.Run(() =>
+                {
+                    using var scope = LatencyMeasurement.BeginInput(202);
+                    LatencyMeasurement.RecordTrackerEntry(202);
+                    LatencyMeasurement.RecordSendInputBefore();
+                    LatencyMeasurement.RecordSendInputAfter(false);
+                });
+                Task.WaitAll(first, second);
+
+                // Overflow the fixed buffer; recording stays in memory and reports the dropped tail.
+                for (int i = 0; i < 100_020; i++) LatencyMeasurement.RecordTrackerEntry(303);
+
+                var export = LatencyMeasurement.ExportAfterStop();
+                Assert.IsTrue(export.Success, export.PathOrError);
+                Assert.IsFalse(LatencyMeasurement.Enabled);
+                Assert.AreEqual(0L, LatencyMeasurement.RecordMidiCallback(), "Stopped recording must be inert.");
+                using var json = JsonDocument.Parse(File.ReadAllText(path));
+                var root = json.RootElement;
+                Assert.AreEqual(100_000, root.GetProperty("capacity").GetInt32());
+                Assert.IsTrue(root.GetProperty("droppedPoints").GetInt64() > 0);
+                Assert.AreEqual(100_000, root.GetProperty("points").GetArrayLength());
+                var tracePoints = root.GetProperty("points").EnumerateArray().ToArray();
+                Assert.IsTrue(tracePoints.Any(p => p.GetProperty("TraceId").GetInt64() == 101 && p.GetProperty("Stage").GetString() == "sendinput_before"));
+                Assert.IsTrue(tracePoints.Any(p => p.GetProperty("TraceId").GetInt64() == 202 && p.GetProperty("Stage").GetString() == "sendinput_return"));
+                var sendIds = tracePoints.Where(p => p.GetProperty("Stage").GetString() == "sendinput_before")
+                    .Select(p => p.GetProperty("SendId").GetInt64()).ToArray();
+                Assert.AreEqual(2, sendIds.Distinct().Count(), "Concurrent inputs must retain separate native-send identities.");
+            }
+            finally
+            {
+                ResetLatencyMeasurement();
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
+        }
+
+        private static void ResetLatencyMeasurement()
+        {
+            typeof(LatencyMeasurement).GetMethod("ResetForTesting", BindingFlags.Static | BindingFlags.NonPublic)!
+                .Invoke(null, null);
         }
     }
 }

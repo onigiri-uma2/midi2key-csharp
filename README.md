@@ -66,6 +66,18 @@
    * **`[別名保存]`**: ゲーム別・用途別の設定ファイルとして好きな名前・フォルダに保存します（保存成功後に自動で現在の読込ファイルとして適用されます）。
    * **`[設定読込]`**: 別途保存したJSON設定ファイルを読み込みます（演奏中に読み込んだ場合も、安全に全キーが解放・停止された上で新設定が適用されます）。
 
+### 実MIDI入力からキー送信までの遅延計測
+
+変換開始時には、選択中のマッピングを使い、独立した入力状態と送信しないキーボード出力でノート・ペダル・Shift付き記号の処理を数回準備します。実際のキー入力は発生しません。`--no-input-warmup` を付けると無効にでき、初回入力の比較測定に使えます。比較時はアプリを毎回起動し直し、同じ設定・ポート・計測手順で `--measure-latency` と `--measure-latency --no-input-warmup` をそれぞれ測ってください。この準備が対象にするのは `InputTracker` と `KeySimulator` の管理コードです。MIDIドライバ、`MidiListener`、Windows の `SendInput` 呼び出し自体は準備しません。
+
+計測JSONの `inputWarmup` には有効設定、試行・完了・失敗回数と対象範囲を記録します。ウォームアップ中の疑似イベントには `traceId` を割り当てないため、`points` には入りません。
+
+計測したい場合だけ `--measure-latency` を付けて起動します。たとえば配布版なら PowerShell で `./midi2key.exe --measure-latency`、開発版なら `dotnet run --project MidiToKeyApp.csproj -- --measure-latency` です。MIDI機器と送信先を準備し、ポートを選んで変換を開始してから演奏し、アプリを終了すると `%LOCALAPPDATA%\midi2key\latency-日時-識別子.json` に結果を保存します。任意の保存先は `--measure-latency=C:\path\latency.json` で指定できます。既存ファイルは上書きせず、保存に失敗した場合は終了時に画面で知らせます。
+
+JSON の `points` は単調時計 `Stopwatch` の tick 値です。`stopwatchFrequency` で割ると秒数になります。同じ `traceId` について `midi_callback`（DryWetMIDI の callback 入口）、`tracker_entry`（入力状態処理の入口）、`sendinput_before` と `sendinput_return`（Windows API の実呼び出し直前と戻り）を追えます。複数のキー送信は `sendId` で区別され、Shift を伴う送信も個別に現れます。`midi_identity` の `deviceId` と `generation` で接続元を区別します。抑止された入力は `suppressed` の理由を参照してください。送信がない trace は `SendInput` が観測されなかったことだけを意味します。`sendinput_return` の `success` が false なら API が失敗しています。
+
+記録は最大 100,000 point をメモリに保持し、入力中に計測ファイルを書きません。上限後に失われた point 数は `droppedPoints` に記録します。計測用のロックや処理時間は callback から送信までの区間に含まれるため、これは計測有効時の値です。`sendinput_before` から `sendinput_return` の区間には計測 buffer のロック待ちは含まれません。実機測定結果とテスト用の模擬入力・ベンチマーク結果は別物です。この機能を追加した時点では実機の遅延値は未測定です。
+
 ---
 
 ## 🛡 安定性と安全性についての仕様

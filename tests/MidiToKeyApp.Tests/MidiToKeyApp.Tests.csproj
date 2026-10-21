@@ -31,6 +31,8 @@
     <Compile Include="..\..\DiagnosticLogger.cs" Link="DiagnosticLogger.cs" />
     <Compile Include="..\..\MidiDeviceDiagnostics.cs" Link="MidiDeviceDiagnostics.cs" />
     <Compile Include="..\..\WinRtMidiWatcher.cs" Link="WinRtMidiWatcher.cs" />
+    <Compile Include="..\..\LatencyMeasurement.cs" Link="LatencyMeasurement.cs" Condition="Exists('..\..\LatencyMeasurement.cs')" />
+    <Compile Include="..\..\InputWarmup.cs" Link="InputWarmup.cs" Condition="Exists('..\..\InputWarmup.cs')" />
   </ItemGroup>
 
 </Project>

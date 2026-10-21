@@ -5,3 +5,5 @@ obj/
 .dotnet/
 *.log
 
+# Local measurement results may contain machine-specific paths.
+tests/**/results/

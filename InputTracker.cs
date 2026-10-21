@@ -16,9 +16,27 @@ namespace MidiToKeyApp
     /// </summary>
     public class InputTracker
     {
+        private static readonly string[] NoteNumbers = CreateNoteNumbers();
+
+        private static string[] CreateNoteNumbers()
+        {
+            var numbers = new string[128];
+            for (int i = 0; i < numbers.Length; i++) numbers[i] = i.ToString();
+            return numbers;
+        }
+
+        private struct CachedResolution
+        {
+            public string? Mapping;
+            public string? Layout;
+            public ResolvedKey Key;
+        }
+
         private readonly KeySimulator _keySimulator;
         private readonly Func<AppSettings> _settingsProvider;
         private readonly object _stateLock = new();
+        private readonly object _transitionLock = new();
+        private ResolvedMappingSnapshot? _resolvedMapping;
 
         // セッションID（Generation）: 停止・再起動時にインクリメントされ、旧セッションの遅延イベントを破棄します
         private long _currentSessionId = 0;
@@ -32,8 +50,26 @@ namespace MidiToKeyApp
         // NoteOn時点で解決されたキー情報のスナップショット（入力元 -> 解決キー）
         private readonly Dictionary<MidiSourceKey, ResolvedKey> _activeNotes = new();
 
-        // ペダルの現在状態（"DeviceId:Channel" -> isPressed）
-        private readonly Dictionary<string, bool> _pedalStates = new();
+        // ペダルの現在状態（DeviceId, Channel -> isPressed）
+        private readonly Dictionary<(string DeviceId, int Channel), bool> _pedalStates = new();
+
+        // マッピング辞書は編集可能なので、値と配列を毎回照合してから解決済みキーを使う
+        private readonly CachedResolution[] _noteResolutions = new CachedResolution[128];
+        private CachedResolution _pedalResolution;
+
+        private static string NoteNumberText(int number) =>
+            (uint)number < (uint)NoteNumbers.Length ? NoteNumbers[number] : number.ToString();
+
+        private static ResolvedKey ResolveCached(string mapping, string layout, ref CachedResolution cache)
+        {
+            if (cache.Mapping != mapping || cache.Layout != layout)
+            {
+                cache.Mapping = mapping;
+                cache.Layout = layout;
+                cache.Key = KeyResolver.Resolve(mapping, layout);
+            }
+            return cache.Key;
+        }
 
         // キャプチャモード中に取得され、対応するNoteOffを受信するまでキー解放を抑止する入力元のセット
         private readonly HashSet<MidiSourceKey> _suppressedSources = new();
@@ -57,15 +93,67 @@ namespace MidiToKeyApp
         public bool IsCapturing => _isCapturing;
 
         /// <summary>
+        /// 設定変更時に呼び出し、解決済みマッピングを原子的に公開します。
+        /// 公開後の辞書の直接変更は次の公開まで反映されません。未公開の場合は従来の可変設定を参照します。
+        /// </summary>
+        public void PublishResolvedMapping(AppSettings settings) =>
+            Volatile.Write(ref _resolvedMapping, ResolvedMappingSnapshot.Create(settings));
+
+        /// <summary>現在公開済みの不変マッピングを取得します。ウォームアップ用の別インスタンスと共有できます。</summary>
+        internal ResolvedMappingSnapshot? GetResolvedMappingSnapshot() => Volatile.Read(ref _resolvedMapping);
+
+        internal void PublishResolvedMapping(ResolvedMappingSnapshot snapshot) =>
+            Volatile.Write(ref _resolvedMapping, snapshot ?? throw new ArgumentNullException(nameof(snapshot)));
+
+        private ResolvedKey ResolveNote(int number)
+        {
+            var snapshot = Volatile.Read(ref _resolvedMapping);
+            if (snapshot != null) return snapshot.GetNote(number);
+            var settings = _settingsProvider();
+            string? mapping;
+            lock (settings.MappingLock)
+                settings.Mapping.TryGetValue(NoteNumberText(number), out mapping);
+            if (mapping == null) return ResolvedKey.None;
+            return (uint)number < (uint)_noteResolutions.Length
+                ? ResolveCached(mapping, settings.KeyboardLayout, ref _noteResolutions[number])
+                : KeyResolver.Resolve(mapping, settings.KeyboardLayout);
+        }
+
+        private ResolvedKey ResolvePedal()
+        {
+            var snapshot = Volatile.Read(ref _resolvedMapping);
+            if (snapshot != null) return snapshot.Pedal;
+            var settings = _settingsProvider();
+            string? mapping;
+            lock (settings.MappingLock)
+                settings.Mapping.TryGetValue("pedal", out mapping);
+            return mapping == null ? ResolvedKey.None : ResolveCached(mapping, settings.KeyboardLayout, ref _pedalResolution);
+        }
+
+        /// <summary>
         /// 通常の変換セッションを開始します。新しいGenerationを発行し、旧イベントを無効化します。
         /// </summary>
         public long StartSession() => StartConversionSession();
 
         public long StartConversionSession()
         {
+            using var notifications = _keySimulator.DeferNotifications();
+            lock (_transitionLock)
             lock (_stateLock)
             {
                 long newSessionId = Interlocked.Increment(ref _currentSessionId);
+                // 重複開始でも旧セッションの論理参照と物理押下を残さない。
+                if ((_isListening && !_keySimulator.ReleaseAllKeys()) ||
+                    !_keySimulator.TryPrepareStartConversion())
+                {
+                    _isListening = false;
+                    _isCapturing = false;
+                    _activeNotes.Clear();
+                    _pedalStates.Clear();
+                    _suppressedSources.Clear();
+                    _disconnectedDeviceIds.Clear();
+                    throw new InvalidOperationException("前のセッションのキーを解放できなかったため開始できません。");
+                }
                 _isListening = true;
                 _isCapturing = false;
                 _activeNotes.Clear();
@@ -83,6 +171,7 @@ namespace MidiToKeyApp
         /// </summary>
         public long StartCaptureSession()
         {
+            lock (_transitionLock)
             lock (_stateLock)
             {
                 _isCapturing = true;
@@ -112,6 +201,7 @@ namespace MidiToKeyApp
         /// </summary>
         public void StopCaptureSession()
         {
+            lock (_transitionLock)
             lock (_stateLock)
             {
                 _isCapturing = false;
@@ -133,17 +223,21 @@ namespace MidiToKeyApp
         /// </summary>
         public void StopSession()
         {
-            // まずセッションIDを更新して新規・進行中のイベントを破棄
-            Interlocked.Increment(ref _currentSessionId);
-            _isListening = false;
-
-            lock (_stateLock)
+            using var notifications = _keySimulator.DeferNotifications();
+            lock (_transitionLock)
             {
-                _keySimulator.ReleaseAllKeys();
-                _activeNotes.Clear();
-                _pedalStates.Clear();
-                _suppressedSources.Clear();
-                _disconnectedDeviceIds.Clear();
+                // 状態ロックを待つ前に旧イベントを失効させる。Start/Captureとも直列化する。
+                Interlocked.Increment(ref _currentSessionId);
+                _isListening = false;
+                _isCapturing = false;
+                lock (_stateLock)
+                {
+                    _keySimulator.ReleaseAllKeys();
+                    _activeNotes.Clear();
+                    _pedalStates.Clear();
+                    _suppressedSources.Clear();
+                    _disconnectedDeviceIds.Clear();
+                }
             }
         }
 
@@ -153,7 +247,9 @@ namespace MidiToKeyApp
         /// </summary>
         public void SetCapturing(bool capturing)
         {
-            _isCapturing = capturing;
+            lock (_transitionLock)
+            lock (_stateLock)
+                _isCapturing = capturing;
         }
 
         /// <summary>
@@ -161,22 +257,33 @@ namespace MidiToKeyApp
         /// </summary>
         public void ProcessNoteEvent(MidiNoteData note)
         {
+            using var inputScope = LatencyMeasurement.BeginInput(note.TraceId);
+            LatencyMeasurement.RecordTrackerEntry(note.TraceId);
             // (1) Generationの検証（停止後や旧セッションの遅延イベントは即破棄）
             if (note.Generation != Interlocked.Read(ref _currentSessionId))
             {
+                LatencyMeasurement.RecordSuppressed(note.TraceId, "stale_generation");
                 return;
             }
 
             var sourceKey = new MidiSourceKey(note.DeviceId, note.Channel, note.NoteNumber, false);
-
-            lock (_stateLock)
+            string? capturedInput = null;
+            using var notifications = _keySimulator.DeferNotifications();
+            try
             {
-                if (note.Generation != Interlocked.Read(ref _currentSessionId)) return;
+                lock (_stateLock)
+                {
+                if (note.Generation != Interlocked.Read(ref _currentSessionId))
+                {
+                    LatencyMeasurement.RecordSuppressed(note.TraceId, "stale_generation");
+                    return;
+                }
 
                 // 切断済みDeviceIdからの遅延イベントを拒否
                 if (_disconnectedDeviceIds.Contains(note.DeviceId))
                 {
                     DiagnosticLogger.Log($"[InputTracker] Dropped note event from disconnected device '{note.DeviceId}': Note={note.NoteNumber}, IsDown={note.IsDown}, Gen={note.Generation}");
+                    LatencyMeasurement.RecordSuppressed(note.TraceId, "disconnected_device");
                     return;
                 }
 
@@ -187,6 +294,7 @@ namespace MidiToKeyApp
                     // 1. 【最優先】既に通常変換で押下中のノートであるか確認
                     if (_activeNotes.ContainsKey(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "duplicate_note_on");
                         // 既に押下中の入力元であれば、キャプチャ中であっても重複NoteOnとして既存状態を維持
                         return;
                     }
@@ -194,6 +302,7 @@ namespace MidiToKeyApp
                     // 2. キャプチャ抑止中であるか確認（キャプチャ終了後の重複NoteOn対策）
                     if (_suppressedSources.Contains(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "capture_suppressed");
                         // キャプチャ中に取得されNoteOff待ちの入力であれば、キャプチャ終了後も重複NoteOnを無視
                         return;
                     }
@@ -202,37 +311,28 @@ namespace MidiToKeyApp
                     if (_isCapturing)
                     {
                         _suppressedSources.Add(sourceKey);
-                        OnInputCaptured?.Invoke(note.NoteNumber.ToString());
+                        capturedInput = NoteNumberText(note.NoteNumber);
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "capture");
                         return;
                     }
 
                     // 4. 通常変換実行中でない場合は何もしない（停止中など）
-                    if (!_isListening) return;
+                    if (!_isListening)
+                    {
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "not_listening");
+                        return;
+                    }
 
                     // 5. 通常変換の新規NoteOn処理
-                    var settings = _settingsProvider();
-                    string noteStr = note.NoteNumber.ToString();
-                    string? mappedKey = null;
-
-                    lock (settings.MappingLock)
+                    var resolved = ResolveNote(note.NoteNumber);
+                    if (resolved.IsValid)
                     {
-                        if (settings.Mapping.TryGetValue(noteStr, out var key))
+                        if (_keySimulator.PressResolvedKey(resolved))
                         {
-                            mappedKey = key;
+                            _activeNotes[sourceKey] = resolved;
                         }
                     }
-
-                    if (mappedKey != null)
-                    {
-                        var resolved = KeyResolver.Resolve(mappedKey, settings.KeyboardLayout);
-                        if (resolved.IsValid)
-                        {
-                            if (_keySimulator.PressResolvedKey(resolved))
-                            {
-                                _activeNotes[sourceKey] = resolved;
-                            }
-                        }
-                    }
+                    else LatencyMeasurement.RecordSuppressed(note.TraceId, "unmapped");
                 }
                 else
                 {
@@ -241,6 +341,7 @@ namespace MidiToKeyApp
                     // キャプチャ中に取得されたノートの解放であれば、抑止セットから除去して終了（キー解放はしない）
                     if (_suppressedSources.Remove(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "capture_release");
                         return;
                     }
 
@@ -249,7 +350,13 @@ namespace MidiToKeyApp
                     {
                         _keySimulator.ReleaseResolvedKey(resolvedKey);
                     }
+                    else LatencyMeasurement.RecordSuppressed(note.TraceId, "no_active_note");
                 }
+                }
+            }
+            finally
+            {
+                if (capturedInput != null) OnInputCaptured?.Invoke(capturedInput);
             }
         }
 
@@ -258,25 +365,41 @@ namespace MidiToKeyApp
         /// </summary>
         public void ProcessControlEvent(MidiControlData cc)
         {
-            if (cc.ControlNumber != 64) return; // サステインペダル以外は無視
-
-            if (cc.Generation != Interlocked.Read(ref _currentSessionId))
+            using var inputScope = LatencyMeasurement.BeginInput(cc.TraceId);
+            LatencyMeasurement.RecordTrackerEntry(cc.TraceId);
+            if (cc.ControlNumber != 64)
             {
+                LatencyMeasurement.RecordSuppressed(cc.TraceId, "unsupported_control");
                 return;
             }
 
-            string pedalKey = $"{cc.DeviceId}:{cc.Channel}";
+            if (cc.Generation != Interlocked.Read(ref _currentSessionId))
+            {
+                LatencyMeasurement.RecordSuppressed(cc.TraceId, "stale_generation");
+                return;
+            }
+
+            var pedalKey = (cc.DeviceId, cc.Channel);
             var sourceKey = new MidiSourceKey(cc.DeviceId, cc.Channel, cc.ControlNumber, true);
             bool isDown = cc.ControlValue >= 64;
 
-            lock (_stateLock)
+            string? capturedInput = null;
+            using var notifications = _keySimulator.DeferNotifications();
+            try
             {
-                if (cc.Generation != Interlocked.Read(ref _currentSessionId)) return;
+                lock (_stateLock)
+                {
+                if (cc.Generation != Interlocked.Read(ref _currentSessionId))
+                {
+                    LatencyMeasurement.RecordSuppressed(cc.TraceId, "stale_generation");
+                    return;
+                }
 
                 // 切断済みDeviceIdからの遅延イベントを拒否
                 if (_disconnectedDeviceIds.Contains(cc.DeviceId))
                 {
                     DiagnosticLogger.Log($"[InputTracker] Dropped CC64 event from disconnected device '{cc.DeviceId}': Val={cc.ControlValue}, Gen={cc.Generation}");
+                    LatencyMeasurement.RecordSuppressed(cc.TraceId, "disconnected_device");
                     return;
                 }
 
@@ -285,6 +408,7 @@ namespace MidiToKeyApp
                 // 状態に変化がない重複イベント（例: 127→127→100、または 63→0）は無視
                 if (isDown == currentDown)
                 {
+                    LatencyMeasurement.RecordSuppressed(cc.TraceId, "duplicate_control");
                     return;
                 }
 
@@ -296,12 +420,14 @@ namespace MidiToKeyApp
                     // 1. 既に通常変換で押下中であれば重複追加しない
                     if (_activeNotes.ContainsKey(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "duplicate_control");
                         return;
                     }
 
                     // 2. キャプチャ抑止中であれば重複踏み込みを無視
                     if (_suppressedSources.Contains(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "capture_suppressed");
                         return;
                     }
 
@@ -309,42 +435,35 @@ namespace MidiToKeyApp
                     if (_isCapturing)
                     {
                         _suppressedSources.Add(sourceKey);
-                        OnInputCaptured?.Invoke("pedal");
+                        capturedInput = "pedal";
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "capture");
                         return;
                     }
 
                     // 4. 通常変換実行中でない場合は何もしない
-                    if (!_isListening) return;
+                    if (!_isListening)
+                    {
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "not_listening");
+                        return;
+                    }
 
                     // 5. 通常変換処理
-                    var settings = _settingsProvider();
-                    string? mappedKey = null;
-
-                    lock (settings.MappingLock)
+                    var resolved = ResolvePedal();
+                    if (resolved.IsValid)
                     {
-                        if (settings.Mapping.TryGetValue("pedal", out var key))
+                        if (_keySimulator.PressResolvedKey(resolved))
                         {
-                            mappedKey = key;
+                            _activeNotes[sourceKey] = resolved;
                         }
                     }
-
-                    if (mappedKey != null)
-                    {
-                        var resolved = KeyResolver.Resolve(mappedKey, settings.KeyboardLayout);
-                        if (resolved.IsValid)
-                        {
-                            if (_keySimulator.PressResolvedKey(resolved))
-                            {
-                                _activeNotes[sourceKey] = resolved;
-                            }
-                        }
-                    }
+                    else LatencyMeasurement.RecordSuppressed(cc.TraceId, "unmapped");
                 }
                 else
                 {
                     // --- ペダル解放 (PedalUp) ---
                     if (_suppressedSources.Remove(sourceKey))
                     {
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "capture_release");
                         return;
                     }
 
@@ -352,7 +471,13 @@ namespace MidiToKeyApp
                     {
                         _keySimulator.ReleaseResolvedKey(resolvedKey);
                     }
+                    else LatencyMeasurement.RecordSuppressed(cc.TraceId, "no_active_control");
                 }
+                }
+            }
+            finally
+            {
+                if (capturedInput != null) OnInputCaptured?.Invoke(capturedInput);
             }
         }
 
@@ -379,6 +504,7 @@ namespace MidiToKeyApp
         /// </summary>
         public void ReleaseDeviceInputs(string deviceId, long generation)
         {
+            using var notifications = _keySimulator.DeferNotifications();
             if (generation != Interlocked.Read(ref _currentSessionId))
             {
                 DiagnosticLogger.Log($"[InputTracker] ReleaseDeviceInputs ignored due to generation mismatch: Received Gen={generation}, Current Gen={CurrentSessionId}");
@@ -423,10 +549,10 @@ namespace MidiToKeyApp
                 }
 
                 // 3. 切断デバイスのペダル状態を削除
-                var pedalKeys = new List<string>();
+                var pedalKeys = new List<(string DeviceId, int Channel)>();
                 foreach (var pk in _pedalStates.Keys)
                 {
-                    if (pk.StartsWith(deviceId + ":", StringComparison.Ordinal))
+                    if (pk.DeviceId == deviceId)
                     {
                         pedalKeys.Add(pk);
                     }

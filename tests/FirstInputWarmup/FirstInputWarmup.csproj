@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\KeySimulator.cs" Link="Production\KeySimulator.cs" />
+    <Compile Include="..\..\InputTracker.cs" Link="Production\InputTracker.cs" />
+    <Compile Include="..\..\SettingsManager.cs" Link="Production\SettingsManager.cs" />
+    <Compile Include="..\..\MidiNoteHelper.cs" Link="Production\MidiNoteHelper.cs" />
+    <Compile Include="..\..\MidiListener.cs" Link="Production\MidiListener.cs" />
+    <Compile Include="..\..\HotkeyManager.cs" Link="Production\HotkeyManager.cs" />
+    <Compile Include="..\..\HotkeyConfigDialog.cs" Link="Production\HotkeyConfigDialog.cs" />
+    <Compile Include="..\..\DiagnosticLogger.cs" Link="Production\DiagnosticLogger.cs" />
+    <Compile Include="..\..\MidiDeviceDiagnostics.cs" Link="Production\MidiDeviceDiagnostics.cs" />
+    <Compile Include="..\..\WinRtMidiWatcher.cs" Link="Production\WinRtMidiWatcher.cs" />
+    <Compile Include="..\..\LatencyMeasurement.cs" Link="Production\LatencyMeasurement.cs" Condition="Exists('..\..\LatencyMeasurement.cs')" />
+    <Compile Include="..\..\InputWarmup.cs" Link="Production\InputWarmup.cs" Condition="Exists('..\..\InputWarmup.cs')" />
+    <PackageReference Include="InputSimulatorCore" Version="1.0.5" />
+    <PackageReference Include="Melanchall.DryWetMidi" Version="8.0.3" />
+    <PackageReference Include="MouseKeyHook" Version="5.7.1" />
+  </ItemGroup>
+</Project>

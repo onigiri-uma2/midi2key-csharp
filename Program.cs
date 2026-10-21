@@ -45,9 +45,41 @@ namespace MidiToKeyApp
                 DiagnosticLogger.Log("AppStart", "midi2key デバッグログセッションを開始しました。");
             }
 
+            InputWarmup.Enabled = !Array.Exists(args ?? Array.Empty<string>(), a =>
+                string.Equals(a, "--no-input-warmup", StringComparison.OrdinalIgnoreCase));
+            LatencyMeasurement.ConfigureInputWarmup(InputWarmup.Enabled);
+
+            string? latencyArgument = Array.Find(args ?? Array.Empty<string>(), a =>
+                string.Equals(a, "--measure-latency", StringComparison.OrdinalIgnoreCase) ||
+                a.StartsWith("--measure-latency=", StringComparison.OrdinalIgnoreCase));
+            if (latencyArgument != null)
+            {
+                int equals = latencyArgument.IndexOf('=');
+                string? path = equals < 0 ? null : latencyArgument[(equals + 1)..];
+                LatencyMeasurement.Enable(string.IsNullOrWhiteSpace(path) ? null : path);
+            }
+
             // 3. WinFormsのメイン画面を起動
             ApplicationConfiguration.Initialize();
-            Application.Run(new Form1());
+            try
+            {
+                Application.Run(new Form1());
+            }
+            finally
+            {
+                if (LatencyMeasurement.Enabled)
+                {
+                    var export = LatencyMeasurement.ExportAfterStop();
+                    if (!export.Success)
+                    {
+                        MessageBox.Show(export.PathOrError, "遅延計測の保存に失敗", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    else
+                    {
+                        MessageBox.Show($"遅延計測結果を保存しました:\n{export.PathOrError}", "遅延計測", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+            }
         }
     }
 }

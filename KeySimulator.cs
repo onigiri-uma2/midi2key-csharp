@@ -48,7 +48,7 @@ namespace MidiToKeyApp
     public class WindowsKeyboardOutput : IKeyboardOutput
     {
         [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        private static extern uint SendInput(uint nInputs, ref INPUT pInputs, int cbSize);
 
         [DllImport("user32.dll")]
         private static extern uint MapVirtualKey(uint uCode, uint uMapType);
@@ -58,6 +58,7 @@ namespace MidiToKeyApp
         private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         private const uint KEYEVENTF_KEYUP = 0x0002;
         private const uint KEYEVENTF_SCANCODE = 0x0008;
+        private static readonly int InputSize = Marshal.SizeOf<INPUT>();
 
         [StructLayout(LayoutKind.Sequential)]
         private struct INPUT
@@ -139,10 +140,21 @@ namespace MidiToKeyApp
                 input.U.ki.dwFlags = flags;
             }
 
-            uint result = SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT)));
+            LatencyMeasurement.RecordSendInputBefore();
+            uint result = 0;
+            int sendError = 0;
+            try
+            {
+                result = SendInput(1, ref input, InputSize);
+                if (result == 0) sendError = Marshal.GetLastWin32Error();
+            }
+            finally
+            {
+                LatencyMeasurement.RecordSendInputAfter(result != 0);
+            }
             if (result == 0)
             {
-                LastWin32Error = Marshal.GetLastWin32Error();
+                LastWin32Error = sendError;
                 return false;
             }
             LastWin32Error = 0;
@@ -369,6 +381,36 @@ namespace MidiToKeyApp
         private readonly HashSet<VirtualKeyCode> _unreleasedKeys = new();
         private readonly object _keyLock = new();
 
+        [ThreadStatic] private static int _notificationDeferralDepth;
+        [ThreadStatic] private static List<(KeySimulator Simulator, KeySendErrorInfo Error)>? _deferredErrors;
+
+        internal readonly struct NotificationDeferral : IDisposable
+        {
+            public void Dispose()
+            {
+                if (--_notificationDeferralDepth != 0) return;
+                var errors = _deferredErrors;
+                _deferredErrors = null;
+                if (errors == null) return;
+                foreach (var (simulator, error) in errors)
+                    simulator.OnKeySendError?.Invoke(error);
+            }
+        }
+
+        internal NotificationDeferral DeferNotifications()
+        {
+            _notificationDeferralDepth++;
+            return default;
+        }
+
+        private void PublishError(KeySendErrorInfo error)
+        {
+            if (_notificationDeferralDepth != 0)
+                (_deferredErrors ??= new()).Add((this, error));
+            else
+                OnKeySendError?.Invoke(error);
+        }
+
         public KeySimulator(IKeyboardOutput? output = null)
         {
             _output = output ?? new WindowsKeyboardOutput();
@@ -385,7 +427,7 @@ namespace MidiToKeyApp
                 _output.LastWin32Error,
                 unreleasedCount
             );
-            OnKeySendError?.Invoke(errorInfo);
+            PublishError(errorInfo);
         }
 
         /// <summary>
@@ -433,7 +475,7 @@ namespace MidiToKeyApp
 
             if (pendingError != null)
             {
-                OnKeySendError?.Invoke(pendingError);
+                PublishError(pendingError);
                 return false;
             }
 
@@ -442,12 +484,14 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 指定された解決済みキー（BaseKeyおよびShift要求）を解放状態にします。
+        /// 押下されていないキーは成功扱いの no-op とし、実際のKeyUp送信失敗時はfalseを返します。
         /// </summary>
         public bool ReleaseResolvedKey(ResolvedKey key)
         {
             if (!key.IsValid) return false;
 
-            List<KeySendErrorInfo> errors = new();
+            List<KeySendErrorInfo>? errors = null;
+            bool succeeded = true;
 
             lock (_keyLock)
             {
@@ -456,7 +500,8 @@ namespace MidiToKeyApp
                 {
                     if (_unreleasedKeys.Contains(key.BaseKey))
                     {
-                        errors.Add(new KeySendErrorInfo(key.BaseKey, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
+                        succeeded = false;
+                        (errors ??= new()).Add(new KeySendErrorInfo(key.BaseKey, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
                     }
                 }
 
@@ -467,18 +512,19 @@ namespace MidiToKeyApp
                     {
                         if (_unreleasedKeys.Contains(VirtualKeyCode.SHIFT))
                         {
-                            errors.Add(new KeySendErrorInfo(VirtualKeyCode.SHIFT, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
+                            succeeded = false;
+                            (errors ??= new()).Add(new KeySendErrorInfo(VirtualKeyCode.SHIFT, false, DateTime.Now, _output.LastWin32Error, _unreleasedKeys.Count));
                         }
                     }
                 }
             }
 
-            foreach (var err in errors)
+            if (errors != null) foreach (var err in errors)
             {
-                OnKeySendError?.Invoke(err);
+                PublishError(err);
             }
 
-            return true;
+            return succeeded;
         }
 
         /// <summary>
@@ -579,7 +625,7 @@ namespace MidiToKeyApp
 
             foreach (var err in errors)
             {
-                OnKeySendError?.Invoke(err);
+                PublishError(err);
             }
 
             lock (_keyLock)
@@ -622,7 +668,7 @@ namespace MidiToKeyApp
 
             foreach (var err in errors)
             {
-                OnKeySendError?.Invoke(err);
+                PublishError(err);
             }
 
             lock (_keyLock)

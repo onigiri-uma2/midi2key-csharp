@@ -74,12 +74,12 @@ namespace MidiToKeyApp
     /// 受信したMIDIノートイベントの詳細情報。
     /// デバイスの一意識別子、チャンネル番号、発行元リスナーのGenerationを含みます。
     /// </summary>
-    public readonly record struct MidiNoteData(string DeviceId, string DeviceName, int Channel, int NoteNumber, int Velocity, bool IsDown, long Generation);
+    public readonly record struct MidiNoteData(string DeviceId, string DeviceName, int Channel, int NoteNumber, int Velocity, bool IsDown, long Generation, long TraceId = 0);
 
     /// <summary>
     /// 受信したコントロールチェンジ（サステインペダル等）の詳細情報。
     /// </summary>
-    public readonly record struct MidiControlData(string DeviceId, string DeviceName, int Channel, int ControlNumber, int ControlValue, long Generation);
+    public readonly record struct MidiControlData(string DeviceId, string DeviceName, int Channel, int ControlNumber, int ControlValue, long Generation, long TraceId = 0);
 
     /// <summary>
     /// 変換開始時におけるMIDIポート接続数のスナップショット。
@@ -576,10 +576,15 @@ namespace MidiToKeyApp
         /// デバイスの接続状態を再確認し、切断されたデバイスがあれば検出して解放・通知します。
         /// 変換開始時スナップショットとのポート別件数比較により、同名デバイスの一部切断も確実に検知します。
         /// </summary>
+        public void CheckDeviceHealth(IEnumerable<string>? activeOsDeviceNames = null,
+            OutOfProcessWinMmResult? outOfProcessWinMmResult = null, long? targetGeneration = null) =>
+            CheckDeviceHealth(activeOsDeviceNames, outOfProcessWinMmResult, targetGeneration, null);
+
         public void CheckDeviceHealth(
-            IEnumerable<string>? activeOsDeviceNames = null,
-            OutOfProcessWinMmResult? outOfProcessWinMmResult = null,
-            long? targetGeneration = null)
+            IEnumerable<string>? activeOsDeviceNames,
+            OutOfProcessWinMmResult? outOfProcessWinMmResult,
+            long? targetGeneration,
+            IReadOnlyList<string>? onlineDeviceNames)
         {
             // Generation検証: 判定対象Generationが指定され、既にセッションが遷移している場合は判定をスキップ
             if (targetGeneration.HasValue && targetGeneration.Value != CurrentGeneration)
@@ -605,7 +610,11 @@ namespace MidiToKeyApp
             List<string> currentOnlineNames = new();
             try
             {
-                if (OnlineDeviceNamesProvider != null)
+                if (onlineDeviceNames != null)
+                {
+                    currentOnlineNames.AddRange(onlineDeviceNames);
+                }
+                else if (OnlineDeviceNamesProvider != null)
                 {
                     currentOnlineNames.AddRange(OnlineDeviceNamesProvider());
                 }
@@ -839,11 +848,20 @@ namespace MidiToKeyApp
 
         private void OnEventReceived(object? sender, MidiEventReceivedEventArgs e)
         {
+            // The timestamp is taken at the callback entrance, before device lookup or locks.
+            long traceId = LatencyMeasurement.RecordMidiCallback();
             OpenDeviceInfo? targetInfo = null;
 
             lock (_lock)
             {
-                targetInfo = _devices.Find(d => ReferenceEquals(d.Device, sender));
+                foreach (var device in _devices)
+                {
+                    if (ReferenceEquals(device.Device, sender))
+                    {
+                        targetInfo = device;
+                        break;
+                    }
+                }
             }
 
             if (targetInfo == null) return;
@@ -865,7 +883,8 @@ namespace MidiToKeyApp
                 if (midiEvent is NoteOnEvent noteOn)
                 {
                     bool isDown = noteOn.Velocity > 0;
-                    var noteData = new MidiNoteData(deviceId, deviceName, noteOn.Channel, noteOn.NoteNumber, noteOn.Velocity, isDown, generation);
+                    var noteData = new MidiNoteData(deviceId, deviceName, noteOn.Channel, noteOn.NoteNumber, noteOn.Velocity, isDown, generation, traceId);
+                    LatencyMeasurement.RecordMidiIdentity(traceId, deviceId, generation, isDown ? "note_on" : "note_on_zero_velocity");
 
                     if (state == DeviceState.Opening)
                     {
@@ -881,7 +900,8 @@ namespace MidiToKeyApp
                 }
                 else if (midiEvent is NoteOffEvent noteOff)
                 {
-                    var noteData = new MidiNoteData(deviceId, deviceName, noteOff.Channel, noteOff.NoteNumber, noteOff.Velocity, false, generation);
+                    var noteData = new MidiNoteData(deviceId, deviceName, noteOff.Channel, noteOff.NoteNumber, noteOff.Velocity, false, generation, traceId);
+                    LatencyMeasurement.RecordMidiIdentity(traceId, deviceId, generation, "note_off");
 
                     if (state == DeviceState.Opening)
                     {
@@ -897,7 +917,8 @@ namespace MidiToKeyApp
                 }
                 else if (midiEvent is ControlChangeEvent controlChange)
                 {
-                    var controlData = new MidiControlData(deviceId, deviceName, controlChange.Channel, controlChange.ControlNumber, controlChange.ControlValue, generation);
+                    var controlData = new MidiControlData(deviceId, deviceName, controlChange.Channel, controlChange.ControlNumber, controlChange.ControlValue, generation, traceId);
+                    LatencyMeasurement.RecordMidiIdentity(traceId, deviceId, generation, "control_change");
 
                     if (state == DeviceState.Opening)
                     {

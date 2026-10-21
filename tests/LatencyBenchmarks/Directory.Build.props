@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup Condition="'$(Baseline)' == 'true'">
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\baseline-build\</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>
