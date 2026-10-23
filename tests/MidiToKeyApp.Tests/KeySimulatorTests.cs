@@ -52,6 +52,7 @@ namespace MidiToKeyApp.Tests
         public List<MidiPortInfo> ActivePorts { get; } = new();
         public HashSet<string> FailPorts { get; } = new();
         public bool FailAllPorts { get; set; } = false;
+        public bool ThrowOnStop { get; set; }
         public TaskCompletionSource? StartEntered { get; set; }
         public TaskCompletionSource? ReleaseStart { get; set; }
         public TaskCompletionSource? StopEntered { get; set; }
@@ -125,6 +126,7 @@ namespace MidiToKeyApp.Tests
                 _portsSeenInWinRt.Clear();
                 CurrentInitialSnapshot = null;
             }
+            if (ThrowOnStop) throw new AggregateException("fake dispose failure");
         }
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts()

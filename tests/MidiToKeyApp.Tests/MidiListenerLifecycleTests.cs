@@ -43,6 +43,79 @@ public sealed class MidiListenerLifecycleTests
         Assert.AreNotEqual(callerThread, listener.StopThreadId);
     }
 
+    [TestMethod]
+    public void Stop_DisposeFailureIsReportedAfterEveryDeviceIsTried_AndAllDevicesBecomeInactive()
+    {
+        using var listener = new MidiListener();
+        int failedReleaseAttempts = 0;
+        int successfulReleaseAttempts = 0;
+        listener.AddTestDevice("Failing Port", "fake-fail", 7, () =>
+        {
+            Interlocked.Increment(ref failedReleaseAttempts);
+            throw new InvalidOperationException("fake dispose failure");
+        });
+        listener.AddTestDevice("Healthy Port", "fake-ok", 7, () =>
+            Interlocked.Increment(ref successfulReleaseAttempts));
+
+        var error = Assert.ThrowsException<AggregateException>(() => listener.Stop());
+
+        Assert.AreEqual(1, failedReleaseAttempts);
+        Assert.AreEqual(1, successfulReleaseAttempts, "A disposal error must not prevent cleanup of later devices.");
+        Assert.AreEqual(0, listener.GetActivePorts().Count, "Failed disposal must still retire the device from input state.");
+        StringAssert.Contains(error.Message, "解放に失敗");
+    }
+
+    [TestMethod]
+    public void HealthCheck_DisposeFailureEmitsSafetyStopNotification_AndRemovesInputDevice()
+    {
+        using var listener = new MidiListener();
+        int disposeAttempts = 0;
+        listener.SetCurrentGenerationForTesting(4);
+        listener.AddTestDevice("Gone Port", "fake-gone", 4, () =>
+        {
+            Interlocked.Increment(ref disposeAttempts);
+            throw new InvalidOperationException("fake dispose failure");
+        });
+        MidiDeviceDisconnectedData? notification = null;
+        listener.OnDeviceDisconnected += data => notification = data;
+
+        Assert.ThrowsException<AggregateException>(() => listener.CheckDeviceHealth(
+            activeOsDeviceNames: Array.Empty<string>(),
+            outOfProcessWinMmResult: OutOfProcessWinMmResult.Succeeded(Array.Empty<string>()),
+            targetGeneration: 4,
+            onlineDeviceNames: Array.Empty<string>()));
+
+        Assert.AreEqual(1, disposeAttempts);
+        Assert.AreEqual(0, listener.GetActivePorts().Count);
+        Assert.IsNotNull(notification);
+        Assert.AreEqual(string.Empty, notification!.Value.DeviceId, "The notification must request a whole-session safety stop.");
+        StringAssert.Contains(notification.Value.Reason, "解放失敗");
+    }
+
+    [TestMethod]
+    public async Task StopFailure_DisablesFutureNativeStarts()
+    {
+        var listener = new BlockingMidiListener { ThrowOnStop = true };
+        Type lifecycleType = typeof(Form1).Assembly.GetType("MidiToKeyApp.MidiListenerLifecycle", throwOnError: true)!;
+        object lifecycle = Activator.CreateInstance(lifecycleType, BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null, args: new object[] { listener }, culture: null)!;
+        MethodInfo startMethod = lifecycleType.GetMethod("StartAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        MethodInfo stopMethod = lifecycleType.GetMethod("StopAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var start = (Task<MidiPortStartResult>)startMethod.Invoke(lifecycle,
+            new object?[] { new[] { "Fake Port" }, 7L, null, CancellationToken.None })!;
+        await listener.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        listener.ReleaseStart.TrySetResult();
+        await start.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stop = (Task)stopMethod.Invoke(lifecycle, null)!;
+        await Assert.ThrowsExceptionAsync<AggregateException>(async () => await stop.WaitAsync(TimeSpan.FromSeconds(2)));
+        var restartError = Assert.ThrowsException<TargetInvocationException>(() => startMethod.Invoke(lifecycle,
+            new object?[] { new[] { "Fake Port" }, 8L, null, CancellationToken.None }));
+        Assert.IsInstanceOfType<InvalidOperationException>(restartError.InnerException);
+        Assert.AreEqual(1, listener.StartCount, "A release failure must not allow another native start.");
+    }
+
     private sealed class BlockingMidiListener : IMidiListener
     {
         public TaskCompletionSource StartEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -51,6 +124,7 @@ public sealed class MidiListenerLifecycleTests
         public int StopCount;
         public int StartThreadId;
         public int StopThreadId;
+        public bool ThrowOnStop { get; set; }
         public long CurrentGeneration { get; private set; }
         public InitialPortSnapshot? CurrentInitialSnapshot { get; private set; }
         public event Action<MidiNoteData>? OnNoteReceived { add { } remove { } }
@@ -73,6 +147,7 @@ public sealed class MidiListenerLifecycleTests
         {
             Interlocked.Increment(ref StopCount);
             StopThreadId = Environment.CurrentManagedThreadId;
+            if (ThrowOnStop) throw new AggregateException("fake dispose failure");
         }
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts() => Array.Empty<MidiPortInfo>();

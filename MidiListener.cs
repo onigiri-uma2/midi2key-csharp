@@ -249,6 +249,7 @@ namespace MidiToKeyApp
         private class OpenDeviceInfo
         {
             public InputDevice? Device { get; init; }
+            public Action? DisposeForTesting { get; init; }
             public required string DeviceId { get; init; }
             public required string DeviceName { get; init; }
             public required long Generation { get; init; }
@@ -276,13 +277,14 @@ namespace MidiToKeyApp
         /// <summary>
         /// テスト用：実機デバイスなしでActive状態のデバイスを登録します。
         /// </summary>
-        internal void AddTestDevice(string deviceName, string deviceId, long generation)
+        internal void AddTestDevice(string deviceName, string deviceId, long generation, Action? disposeForTesting = null)
         {
             lock (_lock)
             {
                 _devices.Add(new OpenDeviceInfo
                 {
                     Device = null,
+                    DisposeForTesting = disposeForTesting,
                     DeviceId = deviceId,
                     DeviceName = deviceName,
                     Generation = generation,
@@ -369,6 +371,28 @@ namespace MidiToKeyApp
                     .Select(d => new MidiPortInfo(d.DeviceId, d.DeviceName, d.State))
                     .ToList();
             }
+        }
+
+        private void ReleaseDevice(OpenDeviceInfo info)
+        {
+            Exception? unsubscribeError = null;
+            try
+            {
+                if (info.Device != null) info.Device.EventReceived -= OnEventReceived;
+            }
+            catch (Exception ex) { unsubscribeError = ex; }
+
+            Exception? disposeError = null;
+            try
+            {
+                if (info.Device != null) info.Device.Dispose();
+                else info.DisposeForTesting?.Invoke();
+            }
+            catch (Exception ex) { disposeError = ex; }
+
+            if (unsubscribeError != null || disposeError != null)
+                throw new AggregateException($"MIDIポート '{info.DeviceName}' の解放に失敗しました。",
+                    new[] { unsubscribeError, disposeError }.OfType<Exception>());
         }
 
         /// <summary>
@@ -551,17 +575,18 @@ namespace MidiToKeyApp
                 }
             }
 
+            var releaseFailures = new List<Exception>();
             foreach (var info in devicesToStop)
             {
                 try
                 {
-                    if (info.Device != null)
-                    {
-                        info.Device.EventReceived -= OnEventReceived;
-                        info.Device.Dispose();
-                    }
+                    ReleaseDevice(info);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    DiagnosticLogger.Log("MidiListener.Stop", $"ポート '{info.DeviceName}' ({info.DeviceId}) の解放に失敗: {ex}");
+                    releaseFailures.Add(new InvalidOperationException($"MIDIポート '{info.DeviceName}' の解放に失敗しました: {ex.Message}", ex));
+                }
                 finally
                 {
                     lock (info.EventDispatchLock)
@@ -570,6 +595,8 @@ namespace MidiToKeyApp
                     }
                 }
             }
+            if (releaseFailures.Count > 0)
+                throw new AggregateException("MIDIポートの解放に失敗しました。機器を接続し直し、アプリを再起動してください。", releaseFailures);
         }
 
         /// <summary>
@@ -742,17 +769,18 @@ namespace MidiToKeyApp
             }
 
             // ロック外でクリーンアップとイベント通知
+            var releaseFailures = new List<string>();
             foreach (var info in disconnectedDevices)
             {
                 try
                 {
-                    if (info.Device != null)
-                    {
-                        info.Device.EventReceived -= OnEventReceived;
-                        info.Device.Dispose();
-                    }
+                    ReleaseDevice(info);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    DiagnosticLogger.Log("CheckDeviceHealth", $"ポート '{info.DeviceName}' ({info.DeviceId}) の解放に失敗: {ex}");
+                    releaseFailures.Add($"{info.DeviceName} ({info.DeviceId}): {ex.Message}");
+                }
                 finally
                 {
                     lock (info.EventDispatchLock)
@@ -760,6 +788,16 @@ namespace MidiToKeyApp
                         info.State = DeviceState.Closed;
                     }
                 }
+            }
+
+            if (releaseFailures.Count > 0)
+            {
+                // 残存ポートも安全停止が必要。Form1 は空の DeviceId を全停止通知として扱う。
+                OnDeviceDisconnected?.Invoke(new MidiDeviceDisconnectedData(
+                    string.Empty, string.Empty, CurrentGeneration,
+                    $"MIDIポート解放失敗: {string.Join("; ", releaseFailures)}。アプリを再起動してください。"));
+                throw new AggregateException("MIDIポート解放失敗。アプリを再起動してください。",
+                    releaseFailures.Select(message => new InvalidOperationException(message)));
             }
 
             if (hasAmbiguousDisconnection)

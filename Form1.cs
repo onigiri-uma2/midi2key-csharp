@@ -916,16 +916,12 @@ namespace MidiToKeyApp
                             catch { }
                         }
 
-                        if (parentPorts.Success)
+                        if (DiagnosticLogger.IsEnabled)
                         {
                             var activePorts = midiListener.GetActivePorts();
                             await MidiDeviceDiagnostics.RunComparisonAsync(
                                 "DeviceChangeDebounce", triggerGen, activePorts,
                                 backendResult: parentPorts, winMmResult: outProcResult);
-                        }
-                        else
-                        {
-                            DiagnosticLogger.Log("DeviceChangeDebounce", $"比較診断を省略: {parentPorts.ErrorMessage}");
                         }
                     }
                     catch (Exception ex)
@@ -1125,11 +1121,22 @@ namespace MidiToKeyApp
         private async void ObserveMidiStop(Task task)
         {
             bool stopped = false;
+            Exception? stopError = null;
             try { await task; stopped = true; }
-            catch (Exception ex) { DiagnosticLogger.Log("MidiLifecycle", $"MIDI停止処理失敗: {ex}"); }
+            catch (Exception ex)
+            {
+                stopError = ex;
+                DiagnosticLogger.Log("MidiLifecycle", $"MIDI停止処理失敗: {ex}");
+            }
             finally
             {
                 if (!_isClosing && !IsDisposed && !inputTracker.IsListening &&
+                    (stopError != null || midiLifecycle.HasReleaseFailure))
+                {
+                    lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
+                    lblStatus.ForeColor = Color.DarkOrange;
+                }
+                else if (!_isClosing && !IsDisposed && !inputTracker.IsListening &&
                     !_isTransitioning && !midiLifecycle.IsBusy &&
                     lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal))
                 {
@@ -1401,22 +1408,21 @@ namespace MidiToKeyApp
             inputTracker.StopSession();
 
             // 前のnative処理が完了した後でポートを閉じる
-            ObserveMidiStop(midiLifecycle.StopAsync());
+            var midiStopTask = midiLifecycle.StopAsync();
 
             bool allReleased = keySimulator.RetryReleasePendingKeys();
 
             if (allReleased && !keySimulator.HasUnreleasedKeys)
             {
-                lblStatus.Text = midiLifecycle.IsBusy
-                    ? "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)"
-                    : "ステータス: 停止中";
-                lblStatus.ForeColor = midiLifecycle.IsBusy ? Color.DarkGoldenrod : Color.Red;
+                lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
             }
             else
             {
                 lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
                 lblStatus.ForeColor = Color.DarkOrange;
             }
+            ObserveMidiStop(midiStopTask);
         }
 
         /// <summary>
@@ -1446,9 +1452,11 @@ namespace MidiToKeyApp
                 DiagnosticLogger.Log($"[Form1] Full disconnect or unidentified device disconnect. Stopping conversion safely. RemainingActivePorts={activePorts.Count}, Reason='{data.Reason}', UnreleasedKeys={keySimulator.UnreleasedKeysCount}");
                 StopConversion();
 
-                string warningMsg = data.Reason.Contains("同名のMIDIデバイスの一部切断") || data.Reason.Contains("同名")
-                    ? "同名のMIDIデバイスの一部切断を検知しました。切断された機器を特定できないため、安全のため変換を停止しました。機器を接続し直し、midi2keyを再起動してください。"
-                    : "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。";
+                string warningMsg = data.Reason.Contains("MIDIポート解放失敗", StringComparison.Ordinal)
+                    ? $"MIDIポートの解放に失敗したため変換を停止しました。{data.Reason}"
+                    : data.Reason.Contains("同名のMIDIデバイスの一部切断") || data.Reason.Contains("同名")
+                        ? "同名のMIDIデバイスの一部切断を検知しました。切断された機器を特定できないため、安全のため変換を停止しました。機器を接続し直し、midi2keyを再起動してください。"
+                        : "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。";
 
                 ShowAggregatedWarning(
                     warningMsg,

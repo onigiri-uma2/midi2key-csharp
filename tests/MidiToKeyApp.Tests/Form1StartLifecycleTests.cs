@@ -229,6 +229,7 @@ public sealed class Form1StartLifecycleTests
 
                 form.SendHotkeyForTest();
                 Assert.IsFalse(form.ListeningForTest, "The hotkey should stop a running conversion.");
+                await WaitUntilAsync(() => form.StatusForTest == "ステータス: 停止中");
             }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
         }
         finally
@@ -312,6 +313,35 @@ public sealed class Form1StartLifecycleTests
         {
             InputWarmup.Enabled = previousWarmup;
             listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task NativeStopFailure_KeepsInputDisabled_AndShowsReleaseWarning()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.StartForTest();
+                await WaitUntilAsync(() => !form.TransitioningForTest && form.ListeningForTest);
+                listener.ThrowOnStop = true;
+
+                form.SendHotkeyForTest();
+                await WaitUntilAsync(() => form.StatusForTest.Contains("解放失敗", StringComparison.Ordinal));
+
+                Assert.IsFalse(form.ListeningForTest, "Input must stay disabled after native release fails.");
+                Assert.AreEqual(1, listener.StartCount);
+                Assert.AreEqual(1, listener.StopCount);
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
         }
     }
 
@@ -402,6 +432,7 @@ public sealed class Form1StartLifecycleTests
 
         public bool TransitioningForTest => (bool)typeof(Form1).GetField("_isTransitioning", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
         public bool ListeningForTest => typeof(Form1).GetField("inputTracker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this) is InputTracker tracker && tracker.IsListening;
+        public string StatusForTest => ((Label)typeof(Form1).GetField("lblStatus", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).Text;
 
         public void StartForTest() => typeof(Form1).GetMethod("StartConversion", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, null);
 

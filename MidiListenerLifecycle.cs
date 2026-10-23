@@ -15,10 +15,12 @@ internal sealed class MidiListenerLifecycle
     private Task? _pendingDispose;
     private int _pendingCount;
     private bool _disposed;
+    private Exception? _stopFailure;
 
     internal MidiListenerLifecycle(IMidiListener listener) => _listener = listener;
 
     internal bool IsBusy => Volatile.Read(ref _pendingCount) != 0;
+    internal bool HasReleaseFailure { get { lock (_gate) return _stopFailure != null; } }
 
     // A caller may await the work already queued without adding another native operation.
     // Preserve stop failures so a new session cannot start after a failed close.
@@ -33,6 +35,8 @@ internal sealed class MidiListenerLifecycle
     {
         lock (_gate)
         {
+            if (_stopFailure != null)
+                throw new InvalidOperationException("前回のMIDIポート解放に失敗しました。アプリを再起動してください。", _stopFailure);
             if (_disposed || _pendingCount != 0)
                 throw new InvalidOperationException("MIDIデバイスの前の処理が完了していません。");
             _pendingStop = null;
@@ -45,7 +49,13 @@ internal sealed class MidiListenerLifecycle
                     await previous.ConfigureAwait(false);
                     cancellationToken.ThrowIfCancellationRequested();
                     // DryWetMIDI has synchronous WinMM calls. This worker must be the only owner.
-                    var result = _listener.Start(ports, generation, snapshot);
+                    MidiPortStartResult result;
+                    try { result = _listener.Start(ports, generation, snapshot); }
+                    catch (AggregateException ex)
+                    {
+                        lock (_gate) _stopFailure = ex;
+                        throw;
+                    }
                     cancellationToken.ThrowIfCancellationRequested();
                     return result;
                 }
@@ -69,7 +79,12 @@ internal sealed class MidiListenerLifecycle
                 try
                 {
                     await previous.ConfigureAwait(false);
-                    _listener.Stop();
+                    try { _listener.Stop(); }
+                    catch (Exception ex)
+                    {
+                        lock (_gate) _stopFailure = ex;
+                        throw;
+                    }
                 }
                 finally { Interlocked.Decrement(ref _pendingCount); }
             });
@@ -119,10 +134,18 @@ internal sealed class MidiListenerLifecycle
                 {
                     await previous.ConfigureAwait(false);
                     var before = _listener.GetActivePorts();
-                    if (_listener is MidiListener concrete)
-                        concrete.CheckDeviceHealth(osNames, outOfProcess, generation, backendPorts);
-                    else
-                        _listener.CheckDeviceHealth(osNames, outOfProcess, generation);
+                    try
+                    {
+                        if (_listener is MidiListener concrete)
+                            concrete.CheckDeviceHealth(osNames, outOfProcess, generation, backendPorts);
+                        else
+                            _listener.CheckDeviceHealth(osNames, outOfProcess, generation);
+                    }
+                    catch (AggregateException ex)
+                    {
+                        lock (_gate) _stopFailure = ex;
+                        throw;
+                    }
                     return (before, _listener.GetActivePorts());
                 }
                 finally { Interlocked.Decrement(ref _pendingCount); }
