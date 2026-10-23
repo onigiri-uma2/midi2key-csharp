@@ -28,4 +28,17 @@
     <PackageReference Include="MouseKeyHook" Version="5.7.1" />
   </ItemGroup>
 
+  <!-- DryWetMIDI includes its macOS binary as an unconditional None item. -->
+  <Target Name="RemoveMacDryWetMidiBinary" BeforeTargets="AssignTargetPaths"
+          Condition="'$(TargetPlatformIdentifier)' == 'Windows'">
+    <ItemGroup>
+      <None Remove="@(None)" Condition="'%(None.Filename)%(None.Extension)' == 'Melanchall_DryWetMidi_Native64.dylib'" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="CleanOldMacDryWetMidiBinary" AfterTargets="CopyFilesToOutputDirectory;Publish"
+          Condition="'$(TargetPlatformIdentifier)' == 'Windows'">
+    <Delete Files="$(TargetDir)Melanchall_DryWetMidi_Native64.dylib;$(PublishDir)Melanchall_DryWetMidi_Native64.dylib" />
+  </Target>
+
 </Project>

@@ -43,6 +43,9 @@ namespace MidiToKeyApp
         private volatile bool _isTransitioning = false;
         private volatile bool _isClosing;
         private CancellationTokenSource? _startCancellation;
+        private readonly Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> _probePorts;
+        private readonly Func<ResolvedMappingSnapshot, CancellationToken, Task> _runWarmup;
+        private readonly bool _skipWatcher;
 
         // ポート一覧の非同期更新競合防止用
         private long _refreshPortsRequestId = 0;
@@ -63,11 +66,34 @@ namespace MidiToKeyApp
         private int errorRepeatCount = 0;
 
         public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null)
+            : this(output, listener, MidiPortProbeService.ProbeAsync, skipWatcher: false)
         {
+        }
+
+        internal Form1(IKeyboardOutput? output, IMidiListener? listener,
+            Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probePorts, bool skipWatcher,
+            AppSettings? initialSettings = null,
+            Func<ResolvedMappingSnapshot, CancellationToken, Task>? runWarmup = null)
+        {
+            _probePorts = probePorts;
+            _runWarmup = runWarmup ?? ((snapshot, token) => Task.Run(() => InputWarmup.Run(snapshot, token), token));
+            _skipWatcher = skipWatcher;
             InitializeComponentProgrammatically();
             SetupDependencies(output, listener);
-            LoadInitialSettings();
-            InitWinRtWatcher();
+            if (initialSettings == null)
+            {
+                LoadInitialSettings();
+            }
+            else
+            {
+                settings = initialSettings;
+                if (settings.KeyboardLayout == "US") rbUS.Checked = true;
+                else rbJIS.Checked = true;
+                RefreshMappingList();
+                inputTracker.PublishResolvedMapping(settings);
+                UpdateHotkeyUi();
+            }
+            if (!skipWatcher) InitWinRtWatcher();
         }
         
         private void SetupDependencies(IKeyboardOutput? output = null, IMidiListener? listener = null)
@@ -255,8 +281,8 @@ namespace MidiToKeyApp
             long currentRequestId = Interlocked.Increment(ref _refreshPortsRequestId);
             var checkedPorts = isInitialLoad ? settings.SelectedPorts : GetSelectedPorts();
             // Both WinMM subprocess and DryWetMIDI enumeration can block for seconds.
-            _ = Task.Run(() => {
-                var (enumResult, outProcResult) = MidiPortProbeService.Probe(1000);
+            _ = Task.Run(async () => {
+                var (enumResult, outProcResult) = await _probePorts(1000, CancellationToken.None);
                 if (IsHandleCreated && !IsDisposed && !_isClosing)
                 {
                     try
@@ -815,7 +841,7 @@ namespace MidiToKeyApp
                 _ = System.Threading.Tasks.Task.Run(async () => {
                     try
                     {
-                        var (parentPorts, outProcResult) = MidiPortProbeService.Probe(1500);
+                        var (parentPorts, outProcResult) = await _probePorts(1500, CancellationToken.None);
                         
                         if (IsHandleCreated && !IsDisposed && !_isClosing)
                         {
@@ -870,8 +896,17 @@ namespace MidiToKeyApp
                             catch { }
                         }
 
-                        var activePorts = midiListener.GetActivePorts();
-                        await MidiDeviceDiagnostics.RunComparisonAsync("DeviceChangeDebounce", activePorts);
+                        if (parentPorts.Success)
+                        {
+                            var activePorts = midiListener.GetActivePorts();
+                            await MidiDeviceDiagnostics.RunComparisonAsync(
+                                "DeviceChangeDebounce", triggerGen, activePorts,
+                                backendResult: parentPorts, winMmResult: outProcResult);
+                        }
+                        else
+                        {
+                            DiagnosticLogger.Log("DeviceChangeDebounce", $"比較診断を省略: {parentPorts.ErrorMessage}");
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -884,6 +919,7 @@ namespace MidiToKeyApp
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+            if (_skipWatcher) return;
             DiagnosticLogger.Log("[Form1] OnShown: Performing initial port refresh.");
             RefreshPorts(true);
         }
@@ -994,7 +1030,11 @@ namespace MidiToKeyApp
         /// </summary>
         private void ToggleConversion()
         {
-            if (_isTransitioning) return;
+            if (_isTransitioning)
+            {
+                StopConversion();
+                return;
+            }
 
             if (inputTracker.IsListening)
             {
@@ -1021,6 +1061,7 @@ namespace MidiToKeyApp
             {
                 var ports = GetSelectedPorts();
                 var settingsAtStart = settings;
+                var mappingAtStart = inputTracker.GetResolvedMappingSnapshot();
                 if (ports.Count == 0)
                 {
                     MessageBox.Show("MIDIポートを選択してください", "ポート未選択");
@@ -1030,12 +1071,11 @@ namespace MidiToKeyApp
                 // 変換開始直前にも選択ポートが現在有効か検証（要件4・課題1）
                 // 選択ポートごとに親プロセス（DryWetMIDI）および新規プロセスWinMMの両方の一覧と照合する
                 lblStatus.Text = "ステータス: MIDIポート確認中";
-                var (enumResult, outProc) = await Task.Run(() =>
-                    MidiPortProbeService.Probe(1000),
-                    startCancellation.Token);
+                var (enumResult, outProc) = await _probePorts(1000, startCancellation.Token);
                 if (_isClosing || IsDisposed) return;
                 if (startCancellation.IsCancellationRequested ||
                     !ReferenceEquals(settings, settingsAtStart) ||
+                    !ReferenceEquals(inputTracker.GetResolvedMappingSnapshot(), mappingAtStart) ||
                     !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
                 {
                     lblStatus.Text = "ステータス: 停止中";
@@ -1073,7 +1113,9 @@ namespace MidiToKeyApp
                     lblStatus.Text = "ステータス: 停止中 (MIDIポート開始不可)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     MessageBox.Show(
-                        "選択されたMIDIポートを開始できませんでした。機器が取り外されているか、MIDIバックエンドに未反映の可能性があります。機器を接続し直し、midi2keyを再起動してください。",
+                        enumResult.Success
+                            ? "選択されたMIDIポートを開始できませんでした。機器が取り外されているか、MIDIバックエンドに未反映の可能性があります。機器を接続し直し、midi2keyを再起動してください。"
+                            : $"MIDIポートを確認できませんでした: {enumResult.ErrorMessage}",
                         "MIDIポート開始不可",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
@@ -1090,8 +1132,7 @@ namespace MidiToKeyApp
                     LatencyMeasurement.RecordInputWarmupAttempt();
                     try
                     {
-                        await Task.Run(() => InputWarmup.Run(warmupSnapshot, startCancellation.Token),
-                            startCancellation.Token);
+                        await _runWarmup(warmupSnapshot, startCancellation.Token);
                         LatencyMeasurement.RecordInputWarmupCompleted();
                     }
                     catch (OperationCanceledException) when (startCancellation.IsCancellationRequested)

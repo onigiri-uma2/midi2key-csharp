@@ -419,22 +419,29 @@ namespace MidiToKeyApp
             string trigger,
             long generation,
             IReadOnlyList<MidiPortInfo>? activePorts = null,
-            bool queryOutOfProcess = true)
+            bool queryOutOfProcess = true,
+            PortEnumerationResult? backendResult = null,
+            OutOfProcessWinMmResult? winMmResult = null)
         {
             string osDesc = RuntimeInformation.OSDescription;
             var active = activePorts ?? Array.Empty<MidiPortInfo>();
 
             // 各APIの列挙を取得
-            var dryWetTask = Task.Run(() => GetDryWetMidiPorts());
+            var dryWetTask = backendResult.HasValue
+                ? Task.FromResult(backendResult.Value)
+                : Task.Run(() => PortEnumerationResult.Succeeded(GetDryWetMidiPorts()));
             var inProcessWinMmTask = Task.Run(() => GetInProcessWinMmPorts());
-            var outProcessWinMmTask = queryOutOfProcess 
+            var outProcessWinMmTask = winMmResult.HasValue
+                ? Task.FromResult(winMmResult.Value)
+                : queryOutOfProcess
                 ? Task.Run(() => GetOutOfProcessWinMmResult()) 
                 : Task.FromResult(OutOfProcessWinMmResult.Failed("クエリ無効"));
             var winRtTask = GetWinRtDevicesAsync();
 
             await Task.WhenAll(dryWetTask, inProcessWinMmTask, outProcessWinMmTask, winRtTask);
 
-            var dryWet = dryWetTask.Result;
+            var dryWetResult = dryWetTask.Result;
+            var dryWet = dryWetResult.Ports;
             var inProc = inProcessWinMmTask.Result;
             var outProcResult = outProcessWinMmTask.Result;
             var winRt = winRtTask.Result;
@@ -443,7 +450,7 @@ namespace MidiToKeyApp
 
             var report = CompareEndpoints(
                 trigger,
-                PortEnumerationResult.Succeeded(dryWet),
+                dryWetResult,
                 inProcDevs,
                 outProcResult,
                 winRt,
