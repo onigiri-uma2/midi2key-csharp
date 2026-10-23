@@ -395,6 +395,32 @@ namespace MidiToKeyApp
                     new[] { unsubscribeError, disposeError }.OfType<Exception>());
         }
 
+        // Used for both rollback and unselected devices during Start. Keep collecting failures
+        // so later devices are released even when one native Dispose throws.
+        internal static void TryReleaseDuringStart(string portName, Action release,
+            List<Exception> releaseFailures, bool rollback)
+        {
+            try { release(); }
+            catch (Exception ex)
+            {
+                string context = rollback ? "開始失敗後" : "未選択ポート";
+                DiagnosticLogger.Log("Start", $"ポート '{portName}' の{context}の解放に失敗: {ex}");
+                releaseFailures.Add(new InvalidOperationException($"MIDIポート '{portName}' の{context}の解放に失敗しました。", ex));
+            }
+        }
+
+        internal static void ThrowIfStartReleaseFailed(List<Exception> releaseFailures, Action stop)
+        {
+            if (releaseFailures.Count == 0) return;
+            try { stop(); }
+            catch (Exception ex)
+            {
+                DiagnosticLogger.Log("Start", $"開始中断時のポート停止にも失敗: {ex}");
+                releaseFailures.Add(ex);
+            }
+            throw new AggregateException("MIDIポートの解放に失敗しました。機器を接続し直し、アプリを再起動してください。", releaseFailures);
+        }
+
         /// <summary>
         /// 指定されたポート名のMIDIデバイスを開き、イベントの監視を開始します。
         /// 変換開始時ポート数スナップショットを保持し、セッション間の独立性を保ちます。
@@ -416,6 +442,7 @@ namespace MidiToKeyApp
 
             var openedPorts = new List<MidiPortInfo>();
             var failedPorts = new List<MidiPortError>();
+            var releaseFailures = new List<Exception>();
 
             ICollection<InputDevice> allDevices;
             try
@@ -436,19 +463,20 @@ namespace MidiToKeyApp
 
             foreach (var device in allDevices)
             {
-                int matchedIndex = remainingRequestedPorts.FindIndex(name => string.Equals(name, device.Name, StringComparison.OrdinalIgnoreCase));
-                if (matchedIndex >= 0)
+                string deviceName = device.Name;
+                int matchedIndex = remainingRequestedPorts.FindIndex(name => string.Equals(name, deviceName, StringComparison.OrdinalIgnoreCase));
+                if (matchedIndex >= 0 && releaseFailures.Count == 0)
                 {
                     string targetPortName = remainingRequestedPorts[matchedIndex];
                     remainingRequestedPorts.RemoveAt(matchedIndex);
 
                     int instId = Interlocked.Increment(ref _instanceCounter);
-                    string deviceId = $"{device.Name}#{instId}";
+                    string deviceId = $"{deviceName}#{instId}";
                     var info = new OpenDeviceInfo
                     {
                         Device = device,
                         DeviceId = deviceId,
-                        DeviceName = device.Name,
+                        DeviceName = deviceName,
                         Generation = gen,
                         State = DeviceState.Opening
                     };
@@ -496,7 +524,7 @@ namespace MidiToKeyApp
                             }
                         }
 
-                        openedPorts.Add(new MidiPortInfo(deviceId, device.Name, DeviceState.Active));
+                        openedPorts.Add(new MidiPortInfo(deviceId, deviceName, DeviceState.Active));
                     }
                     catch (Exception ex)
                     {
@@ -514,17 +542,7 @@ namespace MidiToKeyApp
                             info.PendingEvents.Clear();
                         }
 
-                        try
-                        {
-                            device.EventReceived -= OnEventReceived;
-                        }
-                        catch { }
-
-                        try
-                        {
-                            device.Dispose();
-                        }
-                        catch { }
+                        TryReleaseDuringStart(targetPortName, () => ReleaseDevice(info), releaseFailures, rollback: true);
 
                         failedPorts.Add(new MidiPortError(targetPortName, ex.Message, ex));
                     }
@@ -532,11 +550,7 @@ namespace MidiToKeyApp
                 else
                 {
                     // 監視対象でないデバイスは解放
-                    try
-                    {
-                        device.Dispose();
-                    }
-                    catch { }
+                    TryReleaseDuringStart(deviceName, device.Dispose, releaseFailures, rollback: false);
                 }
             }
 
@@ -545,6 +559,9 @@ namespace MidiToKeyApp
             {
                 failedPorts.Add(new MidiPortError(missingPort, "ポートが見つかりませんでした。"));
             }
+
+            // Stop attempts every opened port; the AggregateException latches failure in MidiListenerLifecycle.
+            ThrowIfStartReleaseFailed(releaseFailures, Stop);
 
             DiagnosticLogger.Log("Start", $"ポート開始完了: Gen={gen}, 成功={openedPorts.Count}, 失敗={failedPorts.Count}");
             return new MidiPortStartResult(gen, openedPorts, failedPorts);

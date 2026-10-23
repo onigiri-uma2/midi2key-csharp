@@ -66,6 +66,33 @@ public sealed class MidiListenerLifecycleTests
     }
 
     [TestMethod]
+    public void StartReleaseFailure_ContinuesReleasingDevices_StopsOpenedDevices_AndReportsFailure()
+    {
+        Type listenerType = typeof(MidiListener);
+        MethodInfo tryRelease = listenerType.GetMethod("TryReleaseDuringStart", BindingFlags.Static | BindingFlags.NonPublic)!;
+        MethodInfo throwIfFailed = listenerType.GetMethod("ThrowIfStartReleaseFailed", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var errors = new List<Exception>();
+        int failedReleaseCount = 0;
+        int laterReleaseCount = 0;
+        int openedDevicesStopCount = 0;
+
+        tryRelease.Invoke(null, new object[] { "Failing unselected", (Action)(() =>
+        {
+            Interlocked.Increment(ref failedReleaseCount);
+            throw new InvalidOperationException("fake dispose failure");
+        }), errors, false });
+        tryRelease.Invoke(null, new object[] { "Later unselected", (Action)(() => Interlocked.Increment(ref laterReleaseCount)), errors, false });
+
+        var wrapped = Assert.ThrowsException<TargetInvocationException>(() =>
+            throwIfFailed.Invoke(null, new object[] { errors, (Action)(() => Interlocked.Increment(ref openedDevicesStopCount)) }));
+
+        Assert.IsInstanceOfType<AggregateException>(wrapped.InnerException);
+        Assert.AreEqual(1, failedReleaseCount);
+        Assert.AreEqual(1, laterReleaseCount, "A failed native release must not skip later devices.");
+        Assert.AreEqual(1, openedDevicesStopCount, "Previously opened devices must be stopped after a release failure.");
+    }
+
+    [TestMethod]
     public void HealthCheck_DisposeFailureEmitsSafetyStopNotification_AndRemovesInputDevice()
     {
         using var listener = new MidiListener();

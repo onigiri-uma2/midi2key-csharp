@@ -345,6 +345,145 @@ public sealed class Form1StartLifecycleTests
         }
     }
 
+    [TestMethod]
+    public async Task CaptureReenterWhileNativeStopIsPending_RestartsOnceAfterCleanup()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1);
+                Assert.IsTrue(form.CapturingForTest);
+
+                listener.StopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.EndCaptureForTest();
+                await listener.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                form.BeginCaptureForTest();
+                await Task.Delay(50);
+                Assert.AreEqual(1, listener.StartCount, "Reentry must wait for the outstanding native stop.");
+
+                listener.ReleaseStop.TrySetResult();
+                await WaitUntilAsync(() => listener.StartCount == 2 && form.CapturingForTest);
+                await Task.Delay(50);
+                Assert.AreEqual(2, listener.StartCount, "One reentry must create exactly one capture session.");
+                Assert.AreEqual(1, listener.StopCount);
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task CaptureReentryThenLeave_DoesNotStartAfterPendingStopCompletes()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1);
+                listener.StopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.EndCaptureForTest();
+                await listener.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+                form.BeginCaptureForTest();
+                form.EndCaptureForTest();
+                listener.ReleaseStop.TrySetResult();
+                await WaitUntilAsync(() => !form.CapturingForTest);
+                await Task.Delay(100);
+                Assert.AreEqual(1, listener.StartCount, "A stale reentry continuation must not open MIDI after leave.");
+                Assert.AreEqual(1, listener.StopCount);
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task CaptureReentryThenConversion_DoesNotStartCaptureAfterPendingStopCompletes()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1);
+                listener.StopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.EndCaptureForTest();
+                await listener.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+                form.BeginCaptureForTest();
+                form.StartForTest();
+                listener.ReleaseStop.TrySetResult();
+                await WaitUntilAsync(() => listener.StartCount == 2 && form.ListeningForTest);
+                await Task.Delay(100);
+                Assert.AreEqual(2, listener.StartCount, "The stale capture continuation must not replace the conversion session.");
+                Assert.IsTrue(form.ListeningForTest, "Conversion should remain the active session after the stale capture continuation finishes.");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task CaptureReentryThenFormClosing_DoesNotStartAfterPendingStopCompletes()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1);
+                listener.StopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.EndCaptureForTest();
+                await listener.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+                form.BeginCaptureForTest();
+                form.SimulateFormClosingForTest();
+                listener.ReleaseStop.TrySetResult();
+                await WaitUntilAsync(() => !form.CapturingForTest);
+                await Task.Delay(100);
+                Assert.AreEqual(1, listener.StartCount, "A late capture continuation must not open MIDI after form closing begins.");
+                Assert.IsTrue(listener.StopCount >= 1, "Form closing should finish the pending MIDI cleanup.");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
     private static async Task RunFormAsync(
         Func<TestForm, Task> scenario,
         FakeMidiListener listener,
@@ -432,9 +571,20 @@ public sealed class Form1StartLifecycleTests
 
         public bool TransitioningForTest => (bool)typeof(Form1).GetField("_isTransitioning", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
         public bool ListeningForTest => typeof(Form1).GetField("inputTracker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this) is InputTracker tracker && tracker.IsListening;
+        public bool CapturingForTest => typeof(Form1).GetField("inputTracker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this) is InputTracker tracker && tracker.IsCapturing;
         public string StatusForTest => ((Label)typeof(Form1).GetField("lblStatus", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).Text;
 
         public void StartForTest() => typeof(Form1).GetMethod("StartConversion", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, null);
+
+        public void BeginCaptureForTest()
+        {
+            var note = (TextBox)typeof(Form1).GetField("txtNote", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+            note.Focus();
+            if (note.Focused)
+                typeof(Form1).GetMethod("StartCapture", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, null);
+        }
+
+        public void EndCaptureForTest() => typeof(Form1).GetMethod("StopCapture", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, new object?[] { null });
 
         public void SendHotkeyForTest()
         {

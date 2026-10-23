@@ -46,6 +46,7 @@ namespace MidiToKeyApp
         private CancellationTokenSource? _startCancellation;
         private CancellationTokenSource? _captureCancellation;
         private long _captureGeneration;
+        private long _captureAttemptId;
         private static readonly TimeSpan MidiStartTimeout = TimeSpan.FromSeconds(3);
         private readonly Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> _probePorts;
         private readonly Func<ResolvedMappingSnapshot, CancellationToken, Task> _runWarmup;
@@ -1064,39 +1065,57 @@ namespace MidiToKeyApp
 
         private async void StartCapture()
         {
-            if (_isClosing || _isTransitioning || _captureCancellation != null) return;
-            if (midiLifecycle.IsBusy)
-            {
-                lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
-                lblStatus.ForeColor = Color.DarkGoldenrod;
-                return;
-            }
+            if (_isClosing || IsDisposed || _isTransitioning || inputTracker.IsListening ||
+                _captureGeneration != 0 || (_captureCancellation != null && !_captureCancellation.IsCancellationRequested)) return;
             var ports = GetSelectedPorts();
             if (ports.Count == 0) return;
             var cancellation = new CancellationTokenSource();
             _captureCancellation = cancellation;
-            long generation = inputTracker.StartCaptureSession();
-            _captureGeneration = generation;
+            long attemptId = ++_captureAttemptId;
+            long generation = 0;
             try
             {
+                if (midiLifecycle.IsBusy)
+                {
+                    lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    await midiLifecycle.WaitForIdleAsync().WaitAsync(MidiStartTimeout, cancellation.Token);
+                }
+                if (attemptId != _captureAttemptId || _isClosing || IsDisposed ||
+                    _isTransitioning || inputTracker.IsListening || cancellation.IsCancellationRequested ||
+                    !txtNote.Focused || !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase)) return;
+
+                generation = inputTracker.StartCaptureSession();
+                _captureGeneration = generation;
                 await midiLifecycle.StartAsync(ports, generation, null, cancellation.Token)
                     .WaitAsync(MidiStartTimeout, cancellation.Token);
-                if (_isClosing || IsDisposed || cancellation.IsCancellationRequested ||
+                if (attemptId != _captureAttemptId || _isClosing || IsDisposed || _isTransitioning ||
+                    cancellation.IsCancellationRequested || inputTracker.IsListening ||
                     !txtNote.Focused || inputTracker.CurrentSessionId != generation ||
                     !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
                     StopCapture(generation);
+                else if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal))
+                {
+                    lblStatus.Text = "ステータス: 停止中";
+                    lblStatus.ForeColor = Color.Red;
+                }
             }
             catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
             {
                 cancellation.Cancel();
-                StopCapture(generation);
+                if (generation != 0 && attemptId == _captureAttemptId) StopCapture(generation);
                 if (ex is TimeoutException)
                     DiagnosticLogger.Log("Capture", "MIDIキャプチャ開始が時間内に完了しませんでした。");
             }
             catch (Exception ex)
             {
-                StopCapture(generation);
+                if (generation != 0 && attemptId == _captureAttemptId) StopCapture(generation);
                 DiagnosticLogger.Log("Capture", $"MIDIキャプチャ開始失敗: {ex}");
+                if (!_isClosing && !IsDisposed && midiLifecycle.HasReleaseFailure)
+                {
+                    lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
+                    lblStatus.ForeColor = Color.DarkOrange;
+                }
             }
             finally
             {
@@ -1107,13 +1126,16 @@ namespace MidiToKeyApp
 
         private void StopCapture(long? expectedGeneration = null)
         {
-            if (_captureGeneration == 0 ||
-                (expectedGeneration.HasValue && _captureGeneration != expectedGeneration.Value) ||
-                inputTracker.CurrentSessionId != _captureGeneration || inputTracker.IsListening)
+            if (expectedGeneration.HasValue && _captureGeneration != expectedGeneration.Value)
                 return;
 
-            _captureGeneration = 0;
+            ++_captureAttemptId;
             _captureCancellation?.Cancel();
+            long generation = _captureGeneration;
+            _captureGeneration = 0;
+            if (generation == 0 || inputTracker.CurrentSessionId != generation || inputTracker.IsListening)
+                return;
+
             inputTracker.StopCaptureSession();
             ObserveMidiStop(midiLifecycle.StopAsync());
         }
@@ -1167,7 +1189,7 @@ namespace MidiToKeyApp
             {
                 // A hotkey can start conversion while the note field still owns a capture.
                 // Retire that generation before waiting for its native stop.
-                if (_captureGeneration != 0) StopCapture(_captureGeneration);
+                StopCapture();
                 if (midiLifecycle.IsBusy)
                 {
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
@@ -1400,7 +1422,7 @@ namespace MidiToKeyApp
         private void StopConversion()
         {
             _startCancellation?.Cancel();
-            _captureCancellation?.Cancel();
+            StopCapture();
 
             DiagnosticLogger.Log($"[Form1] StopConversion invoked. CurrentGen={inputTracker.CurrentSessionId}");
 
