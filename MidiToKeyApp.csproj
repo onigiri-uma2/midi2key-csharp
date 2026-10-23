@@ -41,4 +41,18 @@
     <Delete Files="$(TargetDir)Melanchall_DryWetMidi_Native64.dylib;$(PublishDir)Melanchall_DryWetMidi_Native64.dylib" />
   </Target>
 
+  <PropertyGroup>
+    <CreateWindowsReleaseArchive Condition="'$(OS)' == 'Windows_NT' and '$(Configuration)' == 'Release' and '$(RuntimeIdentifier)' == 'win-x64' and '$(SelfContained)' == 'true' and '$(PublishSingleFile)' == 'true'">true</CreateWindowsReleaseArchive>
+  </PropertyGroup>
+
+  <Target Name="RemovePreviousWindowsReleaseArchive" BeforeTargets="Restore;Build;Publish"
+          Condition="'$(CreateWindowsReleaseArchive)' == 'true'">
+    <Delete Files="$(PublishDir)midi2key.zip" />
+  </Target>
+
+  <Target Name="CreateWindowsReleaseArchive" AfterTargets="Publish"
+          Condition="'$(CreateWindowsReleaseArchive)' == 'true'">
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\package-publish.ps1&quot; -Executable &quot;$(PublishDir)midi2key.exe&quot; -Archive &quot;$(PublishDir)midi2key.zip&quot;" />
+  </Target>
+
 </Project>

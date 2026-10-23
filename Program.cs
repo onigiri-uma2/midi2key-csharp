@@ -67,14 +67,30 @@ namespace MidiToKeyApp
             }
             finally
             {
-                if (LatencyMeasurement.Enabled)
+                if (LatencyMeasurement.Enabled || LatencyMeasurement.ExportPending)
                 {
                     var export = LatencyMeasurement.ExportAfterStop();
-                    if (!export.Success)
+                    while (!export.Success)
                     {
-                        MessageBox.Show(export.PathOrError, "遅延計測の保存に失敗", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        var choice = MessageBox.Show(
+                            $"{export.PathOrError}\n\n計測結果はメモリに残っています。別の保存先を選んで再試行しますか？\nキャンセルすると計測結果は保存されません。",
+                            "遅延計測の保存に失敗", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning);
+                        if (choice != DialogResult.Retry) break;
+
+                        using var dialog = new SaveFileDialog
+                        {
+                            Title = "遅延計測結果の保存先を選択",
+                            Filter = "JSON ファイル (*.json)|*.json|すべてのファイル (*.*)|*.*",
+                            DefaultExt = "json",
+                            AddExtension = true,
+                            CheckFileExists = false,
+                            OverwritePrompt = false,
+                            FileName = $"latency-{DateTime.Now:yyyyMMdd-HHmmss}.json"
+                        };
+                        if (dialog.ShowDialog() != DialogResult.OK) continue;
+                        export = LatencyMeasurement.ExportAfterStop(dialog.FileName);
                     }
-                    else
+                    if (export.Success)
                     {
                         MessageBox.Show($"遅延計測結果を保存しました:\n{export.PathOrError}", "遅延計測", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }

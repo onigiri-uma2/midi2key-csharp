@@ -21,18 +21,26 @@ namespace MidiToKeyApp
         private static long _nextTrace;
         private static long _nextSend;
         private static bool _enabled;
+        private static bool _exportPending;
+        private static bool _exportInProgress;
         private static string? _requestedPath;
         private static DateTimeOffset _startedUtc;
+        private static DateTimeOffset _endedUtc;
         private static bool _inputWarmupEnabled = true;
         private static int _inputWarmupAttempts;
         private static int _inputWarmupCompleted;
         private static int _inputWarmupFailures;
+        private static bool _stoppedWarmupEnabled;
+        private static int _stoppedWarmupAttempts;
+        private static int _stoppedWarmupCompleted;
+        private static int _stoppedWarmupFailures;
 
         [ThreadStatic] private static long _currentTrace;
         [ThreadStatic] private static long _pendingSend;
         [ThreadStatic] private static long _pendingSendBeforeTicks;
 
         public static bool Enabled => Volatile.Read(ref _enabled);
+        public static bool ExportPending { get { lock (Gate) return _exportPending; } }
 
         public static void ConfigureInputWarmup(bool enabled) => Volatile.Write(ref _inputWarmupEnabled, enabled);
 
@@ -72,6 +80,7 @@ namespace MidiToKeyApp
             lock (Gate)
             {
                 if (_enabled) return;
+                if (_exportPending) throw new InvalidOperationException("未保存の遅延計測結果があります。");
                 _count = 0;
                 _dropped = 0;
                 _nextTrace = 0;
@@ -79,9 +88,14 @@ namespace MidiToKeyApp
                 _inputWarmupAttempts = 0;
                 _inputWarmupCompleted = 0;
                 _inputWarmupFailures = 0;
+                _stoppedWarmupEnabled = false;
+                _stoppedWarmupAttempts = 0;
+                _stoppedWarmupCompleted = 0;
+                _stoppedWarmupFailures = 0;
                 Points = new TracePoint[Capacity];
                 _requestedPath = outputPath;
                 _startedUtc = DateTimeOffset.UtcNow;
+                _endedUtc = default;
                 Volatile.Write(ref _enabled, true);
             }
         }
@@ -131,6 +145,7 @@ namespace MidiToKeyApp
             // therefore measures the native call, excluding trace-buffer contention.
             lock (Gate)
             {
+                if (!_enabled) return;
                 if (_count <= Capacity - 2)
                 {
                     Points[_count++] = new TracePoint(_currentTrace, _pendingSend, "sendinput_before", _pendingSendBeforeTicks);
@@ -146,6 +161,7 @@ namespace MidiToKeyApp
         {
             lock (Gate)
             {
+                if (!_enabled) return;
                 if (_count < Capacity) Points[_count++] = point;
                 else _dropped++;
             }
@@ -156,6 +172,8 @@ namespace MidiToKeyApp
             lock (Gate)
             {
                 Volatile.Write(ref _enabled, false);
+                _exportPending = false;
+                _exportInProgress = false;
                 _count = 0;
                 _dropped = 0;
                 _nextTrace = 0;
@@ -163,64 +181,113 @@ namespace MidiToKeyApp
                 _inputWarmupAttempts = 0;
                 _inputWarmupCompleted = 0;
                 _inputWarmupFailures = 0;
+                _stoppedWarmupEnabled = false;
+                _stoppedWarmupAttempts = 0;
+                _stoppedWarmupCompleted = 0;
+                _stoppedWarmupFailures = 0;
                 _inputWarmupEnabled = true;
                 Points = Array.Empty<TracePoint>();
                 _requestedPath = null;
+                _endedUtc = default;
                 _currentTrace = 0;
                 _pendingSend = 0;
                 _pendingSendBeforeTicks = 0;
             }
         }
 
-        /// <summary>Write once after all listeners have stopped; never overwrites an existing file.</summary>
-        public static (bool Success, string PathOrError) ExportAfterStop()
+        /// <summary>Write after all listeners have stopped. Failed exports retain data for a retry.</summary>
+        public static (bool Success, string PathOrError) ExportAfterStop(string? outputPath = null)
         {
-            if (!Enabled) return (true, "計測無効");
-            Volatile.Write(ref _enabled, false);
             TracePoint[] snapshot;
             long dropped;
+            string path;
+            DateTimeOffset endedUtc;
+            bool warmupEnabled;
+            int warmupAttempts;
+            int warmupCompleted;
+            int warmupFailures;
             lock (Gate)
             {
+                if (_exportInProgress) return (false, "遅延計測結果を保存中です。しばらくしてから再試行してください。");
+                if (!_enabled && !_exportPending) return (true, "計測無効");
+                if (_enabled)
+                {
+                    Volatile.Write(ref _enabled, false);
+                    _endedUtc = DateTimeOffset.UtcNow;
+                    _stoppedWarmupEnabled = Volatile.Read(ref _inputWarmupEnabled);
+                    _stoppedWarmupAttempts = Volatile.Read(ref _inputWarmupAttempts);
+                    _stoppedWarmupCompleted = Volatile.Read(ref _inputWarmupCompleted);
+                    _stoppedWarmupFailures = Volatile.Read(ref _inputWarmupFailures);
+                    _exportPending = true;
+                }
                 snapshot = new TracePoint[_count];
                 Array.Copy(Points, snapshot, _count);
                 dropped = _dropped;
-                Points = Array.Empty<TracePoint>();
-                _count = 0;
+                _requestedPath = outputPath ?? _requestedPath ?? Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "midi2key", $"latency-{_startedUtc:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.json");
+                path = _requestedPath;
+                endedUtc = _endedUtc;
+                warmupEnabled = _stoppedWarmupEnabled;
+                warmupAttempts = _stoppedWarmupAttempts;
+                warmupCompleted = _stoppedWarmupCompleted;
+                warmupFailures = _stoppedWarmupFailures;
+                _exportInProgress = true;
             }
 
-            string path = _requestedPath ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "midi2key", $"latency-{_startedUtc:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.json");
+            string? temporaryPath = null;
             try
             {
-                var directory = Path.GetDirectoryName(Path.GetFullPath(path));
-                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-                using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                string fullPath = Path.GetFullPath(path);
+                string directory = Path.GetDirectoryName(fullPath)!;
+                Directory.CreateDirectory(directory);
+                temporaryPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+                using var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
                 JsonSerializer.Serialize(stream, new
                 {
                     schemaVersion = 2,
                     source = "native-instrumentation",
                     inputWarmup = new
                     {
-                        enabled = Volatile.Read(ref _inputWarmupEnabled),
-                        attempts = Volatile.Read(ref _inputWarmupAttempts),
-                        completed = Volatile.Read(ref _inputWarmupCompleted),
-                        failures = Volatile.Read(ref _inputWarmupFailures),
+                        enabled = warmupEnabled,
+                        attempts = warmupAttempts,
+                        completed = warmupCompleted,
+                        failures = warmupFailures,
                         scope = "managed InputTracker and KeySimulator with no-op output; excludes MidiListener and native SendInput"
                     },
                     startedUtc = _startedUtc,
-                    endedUtc = DateTimeOffset.UtcNow,
+                    endedUtc,
                     stopwatchFrequency = Stopwatch.Frequency,
                     capacity = Capacity,
                     droppedPoints = dropped,
                     notes = "Each trace starts at MidiListener.OnEventReceived. A trace can have zero or multiple native sends. No send means no native SendInput was observed; inspect suppressed points. Times include callback locks and processing. Missing return may indicate an exception or a full buffer.",
                     points = snapshot
                 }, new JsonSerializerOptions { WriteIndented = true });
-                return (true, Path.GetFullPath(path));
+                stream.Flush(true);
+                stream.Close();
+                File.Move(temporaryPath, fullPath);
+                temporaryPath = null;
+                lock (Gate)
+                {
+                    Points = Array.Empty<TracePoint>();
+                    _count = 0;
+                    _exportPending = false;
+                }
+                return (true, fullPath);
             }
             catch (Exception ex)
             {
                 return (false, $"計測結果を保存できませんでした ({path}): {ex.Message}");
+            }
+            finally
+            {
+                if (temporaryPath != null)
+                {
+                    try { File.Delete(temporaryPath); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+                lock (Gate) _exportInProgress = false;
             }
         }
     }

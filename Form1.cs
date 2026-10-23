@@ -35,6 +35,7 @@ namespace MidiToKeyApp
         
         private IKeyboardMouseEvents? globalHook;
         private IMidiListener midiListener = null!;
+        private MidiListenerLifecycle midiLifecycle = null!;
         private KeySimulator keySimulator = null!;
         private InputTracker inputTracker = null!;
         private readonly HotkeyManager hotkeyManager = new();
@@ -43,6 +44,9 @@ namespace MidiToKeyApp
         private volatile bool _isTransitioning = false;
         private volatile bool _isClosing;
         private CancellationTokenSource? _startCancellation;
+        private CancellationTokenSource? _captureCancellation;
+        private long _captureGeneration;
+        private static readonly TimeSpan MidiStartTimeout = TimeSpan.FromSeconds(3);
         private readonly Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> _probePorts;
         private readonly Func<ResolvedMappingSnapshot, CancellationToken, Task> _runWarmup;
         private readonly bool _skipWatcher;
@@ -101,6 +105,7 @@ namespace MidiToKeyApp
             keySimulator = new KeySimulator(output);
             inputTracker = new InputTracker(keySimulator, () => settings);
             midiListener = listener ?? new MidiListener();
+            midiLifecycle = new MidiListenerLifecycle(midiListener);
 
             // ノート/ペダル取得（キャプチャモード）時のUI非同期更新（デッドロック防止）
             inputTracker.OnInputCaptured += (capturedText) => {
@@ -521,9 +526,7 @@ namespace MidiToKeyApp
             txtNote.Enter += (s, e) => {
                 if (!inputTracker.IsListening)
                 {
-                    // 停止中のキャプチャ開始: InputTracker側でGenerationを発行してリスナーに渡す
-                    long gen = inputTracker.StartCaptureSession();
-                    midiListener.Start(GetSelectedPorts(), gen);
+                    StartCapture();
                 }
                 else
                 {
@@ -535,8 +538,7 @@ namespace MidiToKeyApp
                 if (!inputTracker.IsListening)
                 {
                     // 停止中のキャプチャ終了: キャプチャ専用リスナーを停止
-                    inputTracker.StopCaptureSession();
-                    midiListener.Stop();
+                    StopCapture();
                 }
                 else
                 {
@@ -847,7 +849,7 @@ namespace MidiToKeyApp
                         {
                             try
                             {
-                                BeginInvoke(new Action(() => {
+                                BeginInvoke(new Action(async () => {
                                     if (IsDisposed || _isClosing) return;
 
                                     // 要件5: 同一セッション内での古い列挙結果の後着上書き防止
@@ -869,12 +871,30 @@ namespace MidiToKeyApp
                                             return;
                                         }
 
-                                        var beforeActive = midiListener.GetActivePorts();
-                                        if (parentPorts.Success && midiListener is MidiListener concreteListener)
-                                            concreteListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen, parentPorts.Ports);
-                                        else if (parentPorts.Success)
-                                            midiListener.CheckDeviceHealth(osDeviceNames, outProcResult, triggerGen);
-                                        var afterActive = midiListener.GetActivePorts();
+                                        IReadOnlyList<MidiPortInfo> beforeActive = midiListener.GetActivePorts();
+                                        IReadOnlyList<MidiPortInfo> afterActive = beforeActive;
+                                        if (parentPorts.Success && !midiLifecycle.IsBusy)
+                                        {
+                                            try
+                                            {
+                                                (beforeActive, afterActive) = await midiLifecycle.CheckHealthAsync(
+                                                    osDeviceNames, outProcResult, triggerGen, parentPorts.Ports)
+                                                    .WaitAsync(MidiStartTimeout);
+                                            }
+                                            catch (TimeoutException)
+                                            {
+                                                DiagnosticLogger.Log("DeviceHealth", "MIDIデバイス確認が時間内に完了しませんでした。");
+                                                StopConversion();
+                                                return;
+                                            }
+                                            catch (InvalidOperationException) { return; }
+                                            catch (Exception ex)
+                                            {
+                                                DiagnosticLogger.Log("DeviceHealth", $"MIDIデバイス確認失敗: {ex}");
+                                                return;
+                                            }
+                                            if (_isClosing || IsDisposed || triggerGen != inputTracker.CurrentSessionId) return;
+                                        }
                                         RefreshPorts(false);
 
                                         // 監視中デバイスの切断は HandleDeviceDisconnected で通知される。
@@ -1046,6 +1066,85 @@ namespace MidiToKeyApp
             }
         }
 
+        private async void StartCapture()
+        {
+            if (_isClosing || _isTransitioning || _captureCancellation != null) return;
+            if (midiLifecycle.IsBusy)
+            {
+                lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
+                lblStatus.ForeColor = Color.DarkGoldenrod;
+                return;
+            }
+            var ports = GetSelectedPorts();
+            if (ports.Count == 0) return;
+            var cancellation = new CancellationTokenSource();
+            _captureCancellation = cancellation;
+            long generation = inputTracker.StartCaptureSession();
+            _captureGeneration = generation;
+            try
+            {
+                await midiLifecycle.StartAsync(ports, generation, null, cancellation.Token)
+                    .WaitAsync(MidiStartTimeout, cancellation.Token);
+                if (_isClosing || IsDisposed || cancellation.IsCancellationRequested ||
+                    !txtNote.Focused || inputTracker.CurrentSessionId != generation ||
+                    !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
+                    StopCapture(generation);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
+            {
+                cancellation.Cancel();
+                StopCapture(generation);
+                if (ex is TimeoutException)
+                    DiagnosticLogger.Log("Capture", "MIDIキャプチャ開始が時間内に完了しませんでした。");
+            }
+            catch (Exception ex)
+            {
+                StopCapture(generation);
+                DiagnosticLogger.Log("Capture", $"MIDIキャプチャ開始失敗: {ex}");
+            }
+            finally
+            {
+                if (ReferenceEquals(_captureCancellation, cancellation)) _captureCancellation = null;
+                cancellation.Dispose();
+            }
+        }
+
+        private void StopCapture(long? expectedGeneration = null)
+        {
+            if (_captureGeneration == 0 ||
+                (expectedGeneration.HasValue && _captureGeneration != expectedGeneration.Value) ||
+                inputTracker.CurrentSessionId != _captureGeneration || inputTracker.IsListening)
+                return;
+
+            _captureGeneration = 0;
+            _captureCancellation?.Cancel();
+            inputTracker.StopCaptureSession();
+            ObserveMidiStop(midiLifecycle.StopAsync());
+        }
+
+        private async void ObserveMidiStop(Task task)
+        {
+            bool stopped = false;
+            try { await task; stopped = true; }
+            catch (Exception ex) { DiagnosticLogger.Log("MidiLifecycle", $"MIDI停止処理失敗: {ex}"); }
+            finally
+            {
+                if (!_isClosing && !IsDisposed && !inputTracker.IsListening &&
+                    !_isTransitioning && !midiLifecycle.IsBusy &&
+                    lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal))
+                {
+                    lblStatus.Text = stopped ? "ステータス: 停止中" : "ステータス: 停止失敗";
+                    lblStatus.ForeColor = stopped ? Color.Red : Color.DarkGoldenrod;
+                }
+            }
+        }
+
+        private static async void ObserveMidiCleanup(Task task)
+        {
+            try { await task.ConfigureAwait(false); }
+            catch (Exception ex) { DiagnosticLogger.Log("MidiLifecycle", $"MIDI停止処理失敗: {ex}"); }
+        }
+
         /// <summary>
         /// 変換処理を開始します。ポート開始結果（全成功・一部成功・全失敗）に応じた適切な処理とロールバックを行います。
         /// </summary>
@@ -1059,6 +1158,17 @@ namespace MidiToKeyApp
 
             try
             {
+                // A hotkey can start conversion while the note field still owns a capture.
+                // Retire that generation before waiting for its native stop.
+                if (_captureGeneration != 0) StopCapture(_captureGeneration);
+                if (midiLifecycle.IsBusy)
+                {
+                    lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    await midiLifecycle.WaitForIdleAsync().WaitAsync(MidiStartTimeout, startCancellation.Token);
+                    if (_isClosing || IsDisposed || startCancellation.IsCancellationRequested) return;
+                }
+
                 var ports = GetSelectedPorts();
                 var settingsAtStart = settings;
                 var mappingAtStart = inputTracker.GetResolvedMappingSnapshot();
@@ -1171,9 +1281,20 @@ namespace MidiToKeyApp
 
                 long sessionId = inputTracker.StartConversionSession();
                 sessionStarted = true;
+                var mappingForSession = inputTracker.GetResolvedMappingSnapshot();
                 DiagnosticLogger.Log($"[Form1] StartConversion invoked. Generated Gen={sessionId}, Ports=[{string.Join(", ", ports)}]");
                 var snapshot = InitialPortSnapshot.FromOutOfProcessResult(sessionId, outProc);
-                var startResult = midiListener.Start(ports, sessionId, snapshot);
+                var startResult = await midiLifecycle.StartAsync(ports, sessionId, snapshot, startCancellation.Token)
+                    .WaitAsync(MidiStartTimeout, startCancellation.Token);
+                if (_isClosing || IsDisposed || startCancellation.IsCancellationRequested ||
+                    !ReferenceEquals(settings, settingsAtStart) ||
+                    !ReferenceEquals(inputTracker.GetResolvedMappingSnapshot(), mappingForSession) ||
+                    !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
+                {
+                    inputTracker.StopSession();
+                    ObserveMidiCleanup(midiLifecycle.StopAsync());
+                    return;
+                }
 
                 if (startResult.IsAllFailed)
                 {
@@ -1217,10 +1338,29 @@ namespace MidiToKeyApp
             }
             catch (OperationCanceledException) when (startCancellation.IsCancellationRequested)
             {
+                if (sessionStarted)
+                {
+                    inputTracker.StopSession();
+                    ObserveMidiCleanup(midiLifecycle.StopAsync());
+                }
                 if (!_isClosing && !IsDisposed)
                 {
                     lblStatus.Text = "ステータス: 停止中";
                     lblStatus.ForeColor = Color.Red;
+                }
+            }
+            catch (TimeoutException)
+            {
+                startCancellation.Cancel();
+                if (sessionStarted)
+                {
+                    inputTracker.StopSession();
+                    ObserveMidiCleanup(midiLifecycle.StopAsync());
+                }
+                if (!_isClosing && !IsDisposed)
+                {
+                    lblStatus.Text = "ステータス: 停止中 (MIDI開始待機がタイムアウト)";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
                 }
             }
             catch (Exception ex)
@@ -1230,8 +1370,7 @@ namespace MidiToKeyApp
                 {
                     try { inputTracker.StopSession(); }
                     catch (Exception cleanupEx) { DiagnosticLogger.Log("StartConversion", $"入力状態の復旧失敗: {cleanupEx}"); }
-                    try { midiListener.Stop(); }
-                    catch (Exception cleanupEx) { DiagnosticLogger.Log("StartConversion", $"ポート停止失敗: {cleanupEx}"); }
+                    ObserveMidiCleanup(midiLifecycle.StopAsync());
                 }
                 if (!_isClosing && !IsDisposed)
                 {
@@ -1249,46 +1388,34 @@ namespace MidiToKeyApp
 
         /// <summary>
         /// 変換処理を安全に停止します。
-        /// デッドロック防止のため、ロック外でMIDIリスナーを停止した上で全キーを解放します。
-        /// 未解放キーが残っている場合はUIに警告表示を行います。
+        /// 入力の無効化とキー解放を直ちに行い、nativeポート停止をworkerへ依頼します。
         /// </summary>
-        private void StopConversion(bool force = false)
+        private void StopConversion()
         {
-            if (_isTransitioning && !force)
+            _startCancellation?.Cancel();
+            _captureCancellation?.Cancel();
+
+            DiagnosticLogger.Log($"[Form1] StopConversion invoked. CurrentGen={inputTracker.CurrentSessionId}");
+
+            // 新規キー送信無効化、セッション無効化、全キー解放
+            inputTracker.StopSession();
+
+            // 前のnative処理が完了した後でポートを閉じる
+            ObserveMidiStop(midiLifecycle.StopAsync());
+
+            bool allReleased = keySimulator.RetryReleasePendingKeys();
+
+            if (allReleased && !keySimulator.HasUnreleasedKeys)
             {
-                _startCancellation?.Cancel();
-                return;
+                lblStatus.Text = midiLifecycle.IsBusy
+                    ? "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)"
+                    : "ステータス: 停止中";
+                lblStatus.ForeColor = midiLifecycle.IsBusy ? Color.DarkGoldenrod : Color.Red;
             }
-            _isTransitioning = true;
-
-            try
+            else
             {
-                DiagnosticLogger.Log($"[Form1] StopConversion invoked. CurrentGen={inputTracker.CurrentSessionId}");
-
-                // (1) 新規キー送信無効化、セッション無効化、全キー解放、内部状態クリア
-                inputTracker.StopSession();
-
-                // (2) ロック外でMIDIリスナーを停止し、受信スレッドの完了を安全に待機
-                midiListener.Stop();
-
-                // (3) 未解放キーがあれば再試行
-                bool allReleased = keySimulator.RetryReleasePendingKeys();
-
-                // (4) UIステータス更新
-                if (allReleased && !keySimulator.HasUnreleasedKeys)
-                {
-                    lblStatus.Text = "ステータス: 停止中";
-                    lblStatus.ForeColor = Color.Red;
-                }
-                else
-                {
-                    lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
-                    lblStatus.ForeColor = Color.DarkOrange;
-                }
-            }
-            finally
-            {
-                _isTransitioning = false;
+                lblStatus.Text = $"ステータス: 停止中 (警告: 未解放キー {keySimulator.UnreleasedKeysCount} 件)";
+                lblStatus.ForeColor = Color.DarkOrange;
             }
         }
 
@@ -1519,15 +1646,16 @@ namespace MidiToKeyApp
         {
             _isClosing = true;
             _startCancellation?.Cancel();
+            _captureCancellation?.Cancel();
             Interlocked.Increment(ref _refreshPortsRequestId);
             Interlocked.Increment(ref _healthCheckRequestId);
             hotkeyManager.Unregister();
             _winRtWatcher?.Dispose();
             deviceDebounceTimer?.Stop();
             deviceDebounceTimer?.Dispose();
-            StopConversion(force: true);
+            StopConversion();
             keySimulator.RetryReleasePendingKeys();
-            midiListener?.Dispose();
+            ObserveMidiCleanup(midiLifecycle.DisposeAsync());
             if (globalHook != null)
             {
                 globalHook.KeyDown -= GlobalHook_KeyDown;

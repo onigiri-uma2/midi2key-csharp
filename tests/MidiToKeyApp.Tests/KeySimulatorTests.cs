@@ -52,6 +52,13 @@ namespace MidiToKeyApp.Tests
         public List<MidiPortInfo> ActivePorts { get; } = new();
         public HashSet<string> FailPorts { get; } = new();
         public bool FailAllPorts { get; set; } = false;
+        public TaskCompletionSource? StartEntered { get; set; }
+        public TaskCompletionSource? ReleaseStart { get; set; }
+        public TaskCompletionSource? StopEntered { get; set; }
+        public TaskCompletionSource? ReleaseStop { get; set; }
+        public bool EmitNoteAfterBlockedStart { get; set; }
+        public int StartThreadId { get; private set; }
+        public int StopThreadId { get; private set; }
         public long CurrentGeneration { get; set; } = 0;
         public InitialPortSnapshot? CurrentInitialSnapshot { get; set; } = null;
 
@@ -64,10 +71,14 @@ namespace MidiToKeyApp.Tests
 
         public MidiPortStartResult Start(IEnumerable<string> portNames, long? specificGeneration = null, InitialPortSnapshot? initialSnapshot = null)
         {
+            MidiPortStartResult result;
+            long generation;
             lock (_lock)
             {
                 StartCount++;
+                StartThreadId = Environment.CurrentManagedThreadId;
                 long gen = specificGeneration ?? (CurrentGeneration + 1);
+                generation = gen;
                 CurrentGeneration = gen;
                 StartedGenerations.Add(gen);
                 var portList = portNames.ToList();
@@ -93,15 +104,23 @@ namespace MidiToKeyApp.Tests
                     }
                 }
 
-                return new MidiPortStartResult(gen, opened, failed);
+                result = new MidiPortStartResult(gen, opened, failed);
             }
+            StartEntered?.TrySetResult();
+            ReleaseStart?.Task.GetAwaiter().GetResult();
+            if (EmitNoteAfterBlockedStart)
+                OnNoteReceived?.Invoke(new MidiNoteData("late-fake-device", "Fake Port", 0, 60, 100, true, generation));
+            return result;
         }
 
         public void Stop()
         {
+            StopEntered?.TrySetResult();
+            ReleaseStop?.Task.GetAwaiter().GetResult();
             lock (_lock)
             {
                 StopCount++;
+                StopThreadId = Environment.CurrentManagedThreadId;
                 ActivePorts.Clear();
                 _portsSeenInWinRt.Clear();
                 CurrentInitialSnapshot = null;
@@ -3676,7 +3695,7 @@ namespace MidiToKeyApp.Tests
         public void LatencyMeasurement_IsDisabledBoundedAndKeepsOverlappingTraceIds()
         {
             ResetLatencyMeasurement();
-            string tempDir = Path.Combine(Path.GetTempPath(), $"midi2key-latency-{Guid.NewGuid():N}");
+            string tempDir = Path.Combine(AppContext.BaseDirectory, $"midi2key-latency-{Guid.NewGuid():N}");
             string path = Path.Combine(tempDir, "trace.json");
             try
             {

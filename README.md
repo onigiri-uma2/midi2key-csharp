@@ -63,6 +63,7 @@
 5. **`[変換開始]` ボタンを押すと変換がスタートし**、MIDIキーボードを弾くとPCキーボードのキーが入力されるようになります。
    * ポート確認・入力準備中は、`[変換停止]` ボタンまたは開始／停止ホットキーでキャンセルできます。キャンセル後に確認結果が届いても、変換は開始しません。
    * ポート確認がタイムアウトした場合は開始を中止します。ドライバー内部の応答待ちは強制終了せず、待機中の列挙処理を重複して起動しません。応答が戻らない場合は、機器の状態を確認してアプリを再起動してください。
+   * MIDI監視の開始・停止・破棄は順番にバックグラウンドで実行します。停止要求時は入力を直ちに無効化して押下中のキーを解放します。ドライバーの停止処理が完了するまで再開始はできず、応答が戻らない場合はアプリを再起動してください。
 6. 設定を次回も使いたい場合は、**`[上書き保存]`** または **`[別名保存]`** を押して設定を保存してください。
    * **`[上書き保存]`**: 現在読み込んでいる設定ファイル（デフォルトは `settings.json`）にワンクリックで上書き保存します。
    * **`[別名保存]`**: ゲーム別・用途別の設定ファイルとして好きな名前・フォルダに保存します（保存成功後に自動で現在の読込ファイルとして適用されます）。
@@ -74,7 +75,7 @@
 
 計測JSONの `inputWarmup` には有効設定、試行・完了・失敗回数と対象範囲を記録します。ウォームアップ中の疑似イベントには `traceId` を割り当てないため、`points` には入りません。
 
-計測したい場合だけ `--measure-latency` を付けて起動します。たとえば配布版なら PowerShell で `./midi2key.exe --measure-latency`、開発版なら `dotnet run --project MidiToKeyApp.csproj -- --measure-latency` です。MIDI機器と送信先を準備し、ポートを選んで変換を開始してから演奏し、アプリを終了すると `%LOCALAPPDATA%\midi2key\latency-日時-識別子.json` に結果を保存します。任意の保存先は `--measure-latency=C:\path\latency.json` で指定できます。既存ファイルは上書きせず、保存に失敗した場合は終了時に画面で知らせます。
+計測したい場合だけ `--measure-latency` を付けて起動します。たとえば配布版なら PowerShell で `./midi2key.exe --measure-latency`、開発版なら `dotnet run --project MidiToKeyApp.csproj -- --measure-latency` です。MIDI機器と送信先を準備し、ポートを選んで変換を開始してから演奏し、アプリを終了すると `%LOCALAPPDATA%\midi2key\latency-日時-識別子.json` に結果を保存します。任意の保存先は `--measure-latency=C:\path\latency.json` で指定できます。既存ファイルは上書きしません。保存に失敗した場合、終了画面から別の保存先を選んで再試行できます。成功するか保存を中止するまで計測データはメモリに保持されます。
 
 JSON の `points` は単調時計 `Stopwatch` の tick 値です。`stopwatchFrequency` で割ると秒数になります。同じ `traceId` について `midi_callback`（DryWetMIDI の callback 入口）、`tracker_entry`（入力状態処理の入口）、`sendinput_before` と `sendinput_return`（Windows API の実呼び出し直前と戻り）を追えます。複数のキー送信は `sendId` で区別され、Shift を伴う送信も個別に現れます。`midi_identity` の `deviceId` と `generation` で接続元を区別します。抑止された入力は `suppressed` の理由を参照してください。送信がない trace は `SendInput` が観測されなかったことだけを意味します。`sendinput_return` の `success` が false なら API が失敗しています。
 
@@ -131,7 +132,7 @@ JSON の `points` は単調時計 `Stopwatch` の tick 値です。`stopwatchFre
 dotnet publish MidiToKeyApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
-正常に終了すると、`bin\Release\net10.0-windows10.0.19041.0\win-x64\publish\` フォルダの中に `midi2key.exe` がたった一つだけ（Native DLL等もすべて埋め込まれた状態で）生成されます。
+正常に終了すると、`bin\Release\net10.0-windows10.0.19041.0\win-x64\publish\` フォルダに `midi2key.exe` が生成され、同じフォルダの `midi2key.zip` も自動更新されます。ZIP の中身はその publish で作られた `midi2key.exe` だけです。publish を開始すると前回の ZIP は削除され、ビルドや ZIP 作成に失敗した場合はコマンドが失敗します。配布前には publish の成功を確認してください。
 
 Windows向けのビルド・publishでは、DryWetMIDIに同梱されたmacOS用の `Melanchall_DryWetMidi_Native64.dylib` を除外します。以前のビルドで出力先に残った同名ファイルも削除します。
 

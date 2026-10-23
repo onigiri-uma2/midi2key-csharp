@@ -237,6 +237,84 @@ public sealed class Form1StartLifecycleTests
         }
     }
 
+    [TestMethod]
+    public async Task HotkeyDuringBlockingNativeStart_ReturnsToUi_AndLateInputCannotSendKeys()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener
+        {
+            StartEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            EmitNoteAfterBlockedStart = true
+        };
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.StartForTest();
+                await listener.StartEntered!.Task.WaitAsync(TimeSpan.FromSeconds(3));
+                form.SendHotkeyForTest();
+                await WaitUntilAsync(() => !form.TransitioningForTest && !form.ListeningForTest);
+                Assert.AreEqual(0, listener.StopCount, "Native stop is queued behind the blocked start.");
+
+                listener.ReleaseStart!.TrySetResult();
+                await WaitUntilAsync(() => listener.StopCount == 1);
+                Assert.AreEqual(1, listener.StartCount);
+                Assert.AreEqual(1, listener.StopCount, "The canceled start must be stopped exactly once after it returns.");
+                Assert.AreEqual(0, form.OutputForTest.History.Count,
+                    "An input callback emitted by the late native start must be ignored after cancellation.");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStart!.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task BlockingNativeStop_DoesNotBlockWinFormsMessagePump()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.StartForTest();
+                await WaitUntilAsync(() => !form.TransitioningForTest);
+                Assert.IsTrue(form.ListeningForTest);
+
+                listener.StopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.SendHotkeyForTest();
+                await listener.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+                var uiCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                form.BeginInvoke(new Action(() => uiCallback.TrySetResult()));
+                await uiCallback.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                Assert.IsFalse(form.ListeningForTest, "Session input must be disabled before the native stop finishes.");
+                Assert.AreEqual(0, listener.StopCount, "The fake stop remains blocked until explicitly released.");
+
+                // One start click while cleanup is pending should resume after the native stop completes.
+                form.StartForTest();
+                listener.ReleaseStop.TrySetResult();
+                await WaitUntilAsync(() => !form.TransitioningForTest && listener.StartCount == 2);
+                Assert.IsTrue(form.ListeningForTest, "The queued start should become the active session after stop completes.");
+                Assert.AreEqual(1, listener.StopCount);
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStop?.TrySetResult();
+        }
+    }
+
     private static async Task RunFormAsync(
         Func<TestForm, Task> scenario,
         FakeMidiListener listener,
@@ -304,13 +382,23 @@ public sealed class Form1StartLifecycleTests
     {
         public TestForm(FakeMidiListener listener, Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probe,
             Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup)
-            : base(new FakeKeyboardOutput(), listener, probe, skipWatcher: true, initialSettings: CreateSettings(), runWarmup: warmup)
+            : this(new FakeKeyboardOutput(), listener, probe, warmup)
         {
+        }
+
+        private TestForm(FakeKeyboardOutput output, FakeMidiListener listener,
+            Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probe,
+            Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup)
+            : base(output, listener, probe, skipWatcher: true, initialSettings: CreateSettings(), runWarmup: warmup)
+        {
+            OutputForTest = output;
             var ports = (CheckedListBox)typeof(Form1).GetField("chkPorts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
             ports.Items.Add("Port A");
             ports.Items.Add("Port B");
             ports.SetItemChecked(0, true);
         }
+
+        public FakeKeyboardOutput OutputForTest { get; }
 
         public bool TransitioningForTest => (bool)typeof(Form1).GetField("_isTransitioning", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
         public bool ListeningForTest => typeof(Form1).GetField("inputTracker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this) is InputTracker tracker && tracker.IsListening;
