@@ -44,6 +44,32 @@ public sealed class MidiListenerLifecycleTests
     }
 
     [TestMethod]
+    public void GetPortNames_DisposeFailureStillAttemptsEveryDeviceAndReturnsFailure()
+    {
+        Type listenerType = typeof(MidiListener);
+        MethodInfo collect = listenerType.GetMethod("CollectPortNames", BindingFlags.Static | BindingFlags.NonPublic)!
+            .MakeGenericMethod(typeof(string));
+        var attempted = new List<string>();
+
+        var result = (PortEnumerationResult)collect.Invoke(null, new object[]
+        {
+            new[] { "first", "second", "third" },
+            (Func<string, string>)(name => name),
+            (Action<string>)(name =>
+            {
+                attempted.Add(name);
+                if (name == "first") throw new InvalidOperationException("fake dispose failure");
+            })
+        })!;
+
+        CollectionAssert.AreEqual(new[] { "first", "second", "third" }, attempted,
+            "A disposal failure must not prevent later enumerated devices from being released.");
+        Assert.IsFalse(result.Success, "Any device disposal failure makes enumeration unreliable.");
+        Assert.IsNotNull(result.Exception);
+        StringAssert.Contains(result.Exception!.Message, "fake dispose failure");
+    }
+
+    [TestMethod]
     public void Stop_DisposeFailureIsReportedAfterEveryDeviceIsTried_AndAllDevicesBecomeInactive()
     {
         using var listener = new MidiListener();

@@ -338,28 +338,35 @@ namespace MidiToKeyApp
         /// </summary>
         public static PortEnumerationResult GetPortNames()
         {
-            var names = new List<string>();
             try
             {
-                var devices = InputDevice.GetAll();
-                foreach (var device in devices)
-                {
-                    try
-                    {
-                        names.Add(device.Name);
-                    }
-                    finally
-                    {
-                        device.Dispose();
-                    }
-                }
-                return PortEnumerationResult.Succeeded(names);
+                return CollectPortNames(InputDevice.GetAll(), device => device.Name, device => device.Dispose());
             }
             catch (Exception ex)
             {
                 DiagnosticLogger.Log("GetPortNames", $"MIDIポート列挙失敗: {ex.Message}");
                 return PortEnumerationResult.Failed($"MIDIポート列挙例外: {ex.Message}", ex);
             }
+        }
+
+        internal static PortEnumerationResult CollectPortNames<T>(IEnumerable<T> devices,
+            Func<T, string> getName, Action<T> dispose)
+        {
+            var names = new List<string>();
+            var errors = new List<Exception>();
+            foreach (var device in devices)
+            {
+                try { names.Add(getName(device)); }
+                catch (Exception ex) { errors.Add(ex); }
+                try { dispose(device); }
+                catch (Exception ex) { errors.Add(ex); }
+            }
+
+            if (errors.Count == 0) return PortEnumerationResult.Succeeded(names);
+
+            var failure = new AggregateException("MIDIポート列挙中に名前の取得または解放に失敗しました。", errors);
+            DiagnosticLogger.Log("GetPortNames", $"MIDIポート列挙失敗: {failure}");
+            return PortEnumerationResult.Failed($"MIDIポート列挙例外: {failure.Message}", failure);
         }
 
         public IReadOnlyList<MidiPortInfo> GetActivePorts()

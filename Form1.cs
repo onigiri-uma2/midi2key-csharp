@@ -1087,14 +1087,32 @@ namespace MidiToKeyApp
 
                 generation = inputTracker.StartCaptureSession();
                 _captureGeneration = generation;
-                await midiLifecycle.StartAsync(ports, generation, null, cancellation.Token)
+                var startResult = await midiLifecycle.StartAsync(ports, generation, null, cancellation.Token)
                     .WaitAsync(MidiStartTimeout, cancellation.Token);
                 if (attemptId != _captureAttemptId || _isClosing || IsDisposed || _isTransitioning ||
                     cancellation.IsCancellationRequested || inputTracker.IsListening ||
                     !txtNote.Focused || inputTracker.CurrentSessionId != generation ||
                     !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
                     StopCapture(generation);
-                else if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal))
+                else if (startResult.IsAllFailed)
+                {
+                    StopCapture(generation);
+                    string reason = startResult.FailedPorts.Count > 0
+                        ? $"{startResult.FailedPorts[0].PortName}: {startResult.FailedPorts[0].Reason}"
+                        : "MIDIポートを確認してください";
+                    lblStatus.Text = $"ステータス: キャプチャ開始失敗 ({reason})";
+                    lblStatus.ForeColor = Color.Red;
+                    DiagnosticLogger.Log("Capture", $"すべてのMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
+                }
+                else if (startResult.IsPartialSuccess)
+                {
+                    string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
+                    lblStatus.Text = $"ステータス: キャプチャ中 (一部ポート開始失敗: {failedNames})";
+                    lblStatus.ForeColor = Color.DarkGoldenrod;
+                    DiagnosticLogger.Log("Capture", $"一部のMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
+                }
+                else if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal) ||
+                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始失敗", StringComparison.Ordinal))
                 {
                     lblStatus.Text = "ステータス: 停止中";
                     lblStatus.ForeColor = Color.Red;
@@ -1137,6 +1155,12 @@ namespace MidiToKeyApp
                 return;
 
             inputTracker.StopCaptureSession();
+            if (!_isClosing && !IsDisposed &&
+                lblStatus.Text.StartsWith("ステータス: キャプチャ中", StringComparison.Ordinal))
+            {
+                lblStatus.Text = "ステータス: 停止中";
+                lblStatus.ForeColor = Color.Red;
+            }
             ObserveMidiStop(midiLifecycle.StopAsync());
         }
 

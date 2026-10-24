@@ -383,6 +383,75 @@ public sealed class Form1StartLifecycleTests
     }
 
     [TestMethod]
+    public async Task CaptureStartWhenEveryPortFails_StopsCaptureAndReportsFailure()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener { FailAllPorts = true };
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.SelectBothPortsForTest();
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1 && listener.StopCount == 1);
+
+                Assert.IsFalse(form.CapturingForTest, "Capture must be ended when none of the selected ports opened.");
+                StringAssert.Contains(form.StatusForTest, "キャプチャ開始失敗");
+                StringAssert.Contains(form.StatusForTest, "Port A");
+                Assert.AreEqual(0, form.OutputForTest.History.Count, "Capture failure must not send keyboard output.");
+
+                listener.FailAllPorts = false;
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 2 && form.CapturingForTest &&
+                    !form.StatusForTest.Contains("キャプチャ開始失敗", StringComparison.Ordinal));
+                Assert.IsFalse(form.StatusForTest.Contains("キャプチャ開始失敗", StringComparison.Ordinal),
+                    "A successful retry must clear the prior capture failure status.");
+                form.LeaveNoteForTest();
+                await WaitUntilAsync(() => listener.StopCount == 2);
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A", "Port B")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+        }
+    }
+
+    [TestMethod]
+    public async Task CaptureStartWhenOnePortFails_KeepsCaptureAndReportsPartialFailure()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener();
+        listener.FailPorts.Add("Port B");
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.SelectBothPortsForTest();
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1 && form.CapturingForTest &&
+                    form.StatusForTest.Contains("一部ポート開始失敗", StringComparison.Ordinal));
+
+                StringAssert.Contains(form.StatusForTest, "一部ポート開始失敗");
+                StringAssert.Contains(form.StatusForTest, "Port B");
+                Assert.AreEqual(0, listener.StopCount, "A successfully opened port keeps the capture session active.");
+                Assert.AreEqual(0, form.OutputForTest.History.Count, "Capture warnings must not send keyboard output.");
+                form.LeaveNoteForTest();
+                await WaitUntilAsync(() => listener.StopCount == 1);
+                Assert.IsFalse(form.StatusForTest.Contains("キャプチャ中", StringComparison.Ordinal),
+                    "Leaving the note field must clear the capture-only partial failure status.");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A", "Port B")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+        }
+    }
+
+    [TestMethod]
     public async Task CaptureReentryThenLeave_DoesNotStartAfterPendingStopCompletes()
     {
         bool previousWarmup = InputWarmup.Enabled;
@@ -586,6 +655,12 @@ public sealed class Form1StartLifecycleTests
 
         public void EndCaptureForTest() => typeof(Form1).GetMethod("StopCapture", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, new object?[] { null });
 
+        public void LeaveNoteForTest()
+        {
+            var key = (TextBox)typeof(Form1).GetField("txtKey", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+            key.Focus();
+        }
+
         public void SendHotkeyForTest()
         {
             var message = Message.Create(Handle, 0x0312, (IntPtr)HotkeyManager.DEFAULT_HOTKEY_ID, IntPtr.Zero);
@@ -608,6 +683,13 @@ public sealed class Form1StartLifecycleTests
             var ports = (CheckedListBox)typeof(Form1).GetField("chkPorts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
             ports.SetItemChecked(0, false);
             ports.SetItemChecked(1, name == "Port B");
+        }
+
+        public void SelectBothPortsForTest()
+        {
+            var ports = (CheckedListBox)typeof(Form1).GetField("chkPorts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+            ports.SetItemChecked(0, true);
+            ports.SetItemChecked(1, true);
         }
 
         public void SimulateFormClosingForTest() => base.OnFormClosing(new FormClosingEventArgs(CloseReason.UserClosing, false));
