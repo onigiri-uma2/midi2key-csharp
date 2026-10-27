@@ -8,6 +8,97 @@ namespace MidiToKeyApp.Tests;
 [TestClass]
 public sealed class Form1StartLifecycleTests
 {
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task HotkeyFromNoteCapture_AppliesFocusBeforeNativeStart(bool leaveNoteDuringStart)
+    {
+        var listener = new FakeMidiListener();
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.ReplaceMappingSnapshotForTest();
+                form.BeginCaptureForTest();
+                await WaitUntilAsync(() => listener.StartCount == 1 && !form.MidiBusyForTest);
+
+                listener.StartEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.ReleaseStart = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                listener.EmitNoteAfterBlockedStart = true;
+                form.SendHotkeyForTest();
+                await listener.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                Assert.IsTrue(form.CapturingForTest, "Capture must already be active before native start emits input.");
+                if (leaveNoteDuringStart) form.FocusPortsForTest();
+
+                listener.ReleaseStart.TrySetResult();
+                await WaitUntilAsync(() => !form.TransitioningForTest);
+                Assert.IsTrue(form.ListeningForTest);
+                Assert.AreEqual(!leaveNoteDuringStart, form.CapturingForTest);
+                Assert.AreEqual(leaveNoteDuringStart ? 1 : 0, form.OutputForTest.KeyDownCount);
+                if (!leaveNoteDuringStart)
+                    await WaitUntilAsync(() => form.NoteTextForTest == "60");
+            }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")),
+                (_, _) => Task.CompletedTask);
+        }
+        finally { listener.ReleaseStart?.TrySetResult(); }
+    }
+
+    [DataTestMethod]
+    [DataRow(true, false)]
+    [DataRow(true, true)]
+    [DataRow(false, false)]
+    public async Task ParentProbeFailure_UsesSuccessfulWinMmResultWithoutTreatingFailureAsEmpty(
+        bool childSuccess, bool portPresent)
+    {
+        var listener = new FakeMidiListener();
+        bool checkHealth = false;
+        await RunFormAsync(async form =>
+        {
+            form.ReplaceMappingSnapshotForTest();
+            form.StartForTest();
+            await WaitUntilAsync(() => !form.TransitioningForTest);
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new MidiNoteData(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            Assert.AreEqual(1, form.OutputForTest.KeyDownCount);
+
+            bool shouldStop = childSuccess && !portPresent;
+            form.SuppressWarningForTest(shouldStop
+                ? "MIDIデバイスの切断を検知しました。変換を停止しました。機器を接続し直し、midi2keyを再起動してください。"
+                : "MIDIデバイスの接続状態を確認できません。必要に応じてmidi2keyを再起動してください。");
+            checkHealth = true;
+            form.TriggerHealthCheckForTest();
+            await WaitUntilAsync(() => form.HealthCheckCompletedForTest && !form.MidiBusyForTest);
+            // The health worker posts disconnect handling back to the UI message queue.
+            await Task.Delay(100);
+            Assert.AreEqual(!shouldStop, form.ListeningForTest);
+            Assert.AreEqual(shouldStop ? 1 : 0, form.OutputForTest.KeyUpCount);
+            Assert.AreEqual(shouldStop ? 0 : 1, listener.GetActivePorts().Count);
+        }, listener, (_, _) => Task.FromResult(checkHealth
+            ? new MidiPortProbeService.ProbeResult(PortEnumerationResult.Failed("backend timeout"),
+                childSuccess ? OutOfProcessWinMmResult.Succeeded(portPresent ? new[] { "Port A" } : Array.Empty<string>())
+                    : OutOfProcessWinMmResult.Failed("child timeout", timedOut: true))
+            : AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [DataTestMethod]
+    [DataRow(Keys.Oem1, false, "*", WindowsInput.Native.VirtualKeyCode.OEM_1)]
+    [DataRow(Keys.Oem3, false, "`", WindowsInput.Native.VirtualKeyCode.OEM_3)]
+    [DataRow(Keys.Oem1, true, ":", WindowsInput.Native.VirtualKeyCode.OEM_1)]
+    [DataRow(Keys.Oem3, true, "~", WindowsInput.Native.VirtualKeyCode.OEM_3)]
+    public async Task ShiftedSymbolCapture_RoundTripsToOriginalKey(Keys key, bool isUs, string symbol,
+        WindowsInput.Native.VirtualKeyCode expectedKey)
+    {
+        await RunFormAsync(form =>
+        {
+            string captured = form.FormatKeyForTest(new KeyEventArgs(key | Keys.Shift), isUs);
+            Assert.AreEqual(symbol, captured);
+            var resolved = KeyResolver.Resolve(captured, isUs ? "US" : "JIS");
+            Assert.AreEqual(expectedKey, resolved.BaseKey);
+            Assert.IsTrue(resolved.ShiftRequired);
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
     [TestMethod]
     public async Task HotkeyDuringHangingProbe_CancelsStart_AndLateResultCannotStartListener()
     {
@@ -713,6 +804,27 @@ public sealed class Form1StartLifecycleTests
         }
 
         public FakeKeyboardOutput OutputForTest { get; }
+
+        public bool MidiBusyForTest => ((MidiListenerLifecycle)typeof(Form1).GetField("midiLifecycle", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).IsBusy;
+        public bool HealthCheckCompletedForTest => (long)typeof(Form1).GetField("_latestCompletedHealthCheckRequestId", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)! > 0;
+        public string NoteTextForTest => ((TextBox)typeof(Form1).GetField("txtNote", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).Text;
+
+        public void FocusPortsForTest() => ((CheckedListBox)typeof(Form1).GetField("chkPorts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).Focus();
+
+        public void TriggerHealthCheckForTest()
+        {
+            var timer = typeof(Form1).GetField("deviceDebounceTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+            typeof(System.Windows.Forms.Timer).GetMethod("OnTick", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(timer, new object[] { EventArgs.Empty });
+        }
+
+        public void SuppressWarningForTest(string message)
+        {
+            typeof(Form1).GetField("_lastAlertMessage", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(this, message);
+            typeof(Form1).GetField("_lastAlertTime", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(this, DateTime.Now);
+        }
+
+        public string FormatKeyForTest(KeyEventArgs key, bool isUs) =>
+            (string)typeof(Form1).GetMethod("FormatKey", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, new object[] { key, isUs })!;
 
         public bool TransitioningForTest => (bool)typeof(Form1).GetField("_isTransitioning", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
         public bool ListeningForTest => typeof(Form1).GetField("inputTracker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this) is InputTracker tracker && tracker.IsListening;

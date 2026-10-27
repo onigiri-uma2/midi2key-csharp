@@ -193,7 +193,7 @@ namespace MidiToKeyApp
             { "=", (VirtualKeyCode.OEM_MINUS, true) },
             { "~", (VirtualKeyCode.OEM_7, true) },
             { "|", (VirtualKeyCode.OEM_5, true) },
-            { "`", (VirtualKeyCode.OEM_3, false) },
+            { "`", (VirtualKeyCode.OEM_3, true) },
             { "{", (VirtualKeyCode.OEM_4, true) },
             { "+", (VirtualKeyCode.OEM_PLUS, true) },
             { "*", (VirtualKeyCode.OEM_1, true) },

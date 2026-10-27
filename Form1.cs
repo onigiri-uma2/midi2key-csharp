@@ -874,7 +874,9 @@ namespace MidiToKeyApp
 
                                         IReadOnlyList<MidiPortInfo> beforeActive = midiListener.GetActivePorts();
                                         IReadOnlyList<MidiPortInfo> afterActive = beforeActive;
-                                        if (parentPorts.Success && !midiLifecycle.IsBusy)
+                                        // A successful fresh WinMM result is authoritative even if the
+                                        // parent enumeration failed. Never interpret two failed probes as zero ports.
+                                        if ((parentPorts.Success || outProcResult.Success) && !midiLifecycle.IsBusy)
                                         {
                                             try
                                             {
@@ -1358,6 +1360,9 @@ namespace MidiToKeyApp
 
                 long sessionId = inputTracker.StartConversionSession();
                 sessionStarted = true;
+                // Start can deliver queued notes before its task completes. Apply capture
+                // first; subsequent focus changes are handled by the Enter/Leave events.
+                inputTracker.SetCapturing(txtNote.Focused);
                 var mappingForSession = inputTracker.GetResolvedMappingSnapshot();
                 DiagnosticLogger.Log($"[Form1] StartConversion invoked. Generated Gen={sessionId}, Ports=[{string.Join(", ", ports)}]");
                 var snapshot = InitialPortSnapshot.FromOutOfProcessResult(sessionId, outProc);
@@ -1386,12 +1391,6 @@ namespace MidiToKeyApp
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
                     return;
-                }
-
-                // もしノート入力欄にフォーカスがあれば、変換中キャプチャとして継続
-                if (txtNote.Focused)
-                {
-                    inputTracker.SetCapturing(true);
                 }
 
                 if (startResult.IsPartialSuccess)
@@ -1667,7 +1666,7 @@ namespace MidiToKeyApp
 
             switch (code)
             {
-                case 186: return isUS ? (shift ? ":" : ";") : (shift ? "+" : ":"); // Oem1
+                case 186: return isUS ? (shift ? ":" : ";") : (shift ? "*" : ":"); // Oem1
                 case 187: return isUS ? (shift ? "+" : "=") : (shift ? "+" : ";"); // OemPlus
                 case 188: return shift ? "<" : ","; // Oemcomma
                 case 189: return isUS ? (shift ? "_" : "-") : (shift ? "=" : "-"); // OemMinus
