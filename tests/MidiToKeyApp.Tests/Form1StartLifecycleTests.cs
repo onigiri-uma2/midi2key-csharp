@@ -383,6 +383,74 @@ public sealed class Form1StartLifecycleTests
     }
 
     [TestMethod]
+    public async Task CaptureStartTimeout_ReportsTimeoutAndStopsCapture()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener
+        {
+            StartEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await listener.StartEntered!.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                await WaitUntilForAsync(() => form.StatusForTest.StartsWith("ステータス: キャプチャ開始タイムアウト", StringComparison.Ordinal), TimeSpan.FromSeconds(5));
+
+                Assert.IsFalse(form.CapturingForTest, "A timed-out capture attempt must be stopped.");
+                Assert.AreEqual(0, form.OutputForTest.History.Count, "Capture timeout must not send keyboard output.");
+
+                listener.ReleaseStart!.TrySetResult();
+                await WaitUntilForAsync(() => listener.StopCount == 1, TimeSpan.FromSeconds(2));
+                StringAssert.Contains(form.StatusForTest, "キャプチャ開始タイムアウト");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStart!.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task CanceledCaptureStart_DoesNotReportStaleTimeout()
+    {
+        bool previousWarmup = InputWarmup.Enabled;
+        InputWarmup.Enabled = false;
+        var listener = new FakeMidiListener
+        {
+            StartEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.BeginCaptureForTest();
+                await listener.StartEntered!.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                form.EndCaptureForTest();
+                listener.ReleaseStart!.TrySetResult();
+                await WaitUntilForAsync(() => listener.StopCount == 1 && !form.CapturingForTest, TimeSpan.FromSeconds(2));
+                await Task.Delay(100);
+
+                Assert.IsFalse(form.StatusForTest.Contains("キャプチャ開始タイムアウト", StringComparison.Ordinal),
+                    "A canceled capture attempt must not publish a stale timeout after ownership ended.");
+                Assert.AreEqual(0, form.OutputForTest.History.Count, "Canceled capture must not send keyboard output.");
+            }, listener, (timeout, token) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally
+        {
+            InputWarmup.Enabled = previousWarmup;
+            listener.ReleaseStart!.TrySetResult();
+        }
+    }
+
+    [TestMethod]
     public async Task CaptureStartWhenEveryPortFails_StopsCaptureAndReportsFailure()
     {
         bool previousWarmup = InputWarmup.Enabled;
@@ -603,6 +671,14 @@ public sealed class Form1StartLifecycleTests
         while (!condition() && DateTime.UtcNow < limit)
             await Task.Delay(10);
         Assert.IsTrue(condition(), "The start transition should finish within two seconds.");
+    }
+
+    private static async Task WaitUntilForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var limit = DateTime.UtcNow + timeout;
+        while (!condition() && DateTime.UtcNow < limit)
+            await Task.Delay(10);
+        Assert.IsTrue(condition(), $"The expected condition should be reached within {timeout}.");
     }
 
     private static AppSettings CreateSettings() => new()

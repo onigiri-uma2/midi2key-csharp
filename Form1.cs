@@ -434,10 +434,10 @@ namespace MidiToKeyApp
         private void InitializeComponentProgrammatically()
         {
             var version = typeof(Form1).Assembly.GetName().Version;
-            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.2.0";
+            string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.2.1";
             this.Text = $"midi2key C#{verStr}";
             this.Width = 430;
-            this.Height = 550;
+            this.Height = 575;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -814,7 +814,7 @@ namespace MidiToKeyApp
             btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 435, Left = 295, Width = 105, Height = 26 };
             btnHotkeyConfig.Click += (s, e) => OpenHotkeyConfigDialog();
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, Height = 48, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
 
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
@@ -1073,13 +1073,16 @@ namespace MidiToKeyApp
             _captureCancellation = cancellation;
             long attemptId = ++_captureAttemptId;
             long generation = 0;
+            bool waitingForPreviousStop = false;
             try
             {
                 if (midiLifecycle.IsBusy)
                 {
+                    waitingForPreviousStop = true;
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     await midiLifecycle.WaitForIdleAsync().WaitAsync(MidiStartTimeout, cancellation.Token);
+                    waitingForPreviousStop = false;
                 }
                 if (attemptId != _captureAttemptId || _isClosing || IsDisposed ||
                     _isTransitioning || inputTracker.IsListening || cancellation.IsCancellationRequested ||
@@ -1112,7 +1115,8 @@ namespace MidiToKeyApp
                     DiagnosticLogger.Log("Capture", $"一部のMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
                 }
                 else if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal) ||
-                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始失敗", StringComparison.Ordinal))
+                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始失敗", StringComparison.Ordinal) ||
+                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始タイムアウト", StringComparison.Ordinal))
                 {
                     lblStatus.Text = "ステータス: 停止中";
                     lblStatus.ForeColor = Color.Red;
@@ -1120,10 +1124,30 @@ namespace MidiToKeyApp
             }
             catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
             {
+                bool ownsAttempt = attemptId == _captureAttemptId && !_isClosing && !IsDisposed &&
+                    !_isTransitioning && !inputTracker.IsListening && txtNote.Focused &&
+                    ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase);
                 cancellation.Cancel();
                 if (generation != 0 && attemptId == _captureAttemptId) StopCapture(generation);
                 if (ex is TimeoutException)
+                {
                     DiagnosticLogger.Log("Capture", "MIDIキャプチャ開始が時間内に完了しませんでした。");
+                    if (ownsAttempt)
+                    {
+                        if (midiLifecycle.HasReleaseFailure)
+                        {
+                            lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
+                            lblStatus.ForeColor = Color.DarkOrange;
+                        }
+                        else
+                        {
+                            lblStatus.Text = waitingForPreviousStop
+                                ? "ステータス: キャプチャ開始タイムアウト (前のMIDI停止処理が完了しません。再起動してください)"
+                                : "ステータス: キャプチャ開始タイムアウト (MIDIポートの応答を確認してください)";
+                            lblStatus.ForeColor = Color.DarkGoldenrod;
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
