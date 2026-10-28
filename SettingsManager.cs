@@ -43,6 +43,9 @@ namespace MidiToKeyApp
         [JsonPropertyName("keyboard_layout")]
         public string KeyboardLayout { get; set; } = "JIS";
 
+        [JsonPropertyName("transpose_semitones")]
+        public int TransposeSemitones { get; set; }
+
         [JsonPropertyName("hotkey")]
         public HotkeySettings Hotkey { get; set; } = new HotkeySettings();
     }
@@ -52,11 +55,13 @@ namespace MidiToKeyApp
     {
         private readonly ResolvedKey[] _notes;
         public ResolvedKey Pedal { get; }
+        public int TransposeSemitones { get; }
 
-        private ResolvedMappingSnapshot(ResolvedKey[] notes, ResolvedKey pedal)
+        private ResolvedMappingSnapshot(ResolvedKey[] notes, ResolvedKey pedal, int transposeSemitones)
         {
             _notes = notes;
             Pedal = pedal;
+            TransposeSemitones = transposeSemitones;
         }
 
         public ResolvedKey GetNote(int number) =>
@@ -68,19 +73,22 @@ namespace MidiToKeyApp
             var notes = new ResolvedKey[128];
             Array.Fill(notes, ResolvedKey.None);
             ResolvedKey pedal = ResolvedKey.None;
+            int transpose;
             lock (settings.MappingLock)
             {
+                transpose = settings.TransposeSemitones;
                 var mapping = settings.Mapping;
                 var layout = settings.KeyboardLayout;
                 for (int i = 0; i < notes.Length; i++)
                 {
-                    if (mapping.TryGetValue(i.ToString(), out var target))
+                    int shifted = i + transpose;
+                    if ((uint)shifted < 128 && mapping.TryGetValue(shifted.ToString(), out var target))
                         notes[i] = KeyResolver.Resolve(target, layout);
                 }
                 if (mapping.TryGetValue("pedal", out var pedalTarget))
                     pedal = KeyResolver.Resolve(pedalTarget, layout);
             }
-            return new ResolvedMappingSnapshot(notes, pedal);
+            return new ResolvedMappingSnapshot(notes, pedal, transpose);
         }
     }
 
@@ -211,6 +219,9 @@ namespace MidiToKeyApp
                 throw new InvalidDataException("mapping が指定されていません (null)。");
             }
 
+            if (settings.TransposeSemitones < -48 || settings.TransposeSemitones > 48)
+                throw new InvalidDataException("移調は -48〜48 半音の範囲で指定してください。");
+
             if (settings.KeyboardLayout != "JIS" && settings.KeyboardLayout != "US")
             {
                 throw new InvalidDataException($"無効なキーボード配列 '{settings.KeyboardLayout}' です。'JIS' または 'US' を指定してください。");
@@ -253,6 +264,7 @@ namespace MidiToKeyApp
                 {
                     SelectedPorts = new List<string>(settings.SelectedPorts),
                     Mapping = new Dictionary<string, string>(settings.Mapping),
+                    TransposeSemitones = settings.TransposeSemitones,
                     KeyboardLayout = settings.KeyboardLayout,
                     Hotkey = new HotkeySettings
                     {

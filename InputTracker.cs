@@ -126,6 +126,9 @@ namespace MidiToKeyApp
         internal void PublishResolvedMapping(ResolvedMappingSnapshot snapshot) =>
             Volatile.Write(ref _resolvedMapping, snapshot ?? throw new ArgumentNullException(nameof(snapshot)));
 
+        private int TransposedNoteNumber(int number) => number +
+            (Volatile.Read(ref _resolvedMapping)?.TransposeSemitones ?? _settingsProvider().TransposeSemitones);
+
         private ResolvedKey ResolveNote(int number)
         {
             var snapshot = Volatile.Read(ref _resolvedMapping);
@@ -133,7 +136,11 @@ namespace MidiToKeyApp
             var settings = _settingsProvider();
             string? mapping;
             lock (settings.MappingLock)
-                settings.Mapping.TryGetValue(NoteNumberText(number), out mapping);
+            {
+                int shifted = number + settings.TransposeSemitones;
+                if ((uint)number >= 128 || (uint)shifted >= 128) return ResolvedKey.None;
+                settings.Mapping.TryGetValue(NoteNumberText(shifted), out mapping);
+            }
             if (mapping == null) return ResolvedKey.None;
             return (uint)number < (uint)_noteResolutions.Length
                 ? ResolveCached(mapping, settings.KeyboardLayout, ref _noteResolutions[number])
@@ -342,7 +349,8 @@ namespace MidiToKeyApp
                     if (_isCapturing)
                     {
                         _suppressedSources.Add(sourceKey);
-                        capturedInput = NoteNumberText(note.NoteNumber);
+                        int shifted = TransposedNoteNumber(note.NoteNumber);
+                        if ((uint)shifted < 128) capturedInput = NoteNumberText(shifted);
                         LatencyMeasurement.RecordSuppressed(note.TraceId, "capture");
                         return;
                     }

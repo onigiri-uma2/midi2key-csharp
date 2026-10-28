@@ -63,7 +63,9 @@ namespace MidiToKeyApp
             ApplicationConfiguration.Initialize();
             try
             {
-                Application.Run(new Form1());
+                bool showOptions = Array.Exists(args ?? Array.Empty<string>(), a =>
+                    string.Equals(a, "--show-options", StringComparison.OrdinalIgnoreCase));
+                Application.Run(new Form1(showOptions: showOptions));
             }
             finally
             {

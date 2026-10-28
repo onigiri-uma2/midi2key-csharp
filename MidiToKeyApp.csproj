@@ -8,6 +8,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>midi2key</AssemblyName>
+    <ApplicationIcon>assets\midi2key.ico</ApplicationIcon>
     <Version>1.2.1</Version>
     <AssemblyVersion>1.2.1</AssemblyVersion>
     <FileVersion>1.2.1</FileVersion>
@@ -26,6 +27,10 @@
     <PackageReference Include="InputSimulatorCore" Version="1.0.5" />
     <PackageReference Include="Melanchall.DryWetMidi" Version="8.0.3" />
     <PackageReference Include="MouseKeyHook" Version="5.7.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="assets\*.ico" LogicalName="MidiToKeyApp.Assets.%(Filename)%(Extension)" />
   </ItemGroup>
 
   <!-- DryWetMIDI includes its macOS binary as an unconditional None item. -->

@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using System.Windows.Forms;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using MidiToKeyApp;
@@ -10,6 +10,150 @@ public sealed class Form1StartLifecycleTests
 {
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     private static extern int GetWindowStyle(IntPtr handle, int index);
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Tray_MinimizeEndsCaptureButKeepsSession_AndStopReleasesKeys(bool testMode)
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.SetMappingInputForTest("60", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            form.SetMappingInputForTest("61", "b");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            form.FocusPortsForTest();
+            form.ControlForTest<CheckBox>("chkTestMode").Checked = testMode;
+            form.RefreshTrayForTest();
+            form.TrayItemForTest("trayStart").PerformClick();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            form.BeginCaptureForTest();
+            Assert.IsTrue(form.CapturingForTest);
+            form.WindowState = FormWindowState.Maximized;
+            form.WindowState = FormWindowState.Minimized;
+            await WaitUntilAsync(() => !form.Visible);
+            Assert.IsFalse(form.ShowInTaskbar);
+            Assert.IsTrue(form.ListeningForTest);
+            Assert.IsFalse(form.CapturingForTest);
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 61, 100, true, listener.CurrentGeneration));
+            form.RefreshTrayForTest();
+            Assert.IsFalse(form.TrayItemForTest("trayStart").Enabled);
+            Assert.IsTrue(form.TrayItemForTest("trayStop").Enabled);
+            StringAssert.Contains(form.TrayIconForTest.Text, testMode ? "テスト中" : "実行中");
+            Assert.AreEqual(testMode ? 0 : 2, form.OutputForTest.KeyDownCount);
+            form.TrayItemForTest("trayStop").PerformClick();
+            await WaitUntilAsync(() => !form.ListeningForTest && !form.MidiBusyForTest);
+            Assert.AreEqual(testMode ? 0 : 2, form.OutputForTest.KeyUpCount);
+            form.TrayItemForTest("trayShow").PerformClick();
+            Assert.IsTrue(form.Visible);
+            Assert.IsTrue(form.ShowInTaskbar);
+            Assert.AreEqual(FormWindowState.Maximized, form.WindowState);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task Tray_CancelsPendingStartWithoutStartingLate()
+    {
+        var probe = new TaskCompletionSource<MidiPortProbeService.ProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            // Opening the real context menu refreshes enabled state after port discovery.
+            form.RefreshTrayForTest();
+            form.TrayItemForTest("trayStart").PerformClick();
+            Assert.IsTrue(form.TransitioningForTest);
+            Assert.AreEqual("開始をキャンセル", form.TrayItemForTest("trayStop").Text);
+            form.TrayItemForTest("trayStop").PerformClick();
+            probe.TrySetResult(AvailablePortResult("Port A"));
+            await WaitUntilAsync(() => !form.TransitioningForTest && !form.MidiBusyForTest);
+            Assert.IsFalse(form.ListeningForTest);
+            Assert.AreEqual(0, listener.StartCount);
+        }, listener, (_, _) => probe.Task, (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task Tray_ExitRestoresWindowForUnsavedPrompt_CancelPreservesSession()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.SetMappingInputForTest("60", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            form.FocusPortsForTest();
+            form.StartForTest();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            form.WindowState = FormWindowState.Minimized;
+            await WaitUntilAsync(() => !form.Visible);
+            form.PendingChangesResponseForTest = DialogResult.Cancel;
+            form.TrayItemForTest("trayExit").PerformClick();
+            Assert.AreEqual(1, form.PendingChangesPromptCountForTest);
+            Assert.IsTrue(form.Visible);
+            Assert.IsTrue(form.ShowInTaskbar);
+            Assert.IsFalse(form.IsDisposed);
+            Assert.IsTrue(form.ListeningForTest);
+            Assert.AreEqual(0, listener.StopCount);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task Tray_CleanExitDisposesIconAndReleasesKeys()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.ReplaceMappingSnapshotForTest();
+            form.AcceptSavedSettingsForTest();
+            form.FocusPortsForTest();
+            form.StartForTest();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            form.AcceptSavedSettingsForTest();
+            var tray = form.TrayIconForTest;
+            form.TrayItemForTest("trayExit").PerformClick();
+            Assert.IsTrue(form.IsDisposed);
+            Assert.IsFalse(tray.Visible);
+            Assert.AreEqual(1, form.OutputForTest.KeyUpCount);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task TransposeControls_TrackDirtyStateAndShowShiftedMonitorTarget()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.SetMappingInputForTest("72", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            form.AcceptSavedSettingsForTest();
+            var transpose = form.ControlForTest<NumericUpDown>("numTranspose");
+            form.ControlForTest<Button>("btnOctaveUp").PerformClick();
+            Assert.AreEqual(12m, transpose.Value);
+            Assert.AreEqual(12, form.SettingsForTest.TransposeSemitones);
+            StringAssert.Contains(form.Text, "未保存");
+            form.FocusPortsForTest();
+            form.ControlForTest<CheckBox>("chkTestMode").Checked = true;
+            form.StartForTest();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            await WaitUntilAsync(() => form.ControlForTest<Label>("lblNoteMonitor").Text.Contains("⇒ 72"));
+            StringAssert.Contains(form.ControlForTest<Label>("lblNoteMonitor").Text, "→ a");
+            form.ControlForTest<Button>("btnResetTranspose").PerformClick();
+            Assert.AreEqual(0m, transpose.Value);
+            Assert.IsFalse(form.Text.Contains("未保存"));
+            transpose.Value = 47;
+            form.ControlForTest<Button>("btnOctaveUp").PerformClick();
+            Assert.AreEqual(48m, transpose.Value);
+            transpose.Value = -47;
+            form.ControlForTest<Button>("btnOctaveDown").PerformClick();
+            Assert.AreEqual(-48m, transpose.Value);
+            Assert.AreEqual(0, form.OutputForTest.History.Count);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask, showOptions: true);
+    }
 
     [TestMethod]
     public async Task TestMode_HotkeySessionAndMonitor_DoNotSendKeys_ThenResumeNormally()
@@ -49,8 +193,10 @@ public sealed class Form1StartLifecycleTests
         }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
     }
 
-    [TestMethod]
-    public async Task Resizing_GrowsMappingList_AndKeepsCaptureControlsVisible()
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Resizing_GrowsMappingList_AndKeepsCaptureControlsVisible(bool showOptions)
     {
         await RunFormAsync(async form =>
         {
@@ -58,6 +204,12 @@ public sealed class Form1StartLifecycleTests
             var note = form.ControlForTest<TextBox>("txtNote");
             var capture = form.ControlForTest<Button>("btnCaptureNote");
             var key = form.ControlForTest<TextBox>("txtKey");
+            form.ApplyPortsForTest(new[] { "Port A", "Port B", "Port C" }, new[] { "Port A" });
+            var ports = form.ControlForTest<CheckedListBox>("chkPorts");
+            await WaitUntilAsync(() => (GetWindowStyle(ports.Handle, -16) & 0x00200000) != 0);
+            ports.TopIndex = 2;
+            Assert.IsTrue(ports.GetItemRectangle(2).IntersectsWith(ports.ClientRectangle));
+            ports.TopIndex = 0;
             for (int i = 0; i < 15; i++)
                 list.Items.Add(new ListViewItem(new[] { (60 + i).ToString(), $"Note {60 + i}", "a" }));
 
@@ -72,8 +224,9 @@ public sealed class Form1StartLifecycleTests
                 Assert.AreEqual(0, GetWindowStyle(list.Handle, -16) & 0x00100000,
                     $"The mapping list should not have a horizontal scrollbar at {snapshot}.");
                 var controls = new Control[] { list, note, capture, key,
-                    form.ControlForTest<CheckBox>("chkTestMode"),
-                    form.ControlForTest<Label>("lblNoteMonitor"), form.ControlForTest<Label>("lblPedalMonitor") };
+                    form.ControlForTest<CheckBox>("chkTestMode"), form.ControlForTest<NumericUpDown>("numTranspose"),
+                    form.ControlForTest<Button>("btnOctaveDown"), form.ControlForTest<Button>("btnOctaveUp"),
+                    form.ControlForTest<Button>("btnResetTranspose"), form.ControlForTest<Label>("lblNoteMonitor"), form.ControlForTest<Label>("lblPedalMonitor") }.Where(c => c.Visible).ToArray();
                 var bounds = controls.Select(c => form.RectangleToClient(c.RectangleToScreen(c.ClientRectangle))).ToArray();
                 for (int i = 0; i < bounds.Length; i++)
                 {
@@ -88,11 +241,27 @@ public sealed class Form1StartLifecycleTests
                     Directory.CreateDirectory(directory);
                     using var bitmap = new System.Drawing.Bitmap(form.Width, form.Height);
                     form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(System.Drawing.Point.Empty, form.Size));
-                    bitmap.Save(Path.Combine(directory, $"form-{snapshot}.png"));
+                    bitmap.Save(Path.Combine(directory, $"form-{snapshot}{(showOptions ? "-options" : "")}.png"));
                 }
             }
 
+            var transpose = form.ControlForTest<NumericUpDown>("numTranspose");
+            var testMode = form.ControlForTest<CheckBox>("chkTestMode");
+            Assert.AreEqual(showOptions, transpose.Visible);
+            Assert.AreEqual(showOptions, testMode.Visible);
+            Assert.AreEqual(showOptions, form.ControlForTest<Label>("lblNoteMonitor").Visible);
+            Assert.AreEqual(showOptions, form.ControlForTest<Label>("lblPedalMonitor").Visible);
             await CheckLayout("default");
+            transpose.Value = 12;
+            testMode.Checked = true;
+            StringAssert.Contains(form.Text, "移調 +12半音");
+            StringAssert.Contains(form.Text, "テストモード");
+            Assert.AreEqual(showOptions, transpose.Visible);
+            await CheckLayout("active-options");
+            transpose.Value = 0;
+            testMode.Checked = false;
+            Assert.IsFalse(form.Text.Contains("半音"));
+            Assert.IsFalse(form.Text.Contains("テストモード"));
             form.Size = form.MinimumSize;
             await CheckLayout("minimum");
             int minimumHeight = list.Height;
@@ -101,7 +270,7 @@ public sealed class Form1StartLifecycleTests
             await CheckLayout("expanded");
             Assert.IsTrue(list.Height > minimumHeight, "The mapping list should use extra vertical space.");
             Assert.IsTrue(list.Width > minimumWidth, "The mapping list should use extra horizontal space.");
-        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")), showOptions: showOptions);
     }
 
     [DataTestMethod]
@@ -1035,14 +1204,14 @@ public sealed class Form1StartLifecycleTests
         Func<TestForm, Task> scenario,
         FakeMidiListener listener,
         Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probe,
-        Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup = null)
+        Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup = null, bool showOptions = false)
     {
         var finished = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             try
             {
-                using var form = new TestForm(listener, probe, warmup);
+                using var form = new TestForm(listener, probe, warmup, showOptions);
                 form.Shown += async (_, _) =>
                 {
                     try
@@ -1056,8 +1225,11 @@ public sealed class Form1StartLifecycleTests
                     }
                     finally
                     {
-                        form.AcceptSavedSettingsForTest();
-                        form.Close();
+                        if (!form.IsDisposed)
+                        {
+                            form.AcceptSavedSettingsForTest();
+                            form.Close();
+                        }
                     }
                 };
                 Application.Run(form);
@@ -1106,15 +1278,15 @@ public sealed class Form1StartLifecycleTests
     private sealed class TestForm : Form1
     {
         public TestForm(FakeMidiListener listener, Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probe,
-            Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup)
-            : this(new FakeKeyboardOutput(), listener, probe, warmup)
+            Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup, bool showOptions)
+            : this(new FakeKeyboardOutput(), listener, probe, warmup, showOptions)
         {
         }
 
         private TestForm(FakeKeyboardOutput output, FakeMidiListener listener,
             Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probe,
-            Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup)
-            : base(output, listener, probe, skipWatcher: true, initialSettings: CreateSettings(), runWarmup: warmup)
+            Func<ResolvedMappingSnapshot, CancellationToken, Task>? warmup, bool showOptions)
+            : base(output, listener, probe, skipWatcher: true, initialSettings: CreateSettings(), runWarmup: warmup, showOptions: showOptions)
         {
             OutputForTest = output;
             var ports = (CheckedListBox)typeof(Form1).GetField("chkPorts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
@@ -1143,6 +1315,13 @@ public sealed class Form1StartLifecycleTests
 
         public T ControlForTest<T>(string name) where T : Control =>
             (T)typeof(Form1).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+
+        public ToolStripMenuItem TrayItemForTest(string name) =>
+            (ToolStripMenuItem)typeof(Form1).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+        public NotifyIcon TrayIconForTest =>
+            (NotifyIcon)typeof(Form1).GetField("trayIcon", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+        public void RefreshTrayForTest() =>
+            typeof(Form1).GetMethod("UpdateTrayState", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, null);
 
         public AppSettings SettingsForTest =>
             (AppSettings)typeof(Form1).GetField("settings", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;

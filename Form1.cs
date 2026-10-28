@@ -37,10 +37,107 @@ namespace MidiToKeyApp
         private Button btnSave = null!;
         private Button btnAdd = null!;
         private Label lblNotification = null!;
+        private NumericUpDown numTranspose = null!;
+        private Button btnOctaveDown = null!;
+        private Button btnOctaveUp = null!;
+        private Button btnResetTranspose = null!;
         private CheckBox chkTestMode = null!;
+        private readonly bool showOptions;
+
+        private void UpdateOptionsSummary() => UpdateSettingsTitle();
         private Label lblNoteMonitor = null!;
         private Label lblPedalMonitor = null!;
         private readonly System.Windows.Forms.Timer monitorTimer = new() { Interval = 100 };
+        private NotifyIcon? trayIcon;
+        private AppIcons? appIcons;
+        private ContextMenuStrip? trayMenu;
+        private ToolStripMenuItem trayStatus = null!;
+        private ToolStripMenuItem trayShow = null!;
+        private ToolStripMenuItem trayStart = null!;
+        private ToolStripMenuItem trayStop = null!;
+        private ToolStripMenuItem trayExit = null!;
+        private FormWindowState restoreWindowState = FormWindowState.Normal;
+
+        private void InitializeTray()
+        {
+            appIcons = new AppIcons();
+            Icon = appIcons.Application;
+            trayStatus = new ToolStripMenuItem { Enabled = false };
+            trayShow = new ToolStripMenuItem("画面を表示");
+            trayStart = new ToolStripMenuItem("変換開始");
+            trayStop = new ToolStripMenuItem("停止");
+            trayExit = new ToolStripMenuItem("終了");
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Items.AddRange(new ToolStripItem[] { trayStatus, new ToolStripSeparator(), trayShow,
+                trayStart, trayStop, new ToolStripSeparator(), trayExit });
+            trayMenu.Opening += (s, e) => UpdateTrayState();
+            trayShow.Click += (s, e) => RestoreFromTray();
+            trayStart.Click += (s, e) => {
+                // Move focus away from capture before starting, including when the menu is
+                // opened while the main window is visible.
+                ActiveControl = chkPorts;
+                StartConversion();
+                UpdateTrayState();
+            };
+            trayStop.Click += (s, e) => { StopConversion(); UpdateTrayState(); };
+            trayExit.Click += (s, e) => { RestoreFromTray(); Close(); };
+            trayIcon = new NotifyIcon { Icon = appIcons.ForState(TrayIconState.Stopped),
+                ContextMenuStrip = trayMenu, Text = "midi2key", Visible = false };
+            trayIcon.DoubleClick += (s, e) => RestoreFromTray();
+            UpdateTrayState();
+        }
+
+        private void UpdateTrayState()
+        {
+            if (trayIcon == null || _isClosing || IsDisposed) return;
+            string status = _isTransitioning ? "開始処理中" : lblStatus.Text.Replace("ステータス: ", "");
+            trayStatus.Text = status;
+            TrayIconState iconState = keySimulator.HasUnreleasedKeys || midiLifecycle.HasReleaseFailure
+                ? TrayIconState.Warning
+                : _isTransitioning ? TrayIconState.Busy
+                : inputTracker.IsListening ? (inputTracker.IsTestMode ? TrayIconState.Test : TrayIconState.Running)
+                : midiLifecycle.IsBusy ? TrayIconState.Busy
+                : TrayIconState.Stopped;
+            var icon = appIcons!.ForState(iconState);
+            if (!ReferenceEquals(trayIcon.Icon, icon)) trayIcon.Icon = icon;
+            string text = $"midi2key | {status}";
+            trayIcon.Text = text.Length > 63 ? text[..60] + "..." : text;
+            trayStart.Text = chkTestMode.Checked ? "テスト開始（キー送信なし）" : "変換開始";
+            trayStart.Enabled = !_isTransitioning && !inputTracker.IsListening && !midiLifecycle.IsBusy &&
+                !midiLifecycle.HasReleaseFailure && !keySimulator.HasUnreleasedKeys && GetSelectedPorts().Count > 0;
+            trayStop.Text = _isTransitioning ? "開始をキャンセル" : "停止";
+            trayStop.Enabled = _isTransitioning || inputTracker.IsListening || inputTracker.IsCapturing ||
+                _captureCancellation != null || keySimulator.HasUnreleasedKeys;
+        }
+
+        private void RestoreFromTray()
+        {
+            if (_isClosing || IsDisposed) return;
+            var state = restoreWindowState;
+            ShowInTaskbar = true;
+            Show();
+            WindowState = state;
+            ActiveControl = chkPorts;
+            Activate();
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (trayIcon == null || _isClosing) return;
+            if (WindowState != FormWindowState.Minimized)
+            {
+                restoreWindowState = WindowState;
+                return;
+            }
+            // Background conversion must not stay in the editor's capture suppression mode.
+            ActiveControl = chkPorts;
+            if (inputTracker.IsListening) inputTracker.SetCapturing(false);
+            else StopCapture();
+            ShowInTaskbar = false;
+            Hide();
+            UpdateTrayState();
+        }
 
         private string SessionDisplay => inputTracker.IsTestMode ? "テスト中・キー送信なし" : "実行中";
 
@@ -51,16 +148,20 @@ namespace MidiToKeyApp
             var sample = inputTracker.ReadMonitor();
             lblNoteMonitor.Text = FormatMonitor(sample.Note, false);
             lblPedalMonitor.Text = FormatMonitor(sample.Pedal, true);
+            UpdateTrayState();
         }
 
         private string FormatMonitor(MidiMonitorSample? sample, bool pedal)
         {
             if (sample is not { } value) return pedal ? "ペダル: 受信なし" : "ノート: 受信なし";
-            string key = pedal ? "pedal" : value.Number.ToString();
+            int shifted = value.Number + settings.TransposeSemitones;
+            string key = pedal ? "pedal" : shifted.ToString();
             string target;
             lock (settings.MappingLock)
-                target = settings.Mapping.TryGetValue(key, out var mapped) ? mapped : "未割り当て";
+                target = !pedal && (uint)shifted >= 128 ? "移調後は範囲外" :
+                    settings.Mapping.TryGetValue(key, out var mapped) ? mapped : "未割り当て";
             string name = pedal ? "ペダル" : $"{MidiNoteHelper.GetNoteDisplayName(value.Number)} ({value.Number})";
+            if (!pedal && settings.TransposeSemitones != 0) name += $" ⇒ {shifted}";
             return $"{value.DeviceName} / Ch {value.Channel + 1}: {name} {(value.IsDown ? "ON" : "OFF")} [{value.Value}] → {target}";
         }
         private readonly System.Windows.Forms.Timer notificationTimer = new() { Interval = 4000 };
@@ -75,6 +176,7 @@ namespace MidiToKeyApp
             Ports = settings.SelectedPorts.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
             Mapping = settings.Mapping.OrderBy(p => p.Key, StringComparer.Ordinal).ToArray(),
             settings.KeyboardLayout,
+            settings.TransposeSemitones,
             settings.Hotkey
         });
         private bool HasUnsavedChanges => settingsReady && SettingsFingerprint() != savedSettings;
@@ -82,7 +184,9 @@ namespace MidiToKeyApp
         private void UpdateSettingsTitle()
         {
             if (!settingsReady) return;
-            Text = $"{baseTitle} — {Path.GetFileName(currentSettingsPath)}{(HasUnsavedChanges ? " *未保存" : "")}";
+            string activeOptions = settings.TransposeSemitones != 0 ? $" [移調 {settings.TransposeSemitones:+0;-0;0}半音]" : "";
+            if (chkTestMode.Checked) activeOptions += " [テストモード]";
+            Text = $"{baseTitle} — {Path.GetFileName(currentSettingsPath)}{(HasUnsavedChanges ? " *未保存" : "")}{activeOptions}";
         }
 
         private void AcceptSavedSettings()
@@ -159,16 +263,17 @@ namespace MidiToKeyApp
         private DateTime lastReportedErrorTime = DateTime.MinValue;
         private int errorRepeatCount = 0;
 
-        public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null)
-            : this(output, listener, MidiPortProbeService.ProbeAsync, skipWatcher: false)
+        public Form1(IKeyboardOutput? output = null, IMidiListener? listener = null, bool showOptions = false)
+            : this(output, listener, MidiPortProbeService.ProbeAsync, skipWatcher: false, showOptions: showOptions)
         {
         }
 
         internal Form1(IKeyboardOutput? output, IMidiListener? listener,
             Func<int, CancellationToken, Task<MidiPortProbeService.ProbeResult>> probePorts, bool skipWatcher,
             AppSettings? initialSettings = null,
-            Func<ResolvedMappingSnapshot, CancellationToken, Task>? runWarmup = null)
+            Func<ResolvedMappingSnapshot, CancellationToken, Task>? runWarmup = null, bool showOptions = false)
         {
+            this.showOptions = showOptions;
             _probePorts = probePorts;
             _runWarmup = runWarmup ?? ((snapshot, token) => Task.Run(() => InputWarmup.Run(snapshot, token), token));
             _skipWatcher = skipWatcher;
@@ -188,6 +293,7 @@ namespace MidiToKeyApp
                 UpdateHotkeyUi();
             }
             AcceptSavedSettings();
+            InitializeTray();
             monitorTimer.Tick += (s, e) => UpdateMonitor();
             monitorTimer.Start();
             if (!skipWatcher) InitWinRtWatcher();
@@ -492,6 +598,7 @@ namespace MidiToKeyApp
         private void RefreshMappingList()
         {
             if (listMapping == null) return;
+            numTranspose.Value = settings.TransposeSemitones;
             KeyValuePair<string, string>[] mappingSnapshot;
             lock (settings.MappingLock)
             {
@@ -582,6 +689,23 @@ namespace MidiToKeyApp
             grpLayout.Controls.Add(rbUS);
             this.Controls.Add(grpLayout);
 
+            numTranspose = new NumericUpDown { Minimum = -48, Maximum = 48, Width = 62,
+                AccessibleName = "移調（半音）", TextAlign = HorizontalAlignment.Center };
+            btnOctaveDown = new Button { Text = "−12", AccessibleName = "1オクターブ下げる" };
+            btnOctaveUp = new Button { Text = "+12", AccessibleName = "1オクターブ上げる" };
+            btnResetTranspose = new Button { Text = "0に戻す" };
+            btnOctaveDown.Click += (s, e) => numTranspose.Value = Math.Max(numTranspose.Minimum, numTranspose.Value - 12);
+            btnOctaveUp.Click += (s, e) => numTranspose.Value = Math.Min(numTranspose.Maximum, numTranspose.Value + 12);
+            btnResetTranspose.Click += (s, e) => numTranspose.Value = 0;
+            numTranspose.ValueChanged += (s, e) => {
+                if (settings == null) return;
+                lock (settings.MappingLock) settings.TransposeSemitones = (int)numTranspose.Value;
+                inputTracker.PublishResolvedMapping(settings);
+                UpdateSettingsTitle();
+                UpdateOptionsSummary();
+                UpdateMonitor();
+            };
+
             var lblList = new Label { Text = "マッピング一覧", Top = 115, Left = 10, AutoSize = true };
             listMapping = new ListView 
             { 
@@ -647,7 +771,7 @@ namespace MidiToKeyApp
                 else if (!inputTracker.IsListening) StartCapture();
                 txtNote.SelectAll();
             };
-            lblCaptureHint = new Label { Text = "「鍵盤から取得」を押して、鍵盤・ペダルを操作します。\nノート番号 (0〜127) / pedal の直接入力もできます。", ForeColor = Color.DarkSlateGray };
+            lblCaptureHint = new Label { Text = "「鍵盤から取得」でノート番号・ペダルを取得します。\nノート番号 (0〜127) / pedal の直接入力もできます。", ForeColor = Color.DarkSlateGray };
             
             // ノート取得モードと変換モードのライフサイクルおよびGeneration同期
             txtNote.Enter += (s, e) => {
@@ -938,6 +1062,7 @@ namespace MidiToKeyApp
             };
 
             chkTestMode = new CheckBox { Text = "テストモード（キー送信なし）", AutoSize = true, Margin = Padding.Empty };
+            chkTestMode.CheckedChanged += (s, e) => UpdateOptionsSummary();
             lblNoteMonitor = new Label { Text = "ノート: 受信なし", AutoEllipsis = true };
             lblPedalMonitor = new Label { Text = "ペダル: 受信なし", AutoEllipsis = true };
             var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
@@ -1089,8 +1214,10 @@ namespace MidiToKeyApp
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10),
                 ColumnCount = 1, RowCount = 11, TabIndex = 0 };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            foreach (int height in new[] { 100, 24, 0, 116, 10, 36, 44, 34, 52, 28, 76 })
+            foreach (int height in new[] { 100, 24, 0, 116, 10, 36, 44, 34, 52, 28, 30 })
                 root.RowStyles.Add(height == 0 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.Absolute, height));
+            root.RowStyles[10].SizeType = SizeType.Absolute;
+            root.RowStyles[10].Height = showOptions ? 132 : 0;
 
             static void Fill(Control control)
             {
@@ -1127,6 +1254,18 @@ namespace MidiToKeyApp
             root.Controls.Add(deviceRow, 0, 0);
             Fill(listHeading); listHeading.TextAlign = ContentAlignment.MiddleLeft;
             root.Controls.Add(listHeading, 0, 1);
+            var transpose = Row(5);
+            foreach (int width in new[] { 100, 70, 60, 60, 90 })
+                transpose.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, width));
+            Control[] transposeControls = { new Label { Text = "移調（半音）", TextAlign = ContentAlignment.MiddleLeft },
+                numTranspose, btnOctaveDown, btnOctaveUp, btnResetTranspose };
+            for (int i = 0; i < transposeControls.Length; i++)
+            {
+                Fill(transposeControls[i]);
+                transposeControls[i].Margin = new Padding(0, 0, 6, 5);
+                transposeControls[i].TabIndex = i;
+                transpose.Controls.Add(transposeControls[i], i, 0);
+            }
             Fill(listMapping); listMapping.Margin = new Padding(0, 0, 0, 8); listMapping.TabIndex = 1;
             root.Controls.Add(listMapping, 0, 2);
             listMapping.SizeChanged += (s, e) => QueueMappingColumnResize();
@@ -1184,20 +1323,37 @@ namespace MidiToKeyApp
             Fill(lblStatus); Fill(lblNotification);
             root.Controls.Add(lblStatus, 0, 8); root.Controls.Add(lblNotification, 0, 9);
             var monitor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
-                ColumnCount = 1, RowCount = 4 };
+                ColumnCount = 1, RowCount = 3 };
             monitor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            monitor.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
             monitor.RowStyles.Add(new RowStyle(SizeType.Absolute, 16));
             monitor.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
             monitor.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-            monitor.Controls.Add(chkTestMode, 0, 0);
             var heading = new Label { Text = "入力モニター（最新の受信・現在の割当／送信結果ではありません）",
                 Dock = DockStyle.Fill, AutoEllipsis = true, Margin = Padding.Empty };
-            monitor.Controls.Add(heading, 0, 1);
+            monitor.Controls.Add(heading, 0, 0);
             Fill(lblNoteMonitor); Fill(lblPedalMonitor);
-            monitor.Controls.Add(lblNoteMonitor, 0, 2);
-            monitor.Controls.Add(lblPedalMonitor, 0, 3);
-            root.Controls.Add(monitor, 0, 10);
+            monitor.Controls.Add(lblNoteMonitor, 0, 1);
+            monitor.Controls.Add(lblPedalMonitor, 0, 2);
+
+            var optionsLayout = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
+                ColumnCount = 1, RowCount = 2, TabIndex = 6, Visible = showOptions };
+            optionsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            optionsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+            optionsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
+            var optionsHeader = new Label { Text = "追加設定", Dock = DockStyle.Fill, Margin = Padding.Empty,
+                TextAlign = ContentAlignment.MiddleLeft };
+            var optionsBody = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
+                ColumnCount = 1, RowCount = 3 };
+            optionsBody.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            optionsBody.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+            optionsBody.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+            optionsBody.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            optionsBody.Controls.Add(monitor, 0, 2);
+            optionsBody.Controls.Add(transpose, 0, 0);
+            optionsBody.Controls.Add(chkTestMode, 0, 1);
+            optionsLayout.Controls.Add(optionsHeader, 0, 0);
+            optionsLayout.Controls.Add(optionsBody, 0, 1);
+            root.Controls.Add(optionsLayout, 0, 10);
             Controls.Add(root);
         }
 
@@ -1253,6 +1409,8 @@ namespace MidiToKeyApp
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+            // Tests exercise the menu lifecycle without adding icons to the user's tray.
+            if (trayIcon != null) trayIcon.Visible = !_skipWatcher;
             if (_skipWatcher) return;
             DiagnosticLogger.Log("[Form1] OnShown: Performing initial port refresh.");
             RefreshPorts(true);
@@ -2060,8 +2218,15 @@ namespace MidiToKeyApp
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { notificationTimer.Dispose(); monitorTimer.Dispose(); }
+            if (disposing)
+            {
+                notificationTimer.Dispose();
+                monitorTimer.Dispose();
+                trayIcon?.Dispose();
+                trayMenu?.Dispose();
+            }
             base.Dispose(disposing);
+            if (disposing) { appIcons?.Dispose(); appIcons = null; }
         }
 
         private void UpdateSettingsFromUI()
@@ -2082,6 +2247,7 @@ namespace MidiToKeyApp
             }
             notificationTimer.Stop();
             monitorTimer.Stop();
+            if (trayIcon != null) trayIcon.Visible = false;
             _isClosing = true;
             _startCancellation?.Cancel();
             _captureCancellation?.Cancel();
