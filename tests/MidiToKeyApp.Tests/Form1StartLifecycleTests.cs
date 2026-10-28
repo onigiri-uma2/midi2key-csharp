@@ -8,6 +8,325 @@ namespace MidiToKeyApp.Tests;
 [TestClass]
 public sealed class Form1StartLifecycleTests
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int GetWindowStyle(IntPtr handle, int index);
+
+    [TestMethod]
+    public async Task TestMode_HotkeySessionAndMonitor_DoNotSendKeys_ThenResumeNormally()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.ReplaceMappingSnapshotForTest();
+            form.FocusPortsForTest();
+            var mode = form.ControlForTest<CheckBox>("chkTestMode");
+            mode.Checked = true;
+            form.SendHotkeyForTest();
+            Assert.IsFalse(mode.Enabled);
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            StringAssert.Contains(form.StatusForTest, "テスト中");
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            await WaitUntilAsync(() => form.ControlForTest<Label>("lblNoteMonitor").Text.Contains("(60)"));
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 1, 127, 99, true, listener.CurrentGeneration));
+            listener.FireControl(new(port.DeviceId, port.DeviceName, 1, 64, 127, listener.CurrentGeneration));
+            await WaitUntilAsync(() => form.ControlForTest<Label>("lblNoteMonitor").Text.Contains("未割り当て") &&
+                form.ControlForTest<Label>("lblPedalMonitor").Text.Contains("ON"));
+            StringAssert.Contains(form.ControlForTest<Label>("lblNoteMonitor").Text, "Ch 2");
+            Assert.AreEqual(0, form.OutputForTest.History.Count);
+            form.SendHotkeyForTest();
+            await WaitUntilAsync(() => !form.MidiBusyForTest && mode.Enabled);
+            Assert.AreEqual("ノート: 受信なし", form.ControlForTest<Label>("lblNoteMonitor").Text);
+            mode.Checked = false;
+            form.SendHotkeyForTest();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            port = listener.GetActivePorts().Single();
+            listener.FireNote(new(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            Assert.AreEqual(1, form.OutputForTest.KeyDownCount);
+            form.SendHotkeyForTest();
+            await WaitUntilAsync(() => !form.MidiBusyForTest);
+            Assert.AreEqual(1, form.OutputForTest.KeyUpCount);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task Resizing_GrowsMappingList_AndKeepsCaptureControlsVisible()
+    {
+        await RunFormAsync(async form =>
+        {
+            var list = form.ControlForTest<ListView>("listMapping");
+            var note = form.ControlForTest<TextBox>("txtNote");
+            var capture = form.ControlForTest<Button>("btnCaptureNote");
+            var key = form.ControlForTest<TextBox>("txtKey");
+            for (int i = 0; i < 15; i++)
+                list.Items.Add(new ListViewItem(new[] { (60 + i).ToString(), $"Note {60 + i}", "a" }));
+
+            async Task CheckLayout(string snapshot)
+            {
+                form.PerformLayout();
+                await Task.Delay(100);
+                await WaitUntilAsync(() => (GetWindowStyle(list.Handle, -16) & 0x00100000) == 0);
+                Assert.IsTrue(list.Columns.Cast<ColumnHeader>().Sum(column => column.Width) <=
+                    list.ClientSize.Width - SystemInformation.VerticalScrollBarWidth,
+                    $"Mapping columns should fit beside the vertical scrollbar at {snapshot}.");
+                Assert.AreEqual(0, GetWindowStyle(list.Handle, -16) & 0x00100000,
+                    $"The mapping list should not have a horizontal scrollbar at {snapshot}.");
+                var controls = new Control[] { list, note, capture, key,
+                    form.ControlForTest<CheckBox>("chkTestMode"),
+                    form.ControlForTest<Label>("lblNoteMonitor"), form.ControlForTest<Label>("lblPedalMonitor") };
+                var bounds = controls.Select(c => form.RectangleToClient(c.RectangleToScreen(c.ClientRectangle))).ToArray();
+                for (int i = 0; i < bounds.Length; i++)
+                {
+                    Assert.IsTrue(form.ClientRectangle.Contains(bounds[i]), $"{controls[i].Name} is outside the client area at {snapshot}.");
+                    for (int j = i + 1; j < bounds.Length; j++)
+                        Assert.IsFalse(bounds[i].IntersectsWith(bounds[j]), $"Controls overlap at {snapshot}.");
+                }
+
+                string? directory = Environment.GetEnvironmentVariable("MIDI2KEY_UI_SNAPSHOT_DIR");
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                    using var bitmap = new System.Drawing.Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(System.Drawing.Point.Empty, form.Size));
+                    bitmap.Save(Path.Combine(directory, $"form-{snapshot}.png"));
+                }
+            }
+
+            await CheckLayout("default");
+            form.Size = form.MinimumSize;
+            await CheckLayout("minimum");
+            int minimumHeight = list.Height;
+            int minimumWidth = list.Width;
+            form.Size = new System.Drawing.Size(form.Width + 300, form.Height + 250);
+            await CheckLayout("expanded");
+            Assert.IsTrue(list.Height > minimumHeight, "The mapping list should use extra vertical space.");
+            Assert.IsTrue(list.Width > minimumWidth, "The mapping list should use extra horizontal space.");
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task CaptureButton_FocusesNoteAndCapturesMidi_LeavingRestoresMode(bool conversionRunning)
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.FocusPortsForTest();
+            if (conversionRunning)
+            {
+                form.ReplaceMappingSnapshotForTest();
+                form.StartForTest();
+                await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            }
+
+            int initialStarts = listener.StartCount;
+            form.ControlForTest<Button>("btnCaptureNote").PerformClick();
+            await WaitUntilAsync(() => form.CapturingForTest && !form.MidiBusyForTest);
+            Assert.IsTrue(form.ControlForTest<TextBox>("txtNote").Focused);
+            await WaitUntilAsync(() => form.ControlForTest<Label>("lblCaptureHint").Text.Contains("入力待ち", StringComparison.Ordinal));
+            Assert.AreEqual(initialStarts + (conversionRunning ? 0 : 1), listener.StartCount);
+
+            var port = listener.GetActivePorts().Single();
+            listener.FireNote(new MidiNoteData(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
+            await WaitUntilAsync(() => form.NoteTextForTest == "60");
+            StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "取得: 60");
+            Assert.AreEqual(0, form.OutputForTest.KeyDownCount, "Captured notes must not emit mapped keys.");
+
+            form.FocusPortsForTest();
+            await WaitUntilAsync(() => !form.CapturingForTest && !form.MidiBusyForTest);
+            StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "取得を終了");
+            Assert.AreEqual(conversionRunning, form.ListeningForTest);
+            Assert.AreEqual(conversionRunning ? 0 : 1, listener.StopCount);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task CaptureButton_WithoutSelectedPort_ExplainsPrerequisite()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(form =>
+        {
+            form.FocusPortsForTest();
+            form.ControlForTest<CheckedListBox>("chkPorts").SetItemChecked(0, false);
+            form.ControlForTest<Button>("btnCaptureNote").PerformClick();
+            Assert.AreEqual(0, listener.StartCount);
+            Assert.IsFalse(form.CapturingForTest);
+            StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "ポート");
+            return Task.CompletedTask;
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task CaptureButton_WhilePortOpens_ShowsPreparationUntilReady()
+    {
+        var listener = new FakeMidiListener
+        {
+            StartEntered = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseStart = new(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.FocusPortsForTest();
+                form.ControlForTest<Button>("btnCaptureNote").PerformClick();
+                await listener.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                string hint = form.ControlForTest<Label>("lblCaptureHint").Text;
+                StringAssert.Contains(hint, "準備中");
+                Assert.IsFalse(hint.Contains("入力待ち", StringComparison.Ordinal));
+                listener.ReleaseStart.TrySetResult();
+                await WaitUntilAsync(() => form.CapturingForTest && !form.MidiBusyForTest);
+                await WaitUntilAsync(() => form.ControlForTest<Label>("lblCaptureHint").Text.Contains("入力待ち", StringComparison.Ordinal));
+                form.FocusPortsForTest();
+                await WaitUntilAsync(() => !form.CapturingForTest && !form.MidiBusyForTest);
+            }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally { listener.ReleaseStart.TrySetResult(); }
+    }
+
+    [TestMethod]
+    public async Task SettingsTitle_TracksLayoutReversion_AndSaveClearsMappingChanges()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"midi2key-ui-{Guid.NewGuid():N}.json");
+        try
+        {
+            await RunFormAsync(form =>
+            {
+                form.SetSettingsPathForTest(path);
+                Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));
+                StringAssert.Contains(form.Text, Path.GetFileName(path));
+
+                form.ControlForTest<RadioButton>("rbJIS").Checked = true;
+                StringAssert.Contains(form.Text, "*未保存");
+                form.ControlForTest<RadioButton>("rbUS").Checked = true;
+                Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal),
+                    "Returning to the saved layout should clear the dirty marker.");
+
+                form.SetMappingInputForTest("60", "a");
+                form.ControlForTest<Button>("btnAdd").PerformClick();
+                StringAssert.Contains(form.Text, "*未保存");
+                form.ControlForTest<Button>("btnSave").PerformClick();
+
+                Assert.AreEqual("a", SettingsManager.Load(path).Mapping["60"]);
+                Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));
+                StringAssert.Contains(form.NotificationForTest, Path.GetFileName(path));
+                return Task.CompletedTask;
+            }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [DataTestMethod]
+    [DataRow("060", "60")]
+    [DataRow("PeDaL", "pedal")]
+    public async Task MappingAction_NormalizesInput_AndUpdatesExistingEntry(string input, string storedNote)
+    {
+        await RunFormAsync(form =>
+        {
+            var action = form.ControlForTest<Button>("btnAdd");
+            form.SetMappingInputForTest(input, "a");
+            Assert.AreEqual("追加", action.Text);
+            action.PerformClick();
+            Assert.AreEqual("更新", action.Text);
+            Assert.AreEqual("a", form.SettingsForTest.Mapping[storedNote]);
+
+            form.SetMappingInputForTest(input, "b");
+            action.PerformClick();
+            Assert.AreEqual(1, form.SettingsForTest.Mapping.Count);
+            Assert.AreEqual("b", form.SettingsForTest.Mapping[storedNote]);
+            Assert.AreEqual("更新", action.Text);
+
+            form.SetMappingInputForTest("61", "b");
+            Assert.AreEqual("追加", action.Text);
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task SaveNotification_AndExpiry_PreserveRunningConversionStatus()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"midi2key-ui-{Guid.NewGuid():N}.json");
+        try
+        {
+            await RunFormAsync(async form =>
+            {
+                form.SetSettingsPathForTest(path);
+                form.StartForTest();
+                await WaitUntilAsync(() => !form.TransitioningForTest);
+                Assert.IsTrue(form.ListeningForTest);
+                var status = form.ControlForTest<Label>("lblStatus");
+                string runningText = status.Text;
+                var runningColor = status.ForeColor;
+
+                form.ControlForTest<Button>("btnSave").PerformClick();
+                StringAssert.Contains(form.NotificationForTest, "保存完了");
+                Assert.AreEqual(runningText, status.Text);
+                Assert.AreEqual(runningColor, status.ForeColor);
+                Assert.IsTrue(form.ListeningForTest);
+
+                form.ExpireNotificationForTest();
+                Assert.AreEqual("", form.NotificationForTest);
+                Assert.AreEqual(runningText, status.Text);
+                Assert.AreEqual(runningColor, status.ForeColor);
+                Assert.IsTrue(form.ListeningForTest);
+            }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")),
+                (_, _) => Task.CompletedTask);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
+    public async Task PortRefresh_PreservesSavedSelectionWithoutDirtyingSettings()
+    {
+        await RunFormAsync(form =>
+        {
+            form.ApplyPortsForTest(new[] { "Port B" }, new[] { "Port A" });
+            CollectionAssert.AreEqual(new[] { "Port A" }, form.SettingsForTest.SelectedPorts);
+            Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal),
+                "Refreshing a temporarily unavailable selected port should not edit saved settings.");
+
+            form.ApplyPortsForTest(new[] { "Port A", "Port B" }, new[] { "Port A" });
+            Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));
+            var ports = form.ControlForTest<CheckedListBox>("chkPorts");
+            ports.SetItemChecked(1, true);
+            StringAssert.Contains(form.Text, "*未保存");
+            CollectionAssert.AreEqual(new[] { "Port A", "Port B" }, form.SettingsForTest.SelectedPorts);
+            ports.SetItemChecked(1, false);
+            Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A", "Port B")));
+    }
+
+    [TestMethod]
+    public async Task DirtyClose_CancelKeepsConversionRunning_AndDiscardStopsIt()
+    {
+        var listener = new FakeMidiListener();
+        await RunFormAsync(async form =>
+        {
+            form.StartForTest();
+            await WaitUntilAsync(() => !form.TransitioningForTest);
+            Assert.IsTrue(form.ListeningForTest);
+            form.SetMappingInputForTest("60", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            StringAssert.Contains(form.Text, "*未保存");
+
+            form.PendingChangesResponseForTest = DialogResult.Cancel;
+            Assert.IsTrue(form.TryDirtyCloseForTest().Cancel);
+            Assert.AreEqual(1, form.PendingChangesPromptCountForTest);
+            Assert.IsTrue(form.ListeningForTest,
+                "Canceling the unsaved-settings prompt must preserve the conversion session.");
+            Assert.AreEqual(0, listener.StopCount);
+            StringAssert.Contains(form.Text, "*未保存");
+
+            form.PendingChangesResponseForTest = DialogResult.No;
+            Assert.IsFalse(form.TryDirtyCloseForTest().Cancel);
+            Assert.AreEqual(2, form.PendingChangesPromptCountForTest);
+            await WaitUntilAsync(() => !form.ListeningForTest && listener.StopCount > 0);
+        }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")),
+            (_, _) => Task.CompletedTask);
+    }
+
     [DataTestMethod]
     [DataRow(false)]
     [DataRow(true)]
@@ -737,6 +1056,7 @@ public sealed class Form1StartLifecycleTests
                     }
                     finally
                     {
+                        form.AcceptSavedSettingsForTest();
                         form.Close();
                     }
                 };
@@ -804,6 +1124,55 @@ public sealed class Form1StartLifecycleTests
         }
 
         public FakeKeyboardOutput OutputForTest { get; }
+
+        public DialogResult PendingChangesResponseForTest = DialogResult.No;
+        public int PendingChangesPromptCountForTest { get; private set; }
+
+        protected override DialogResult AskToSaveChanges()
+        {
+            PendingChangesPromptCountForTest++;
+            return PendingChangesResponseForTest;
+        }
+
+        public FormClosingEventArgs TryDirtyCloseForTest()
+        {
+            var args = new FormClosingEventArgs(CloseReason.UserClosing, false);
+            base.OnFormClosing(args);
+            return args;
+        }
+
+        public T ControlForTest<T>(string name) where T : Control =>
+            (T)typeof(Form1).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+
+        public AppSettings SettingsForTest =>
+            (AppSettings)typeof(Form1).GetField("settings", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+
+        public string NotificationForTest => ControlForTest<Label>("lblNotification").Text;
+
+        public void AcceptSavedSettingsForTest() =>
+            typeof(Form1).GetMethod("AcceptSavedSettings", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, null);
+
+        public void SetSettingsPathForTest(string path)
+        {
+            typeof(Form1).GetField("currentSettingsPath", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(this, path);
+            AcceptSavedSettingsForTest();
+        }
+
+        public void SetMappingInputForTest(string note, string key)
+        {
+            ControlForTest<TextBox>("txtNote").Text = note;
+            ControlForTest<TextBox>("txtKey").Text = key;
+        }
+
+        public void ExpireNotificationForTest()
+        {
+            var timer = typeof(Form1).GetField("notificationTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!;
+            typeof(System.Windows.Forms.Timer).GetMethod("OnTick", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(timer, new object[] { EventArgs.Empty });
+        }
+
+        public void ApplyPortsForTest(string[] available, string[] selected) =>
+            typeof(Form1).GetMethod("ApplyPortsToUi", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this,
+                new object[] { available, selected, OutOfProcessWinMmResult.Succeeded(available) });
 
         public bool MidiBusyForTest => ((MidiListenerLifecycle)typeof(Form1).GetField("midiLifecycle", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)!).IsBusy;
         public bool HealthCheckCompletedForTest => (long)typeof(Form1).GetField("_latestCompletedHealthCheckRequestId", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(this)! > 0;
@@ -880,6 +1249,10 @@ public sealed class Form1StartLifecycleTests
             ports.SetItemChecked(1, true);
         }
 
-        public void SimulateFormClosingForTest() => base.OnFormClosing(new FormClosingEventArgs(CloseReason.UserClosing, false));
+        public void SimulateFormClosingForTest()
+        {
+            AcceptSavedSettingsForTest();
+            base.OnFormClosing(new FormClosingEventArgs(CloseReason.UserClosing, false));
+        }
     }
 }

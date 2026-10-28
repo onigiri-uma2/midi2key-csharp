@@ -14,6 +14,9 @@ namespace MidiToKeyApp
     /// MIDI入力イベントの状態遷移、重複防止、押下時キースナップショットの追跡、
     /// およびキャプチャモードと通常変換モードの排他・抑止を管理するサービスクラス。
     /// </summary>
+    public readonly record struct MidiMonitorSample(string DeviceId, string DeviceName, int Channel,
+        int Number, int Value, bool IsDown, long Generation);
+
     public class InputTracker
     {
         private static readonly string[] NoteNumbers = CreateNoteNumbers();
@@ -43,6 +46,24 @@ namespace MidiToKeyApp
 
         // 変換実行中フラグ
         private volatile bool _isListening = false;
+        private volatile bool _testMode;
+        public bool IsTestMode => _testMode;
+        public bool MonitorEnabled { get; set; }
+        private MidiMonitorSample? _lastNote;
+        private MidiMonitorSample? _lastPedal;
+
+        // Two latest values only: callbacks do not format strings or enqueue UI messages.
+        public (MidiMonitorSample? Note, MidiMonitorSample? Pedal) ReadMonitor()
+        {
+            lock (_stateLock)
+            {
+                MidiMonitorSample? Current(MidiMonitorSample? sample) =>
+                    (_isListening || _isCapturing) && sample is { } value &&
+                    value.Generation == _currentSessionId && !_disconnectedDeviceIds.Contains(value.DeviceId)
+                        ? sample : null;
+                return (Current(_lastNote), Current(_lastPedal));
+            }
+        }
 
         // キャプチャモード（ノート/ペダル取得）フラグ
         private volatile bool _isCapturing = false;
@@ -135,7 +156,7 @@ namespace MidiToKeyApp
         /// </summary>
         public long StartSession() => StartConversionSession();
 
-        public long StartConversionSession()
+        public long StartConversionSession(bool testMode = false)
         {
             using var notifications = _keySimulator.DeferNotifications();
             lock (_transitionLock)
@@ -147,6 +168,8 @@ namespace MidiToKeyApp
                     !_keySimulator.TryPrepareStartConversion())
                 {
                     _isListening = false;
+                    _testMode = false;
+                    _lastNote = _lastPedal = null;
                     _isCapturing = false;
                     _activeNotes.Clear();
                     _pedalStates.Clear();
@@ -154,6 +177,8 @@ namespace MidiToKeyApp
                     _disconnectedDeviceIds.Clear();
                     throw new InvalidOperationException("前のセッションのキーを解放できなかったため開始できません。");
                 }
+                _testMode = testMode;
+                _lastNote = _lastPedal = null;
                 _isListening = true;
                 _isCapturing = false;
                 _activeNotes.Clear();
@@ -232,6 +257,8 @@ namespace MidiToKeyApp
                 _isCapturing = false;
                 lock (_stateLock)
                 {
+                    _testMode = false;
+                    _lastNote = _lastPedal = null;
                     _keySimulator.ReleaseAllKeys();
                     _activeNotes.Clear();
                     _pedalStates.Clear();
@@ -287,6 +314,10 @@ namespace MidiToKeyApp
                     return;
                 }
 
+                if (MonitorEnabled && (_isListening || _isCapturing))
+                    _lastNote = new(note.DeviceId, note.DeviceName, note.Channel, note.NoteNumber,
+                        note.Velocity, note.IsDown, note.Generation);
+
                 if (note.IsDown)
                 {
                     // --- NoteOn 処理 ---
@@ -324,6 +355,11 @@ namespace MidiToKeyApp
                     }
 
                     // 5. 通常変換の新規NoteOn処理
+                    if (_testMode)
+                    {
+                        LatencyMeasurement.RecordSuppressed(note.TraceId, "test_mode");
+                        return;
+                    }
                     var resolved = ResolveNote(note.NoteNumber);
                     if (resolved.IsValid)
                     {
@@ -403,6 +439,10 @@ namespace MidiToKeyApp
                     return;
                 }
 
+                if (MonitorEnabled && (_isListening || _isCapturing))
+                    _lastPedal = new(cc.DeviceId, cc.DeviceName, cc.Channel, cc.ControlNumber,
+                        cc.ControlValue, isDown, cc.Generation);
+
                 _pedalStates.TryGetValue(pedalKey, out bool currentDown);
 
                 // 状態に変化がない重複イベント（例: 127→127→100、または 63→0）は無視
@@ -448,6 +488,11 @@ namespace MidiToKeyApp
                     }
 
                     // 5. 通常変換処理
+                    if (_testMode)
+                    {
+                        LatencyMeasurement.RecordSuppressed(cc.TraceId, "test_mode");
+                        return;
+                    }
                     var resolved = ResolvePedal();
                     if (resolved.IsValid)
                     {

@@ -28,10 +28,99 @@ namespace MidiToKeyApp
         private ListView listMapping = null!;
         private TextBox txtNote = null!;
         private TextBox txtKey = null!;
+        private Button btnCaptureNote = null!;
+        private Label lblCaptureHint = null!;
         private Label lblStatus = null!;
         private Label lblHotkeyInfo = null!;
         private Button btnHotkeyConfig = null!;
         private Button btnSaveAs = null!;
+        private Button btnSave = null!;
+        private Button btnAdd = null!;
+        private Label lblNotification = null!;
+        private CheckBox chkTestMode = null!;
+        private Label lblNoteMonitor = null!;
+        private Label lblPedalMonitor = null!;
+        private readonly System.Windows.Forms.Timer monitorTimer = new() { Interval = 100 };
+
+        private string SessionDisplay => inputTracker.IsTestMode ? "テスト中・キー送信なし" : "実行中";
+
+        private void UpdateMonitor()
+        {
+            if (_isClosing || IsDisposed) return;
+            chkTestMode.Enabled = !_isTransitioning && !inputTracker.IsListening && !midiLifecycle.IsBusy;
+            var sample = inputTracker.ReadMonitor();
+            lblNoteMonitor.Text = FormatMonitor(sample.Note, false);
+            lblPedalMonitor.Text = FormatMonitor(sample.Pedal, true);
+        }
+
+        private string FormatMonitor(MidiMonitorSample? sample, bool pedal)
+        {
+            if (sample is not { } value) return pedal ? "ペダル: 受信なし" : "ノート: 受信なし";
+            string key = pedal ? "pedal" : value.Number.ToString();
+            string target;
+            lock (settings.MappingLock)
+                target = settings.Mapping.TryGetValue(key, out var mapped) ? mapped : "未割り当て";
+            string name = pedal ? "ペダル" : $"{MidiNoteHelper.GetNoteDisplayName(value.Number)} ({value.Number})";
+            return $"{value.DeviceName} / Ch {value.Channel + 1}: {name} {(value.IsDown ? "ON" : "OFF")} [{value.Value}] → {target}";
+        }
+        private readonly System.Windows.Forms.Timer notificationTimer = new() { Interval = 4000 };
+        private string savedSettings = "";
+        private string baseTitle = "";
+        private bool settingsReady;
+        private bool applyingPorts;
+        private bool sizingMappingColumns;
+        private bool mappingColumnResizePending;
+
+        private string SettingsFingerprint() => System.Text.Json.JsonSerializer.Serialize(new {
+            Ports = settings.SelectedPorts.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            Mapping = settings.Mapping.OrderBy(p => p.Key, StringComparer.Ordinal).ToArray(),
+            settings.KeyboardLayout,
+            settings.Hotkey
+        });
+        private bool HasUnsavedChanges => settingsReady && SettingsFingerprint() != savedSettings;
+
+        private void UpdateSettingsTitle()
+        {
+            if (!settingsReady) return;
+            Text = $"{baseTitle} — {Path.GetFileName(currentSettingsPath)}{(HasUnsavedChanges ? " *未保存" : "")}";
+        }
+
+        private void AcceptSavedSettings()
+        {
+            savedSettings = SettingsFingerprint();
+            settingsReady = true;
+            UpdateSettingsTitle();
+        }
+
+        private void ShowNotification(string message)
+        {
+            lblNotification.Text = message;
+            notificationTimer.Stop();
+            notificationTimer.Start();
+        }
+
+        protected virtual DialogResult AskToSaveChanges() => MessageBox.Show(this,
+            "設定に未保存の変更があります。保存しますか？", "未保存の設定",
+            MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+        private bool ConfirmPendingChanges()
+        {
+            if (!HasUnsavedChanges) return true;
+            var result = AskToSaveChanges();
+            if (result == DialogResult.Cancel) return false;
+            if (result == DialogResult.No) return true;
+            btnSave.PerformClick();
+            return !HasUnsavedChanges;
+        }
+
+        private void UpdateMappingAction()
+        {
+            if (settings == null || btnAdd == null) return;
+            string note = txtNote.Text.Trim();
+            if (int.TryParse(note, out int number)) note = number.ToString();
+            if (note.Equals("pedal", StringComparison.OrdinalIgnoreCase)) note = "pedal";
+            btnAdd.Text = settings.Mapping.ContainsKey(note) ? "更新" : "追加";
+        }
         
         private IKeyboardMouseEvents? globalHook;
         private IMidiListener midiListener = null!;
@@ -98,26 +187,33 @@ namespace MidiToKeyApp
                 inputTracker.PublishResolvedMapping(settings);
                 UpdateHotkeyUi();
             }
+            AcceptSavedSettings();
+            monitorTimer.Tick += (s, e) => UpdateMonitor();
+            monitorTimer.Start();
             if (!skipWatcher) InitWinRtWatcher();
         }
         
         private void SetupDependencies(IKeyboardOutput? output = null, IMidiListener? listener = null)
         {
             keySimulator = new KeySimulator(output);
-            inputTracker = new InputTracker(keySimulator, () => settings);
+            inputTracker = new InputTracker(keySimulator, () => settings) { MonitorEnabled = true };
             midiListener = listener ?? new MidiListener();
             midiLifecycle = new MidiListenerLifecycle(midiListener);
 
             // ノート/ペダル取得（キャプチャモード）時のUI非同期更新（デッドロック防止）
             inputTracker.OnInputCaptured += (capturedText) => {
+                long capturedSession = inputTracker.CurrentSessionId;
                 if (IsHandleCreated && !IsDisposed)
                 {
                     try
                     {
                         BeginInvoke(new Action(() => {
-                            if (!IsDisposed)
+                            if (!IsDisposed && !_isClosing && txtNote.Focused && inputTracker.IsCapturing &&
+                                inputTracker.CurrentSessionId == capturedSession)
                             {
                                 txtNote.Text = capturedText;
+                                if (txtNote.Focused && inputTracker.IsCapturing)
+                                    lblCaptureHint.Text = $"取得: {capturedText}。次に変換キーを入力してください。\n別の鍵盤・ペダルを押すと取り直せます。";
                             }
                         }));
                     }
@@ -322,39 +418,45 @@ namespace MidiToKeyApp
 
         private void ApplyPortsToUi(IReadOnlyList<string> availablePorts, IReadOnlyList<string> checkedPorts, OutOfProcessWinMmResult outProcResult)
         {
-            chkPorts.Items.Clear();
-
-            // 利用可能なポートの厳格な絞り込み:
-            // 1. 新規プロセスWinMMで正常に0件（消失）と確認されたポートは、取り外し済みのため除外
-            // 2. 新規プロセスWinMMで検出されていても親プロセスDryWetMIDIにないポートは除外
-            // 3. 診断プロセス失敗時は親プロセスの一覧をそのまま使用
             List<string> validPorts;
-            if (outProcResult.Success && outProcResult.Ports.Count == 0)
+            applyingPorts = true;
+            try
             {
-                // 新規プロセスWinMMが正常に0件: デバイスが取り外されているため、親プロセスの残存ポートは利用不可
-                validPorts = new List<string>();
-            }
-            else if (outProcResult.Success)
-            {
-                // 新規プロセスWinMMに含まれており、かつ親プロセスにも存在するポートのみ
-                var outSet = new HashSet<string>(outProcResult.Ports, StringComparer.OrdinalIgnoreCase);
-                validPorts = availablePorts.Where(p => outSet.Contains(p)).ToList();
-            }
-            else
-            {
-                // 新規プロセスの確認失敗時は親プロセスの列挙をそのまま使用
-                validPorts = availablePorts.ToList();
-            }
+                chkPorts.Items.Clear();
 
-            // 純粋なポート名のみを追加（修飾文字列は一切追加しない）
-            foreach (var port in validPorts)
-            {
-                int index = chkPorts.Items.Add(port);
-                if (checkedPorts.Contains(port, StringComparer.OrdinalIgnoreCase))
+                // 利用可能なポートの厳格な絞り込み:
+                // 1. 新規プロセスWinMMで正常に0件（消失）と確認されたポートは、取り外し済みのため除外
+                // 2. 新規プロセスWinMMで検出されていても親プロセスDryWetMIDIにないポートは除外
+                // 3. 診断プロセス失敗時は親プロセスの一覧をそのまま使用
+                if (outProcResult.Success && outProcResult.Ports.Count == 0)
                 {
-                    chkPorts.SetItemChecked(index, true);
+                    // 新規プロセスWinMMが正常に0件: デバイスが取り外されているため、親プロセスの残存ポートは利用不可
+                    validPorts = new List<string>();
                 }
+                else if (outProcResult.Success)
+                {
+                    // 新規プロセスWinMMに含まれており、かつ親プロセスにも存在するポートのみ
+                    var outSet = new HashSet<string>(outProcResult.Ports, StringComparer.OrdinalIgnoreCase);
+                    validPorts = availablePorts.Where(p => outSet.Contains(p)).ToList();
+                }
+                else
+                {
+                    // 新規プロセスの確認失敗時は親プロセスの列挙をそのまま使用
+                    validPorts = availablePorts.ToList();
+                }
+
+                // 純粋なポート名のみを追加（修飾文字列は一切追加しない）
+                foreach (var port in validPorts)
+                {
+                    int index = chkPorts.Items.Add(port);
+                    if (checkedPorts.Contains(port, StringComparer.OrdinalIgnoreCase))
+                    {
+                        chkPorts.SetItemChecked(index, true);
+                    }
+                }
+
             }
+            finally { applyingPorts = false; }
 
             // ステータス表示の更新（接続不一致はステータス欄で案内）
             // 変換中（inputTracker.IsListening == true）はステータスを「停止中」へ書き換えない
@@ -378,7 +480,7 @@ namespace MidiToKeyApp
                 else
                 {
                     lblStatus.Text = "ステータス: 停止中";
-                    lblStatus.ForeColor = Color.Red;
+                    lblStatus.ForeColor = SystemColors.ControlText;
                 }
             }
         }
@@ -426,6 +528,9 @@ namespace MidiToKeyApp
                 item.SubItems.Add(targetKey);
                 listMapping.Items.Add(item);
             }
+            QueueMappingColumnResize();
+            UpdateMappingAction();
+            UpdateSettingsTitle();
         }
 
         /// <summary>
@@ -436,15 +541,27 @@ namespace MidiToKeyApp
             var version = typeof(Form1).Assembly.GetName().Version;
             string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.2.1";
             this.Text = $"midi2key C#{verStr}";
-            this.Width = 430;
-            this.Height = 575;
-            this.FormBorderStyle = FormBorderStyle.FixedDialog;
-            this.MaximizeBox = false;
+            this.SuspendLayout();
+            this.AutoScaleDimensions = new SizeF(96, 96);
+            this.AutoScaleMode = AutoScaleMode.Dpi;
+            this.ClientSize = new Size(480, 680);
+            baseTitle = this.Text;
+            this.FormBorderStyle = FormBorderStyle.Sizable;
+            this.MaximizeBox = true;
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("Yu Gothic UI", 9);
 
-            var grpPorts = new GroupBox { Text = "🎛 MIDIポート選択", Width = 275, Height = 95, Top = 10, Left = 10 };
+            var grpPorts = new GroupBox { Text = "MIDIポート選択", Width = 275, Height = 95, Top = 10, Left = 10 };
             chkPorts = new CheckedListBox { Top = 18, Left = 10, Width = 255, Height = 52, BorderStyle = BorderStyle.None, CheckOnClick = true };
+            chkPorts.ItemCheck += (s, e) => {
+                if (!settingsReady || applyingPorts) return;
+                var selected = GetSelectedPorts();
+                string port = chkPorts.Items[e.Index]?.ToString() ?? "";
+                selected.RemoveAll(p => p == port);
+                if (e.NewValue == CheckState.Checked) selected.Add(port);
+                settings.SelectedPorts = selected;
+                UpdateSettingsTitle();
+            };
             chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
             grpPorts.Controls.Add(chkPorts);
 
@@ -452,20 +569,20 @@ namespace MidiToKeyApp
             grpPorts.Controls.Add(lblPortWarn);
             this.Controls.Add(grpPorts);
 
-            var grpLayout = new GroupBox { Text = "🌐 キー配列", Top = 10, Left = 295, Width = 105, Height = 95 };
+            var grpLayout = new GroupBox { Text = "キー配列", Top = 10, Left = 295, Width = 105, Height = 95 };
             rbJIS = new RadioButton { Text = "JIS", Top = 25, Left = 20, Width = 65 };
             rbUS = new RadioButton { Text = "US", Top = 55, Left = 20, Width = 65 };
             rbUS.CheckedChanged += (s, e) => {
-                if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); }
+                if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); }
             };
             rbJIS.CheckedChanged += (s, e) => {
-                if (settings != null && rbJIS.Checked) { settings.KeyboardLayout = "JIS"; inputTracker.PublishResolvedMapping(settings); }
+                if (settings != null && rbJIS.Checked) { settings.KeyboardLayout = "JIS"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); }
             };
             grpLayout.Controls.Add(rbJIS);
             grpLayout.Controls.Add(rbUS);
             this.Controls.Add(grpLayout);
 
-            var lblList = new Label { Text = "📄 マッピング一覧", Top = 115, Left = 10, AutoSize = true };
+            var lblList = new Label { Text = "マッピング一覧", Top = 115, Left = 10, AutoSize = true };
             listMapping = new ListView 
             { 
                 Top = 135, 
@@ -520,8 +637,17 @@ namespace MidiToKeyApp
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "🎹 ノート/ペダル", Top = 280, Left = 10, AutoSize = true };
+            var lblNote = new Label { Text = "ノート/ペダル", Top = 280, Left = 10, AutoSize = true };
             txtNote = new TextBox { Top = 300, Left = 10, Width = 75 };
+            txtNote.AccessibleName = "ノート番号またはペダル";
+            txtNote.AccessibleDescription = "0から127、またはpedalを入力できます。フォーカス中はMIDI鍵盤やペダルからも取得できます。";
+            btnCaptureNote = new Button { Text = "鍵盤から取得", AutoSize = true, Height = 28 };
+            btnCaptureNote.Click += (s, e) => {
+                if (!txtNote.Focused) txtNote.Focus();
+                else if (!inputTracker.IsListening) StartCapture();
+                txtNote.SelectAll();
+            };
+            lblCaptureHint = new Label { Text = "「鍵盤から取得」を押して、鍵盤・ペダルを操作します。\nノート番号 (0〜127) / pedal の直接入力もできます。", ForeColor = Color.DarkSlateGray };
             
             // ノート取得モードと変換モードのライフサイクルおよびGeneration同期
             txtNote.Enter += (s, e) => {
@@ -533,6 +659,9 @@ namespace MidiToKeyApp
                 {
                     // 変換実行中: リスナーは再起動せずキャプチャフラグのみON
                     inputTracker.SetCapturing(true);
+                    if (_isTransitioning)
+                        lblCaptureHint.Text = "変換の開始処理中です。完了するまでお待ちください。";
+                    else ShowCaptureReady();
                 }
             };
             txtNote.Leave += (s, e) => {
@@ -546,9 +675,10 @@ namespace MidiToKeyApp
                     // 変換実行中: キャプチャフラグのみOFF（押下中ノートの抑止は維持）
                     inputTracker.SetCapturing(false);
                 }
+                lblCaptureHint.Text = "取得を終了しました。「鍵盤から取得」で再開できます。\nノート番号 (0〜127) / pedal の直接入力もできます。";
             };
 
-            var lblKey = new Label { Text = "⌨ キー", Top = 280, Left = 95, AutoSize = true };
+            var lblKey = new Label { Text = "変換キー", Top = 280, Left = 95, AutoSize = true };
             txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
             // キー入力欄の「消去」ボタン
@@ -594,7 +724,8 @@ namespace MidiToKeyApp
             };
 
             // ノート番号バリデーション（0〜127）、pedal の登録、およびキー厳格検証
-            var btnAdd = new Button { Text = "追加", Top = 275, Left = 315, Width = 85, Height = 25 };
+            btnAdd = new Button { Text = "追加", Top = 275, Left = 315, Width = 85, Height = 25 };
+            txtNote.TextChanged += (s, e) => UpdateMappingAction();
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
                 string keyInput = txtKey.Text.Trim();
@@ -695,7 +826,7 @@ namespace MidiToKeyApp
             this.Controls.Add(sep);
 
             // 「上書き保存」ボタン
-            var btnSave = new Button { Text = "上書き保存", Top = 355, Left = 10, Width = 85, Height = 28 };
+            btnSave = new Button { Text = "上書き保存", Top = 355, Left = 10, Width = 85, Height = 28 };
             btnSave.Click += (s, e) => {
                 if (isCurrentSettingsCorrupted)
                 {
@@ -721,9 +852,8 @@ namespace MidiToKeyApp
                 {
                     SettingsManager.Save(currentSettingsPath, settings);
                     isCurrentSettingsCorrupted = false;
-                    lblStatus.Text = $"保存完了: {Path.GetFileName(currentSettingsPath)}";
-                    lblStatus.ForeColor = Color.Blue;
-                    MessageBox.Show($"設定を保存しました。\n保存先: {currentSettingsPath}", "保存完了");
+                    AcceptSavedSettings();
+                    ShowNotification($"保存完了: {Path.GetFileName(currentSettingsPath)}");
                 }
                 catch (Exception ex)
                 {
@@ -750,7 +880,8 @@ namespace MidiToKeyApp
                             currentSettingsPath = targetPath;
                             currentSettingsDir = Path.GetDirectoryName(currentSettingsPath) ?? appDir;
                             isCurrentSettingsCorrupted = false;
-                            MessageBox.Show("別名保存が完了しました。\n保存先: " + currentSettingsPath, "保存完了");
+                            AcceptSavedSettings();
+                            ShowNotification($"保存完了: {Path.GetFileName(currentSettingsPath)}");
                         }
                         catch (Exception ex)
                         {
@@ -773,6 +904,8 @@ namespace MidiToKeyApp
                         try 
                         {
                             var newSettings = SettingsManager.Load(targetPath);
+                            if (!ConfirmPendingChanges()) return;
+                            newSettings = SettingsManager.Load(targetPath);
 
                             if (inputTracker.IsListening)
                             {
@@ -793,7 +926,8 @@ namespace MidiToKeyApp
                             RefreshMappingList();
                             inputTracker.PublishResolvedMapping(settings);
                             UpdateHotkeyRegistration();
-                            MessageBox.Show("読込み完了しました: " + Path.GetFileName(currentSettingsPath), "読込完了");
+                            AcceptSavedSettings();
+                            ShowNotification($"読込完了: {Path.GetFileName(currentSettingsPath)}");
                         }
                         catch (Exception ex)
                         {
@@ -803,6 +937,9 @@ namespace MidiToKeyApp
                 }
             };
 
+            chkTestMode = new CheckBox { Text = "テストモード（キー送信なし）", AutoSize = true, Margin = Padding.Empty };
+            lblNoteMonitor = new Label { Text = "ノート: 受信なし", AutoEllipsis = true };
+            lblPedalMonitor = new Label { Text = "ペダル: 受信なし", AutoEllipsis = true };
             var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => StartConversion();
 
@@ -814,8 +951,12 @@ namespace MidiToKeyApp
             btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 435, Left = 295, Width = 105, Height = 26 };
             btnHotkeyConfig.Click += (s, e) => OpenHotkeyConfigDialog();
 
-            lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, Height = 48, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.Red, Font = new Font(this.Font, FontStyle.Bold) };
+            lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, Height = 48, TextAlign = ContentAlignment.MiddleCenter, ForeColor = SystemColors.ControlText, Font = new Font(this.Font, FontStyle.Bold) };
 
+            lblNotification = new Label { Left = 10, Top = 528, Width = 390, Height = 24,
+                AutoEllipsis = true, ForeColor = SystemColors.ControlText, TextAlign = ContentAlignment.MiddleCenter };
+            notificationTimer.Tick += (s, e) => { notificationTimer.Stop(); lblNotification.Text = ""; };
+            this.Controls.Add(lblNotification);
             this.Controls.Add(btnSave);
             this.Controls.Add(btnSaveAs);
             this.Controls.Add(btnLoad);
@@ -824,6 +965,11 @@ namespace MidiToKeyApp
             this.Controls.Add(lblHotkeyInfo);
             this.Controls.Add(btnHotkeyConfig);
             this.Controls.Add(lblStatus);
+
+            ArrangeResizableLayout(grpPorts, grpLayout, lblPortWarn, lblList, lblNote, lblKey,
+                btnClearKey, btnDel, sep, btnLoad, btnStart, btnStop);
+            this.MinimumSize = this.SizeFromClientSize(new Size(440, 650));
+            this.ResumeLayout(true);
 
             // デバイス切断・変更検知のデバウンスタイマー
             deviceDebounceTimer = new System.Windows.Forms.Timer { Interval = 300 };
@@ -935,6 +1081,175 @@ namespace MidiToKeyApp
             };
         }
 
+        private void ArrangeResizableLayout(GroupBox ports, GroupBox layout, Label portWarning,
+            Label listHeading, Label noteLabel, Label keyLabel, Button clearKey, Button delete,
+            Label separator, Button load, Button start, Button stop)
+        {
+            // Only the mapping row absorbs extra height. Every other row keeps its readable size.
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10),
+                ColumnCount = 1, RowCount = 11, TabIndex = 0 };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            foreach (int height in new[] { 100, 24, 0, 116, 10, 36, 44, 34, 52, 28, 76 })
+                root.RowStyles.Add(height == 0 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.Absolute, height));
+
+            static void Fill(Control control)
+            {
+                control.Dock = DockStyle.Fill;
+                control.Margin = Padding.Empty;
+                if (control is Label label) label.AutoSize = false;
+            }
+            TableLayoutPanel Row(int columns)
+            {
+                var row = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
+                    ColumnCount = columns, RowCount = 1 };
+                row.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+                return row;
+            }
+
+            var deviceRow = Row(2);
+            deviceRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            deviceRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            Fill(ports); ports.Margin = new Padding(0, 0, 10, 5);
+            Fill(layout); layout.Margin = new Padding(0, 0, 0, 5);
+            deviceRow.Controls.Add(ports, 0, 0);
+            deviceRow.Controls.Add(layout, 1, 0);
+            // The small warning wraps inside its group as the window or DPI changes.
+            var portContents = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+                Padding = new Padding(5, 2, 5, 0) };
+            portContents.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            portContents.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            Fill(chkPorts); chkPorts.IntegralHeight = false;
+            Fill(portWarning);
+            portWarning.Text = "機器の接続・切断後は\nmidi2keyを再起動してください";
+            portContents.Controls.Add(chkPorts, 0, 0);
+            portContents.Controls.Add(portWarning, 0, 1);
+            ports.Controls.Add(portContents);
+            root.Controls.Add(deviceRow, 0, 0);
+            Fill(listHeading); listHeading.TextAlign = ContentAlignment.MiddleLeft;
+            root.Controls.Add(listHeading, 0, 1);
+            Fill(listMapping); listMapping.Margin = new Padding(0, 0, 0, 8); listMapping.TabIndex = 1;
+            root.Controls.Add(listMapping, 0, 2);
+            listMapping.SizeChanged += (s, e) => QueueMappingColumnResize();
+            listMapping.HandleCreated += (s, e) => QueueMappingColumnResize();
+
+            var editor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
+                ColumnCount = 4, RowCount = 4, TabIndex = 2 };
+            foreach (var width in new[] { 90, 0, 55, 85 })
+                editor.ColumnStyles.Add(width == 0 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.Absolute, width));
+            foreach (var height in new[] { 20, 28, 28, 40 }) editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            Fill(noteLabel); Fill(keyLabel);
+            editor.Controls.Add(noteLabel, 0, 0); editor.Controls.Add(keyLabel, 1, 0);
+            editor.SetColumnSpan(keyLabel, 2);
+            Control[] inputs = { txtNote, txtKey, clearKey, btnAdd };
+            for (int column = 0; column < inputs.Length; column++)
+            {
+                Fill(inputs[column]); inputs[column].Margin = new Padding(0, 0, column == 3 ? 0 : 6, 3);
+                inputs[column].TabIndex = column;
+                editor.Controls.Add(inputs[column], column, 1);
+            }
+            btnCaptureNote.Dock = DockStyle.None; btnCaptureNote.Anchor = AnchorStyles.Left;
+            btnCaptureNote.Margin = Padding.Empty; btnCaptureNote.TabIndex = 4;
+            editor.Controls.Add(btnCaptureNote, 0, 2); editor.SetColumnSpan(btnCaptureNote, 2);
+            Fill(delete); delete.Margin = new Padding(0, 0, 0, 3); delete.TabIndex = 5;
+            editor.Controls.Add(delete, 3, 2);
+            Fill(lblCaptureHint); lblCaptureHint.Padding = new Padding(0, 3, 0, 0);
+            editor.Controls.Add(lblCaptureHint, 0, 3); editor.SetColumnSpan(lblCaptureHint, 4);
+            root.Controls.Add(editor, 0, 3);
+            Fill(separator); separator.Dock = DockStyle.Top; separator.Height = 2;
+            root.Controls.Add(separator, 0, 4);
+
+            var files = Row(4); files.TabIndex = 3;
+            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
+            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
+            files.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            Fill(btnSave); Fill(btnSaveAs); Fill(load);
+            btnSave.Margin = btnSaveAs.Margin = new Padding(0, 0, 10, 8); load.Margin = new Padding(0, 0, 0, 8);
+            files.Controls.Add(btnSave, 0, 0); files.Controls.Add(btnSaveAs, 1, 0); files.Controls.Add(load, 3, 0);
+            root.Controls.Add(files, 0, 5);
+            var conversion = Row(3); conversion.TabIndex = 4;
+            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            Fill(start); Fill(stop); start.Margin = stop.Margin = new Padding(0, 0, 0, 9);
+            conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 2, 0);
+            root.Controls.Add(conversion, 0, 6);
+            var hotkey = Row(2); hotkey.TabIndex = 5;
+            hotkey.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            hotkey.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
+            Fill(lblHotkeyInfo); lblHotkeyInfo.TextAlign = ContentAlignment.MiddleLeft;
+            Fill(btnHotkeyConfig); btnHotkeyConfig.Margin = new Padding(0, 0, 0, 8);
+            hotkey.Controls.Add(lblHotkeyInfo, 0, 0); hotkey.Controls.Add(btnHotkeyConfig, 1, 0);
+            root.Controls.Add(hotkey, 0, 7);
+            Fill(lblStatus); Fill(lblNotification);
+            root.Controls.Add(lblStatus, 0, 8); root.Controls.Add(lblNotification, 0, 9);
+            var monitor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
+                ColumnCount = 1, RowCount = 4 };
+            monitor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            monitor.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+            monitor.RowStyles.Add(new RowStyle(SizeType.Absolute, 16));
+            monitor.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            monitor.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            monitor.Controls.Add(chkTestMode, 0, 0);
+            var heading = new Label { Text = "入力モニター（最新の受信・現在の割当／送信結果ではありません）",
+                Dock = DockStyle.Fill, AutoEllipsis = true, Margin = Padding.Empty };
+            monitor.Controls.Add(heading, 0, 1);
+            Fill(lblNoteMonitor); Fill(lblPedalMonitor);
+            monitor.Controls.Add(lblNoteMonitor, 0, 2);
+            monitor.Controls.Add(lblPedalMonitor, 0, 3);
+            root.Controls.Add(monitor, 0, 10);
+            Controls.Add(root);
+        }
+
+        private void ShowCaptureReady() => lblCaptureHint.Text =
+            "入力待ち: 鍵盤を弾くか、ペダルを踏んでください。\n取得中のMIDI入力は変換キーとして送信されません。";
+
+        private void QueueMappingColumnResize()
+        {
+            if (sizingMappingColumns || listMapping == null || listMapping.IsDisposed) return;
+            ResizeMappingColumns();
+            if (mappingColumnResizePending || !listMapping.IsHandleCreated) return;
+            mappingColumnResizePending = true;
+            try
+            {
+                // SizeChanged runs inside the native resize message. Repeat after that message
+                // finishes so the list recalculates its scroll range from the final column widths.
+                listMapping.BeginInvoke(new Action(() => {
+                    try
+                    {
+                        if (!_isClosing && !IsDisposed && !listMapping.IsDisposed && listMapping.IsHandleCreated)
+                            ResizeMappingColumns();
+                    }
+                    finally { mappingColumnResizePending = false; }
+                }));
+            }
+            catch (InvalidOperationException) { mappingColumnResizePending = false; }
+        }
+
+        private void ResizeMappingColumns()
+        {
+            if (sizingMappingColumns || listMapping == null || listMapping.Columns.Count < 3) return;
+            sizingMappingColumns = true;
+            try
+            {
+                // Updating native columns can itself resize the client area as scrollbars change.
+                // Reserve scrollbar room throughout and avoid re-entering with partial widths.
+                int width = Math.Max(0, listMapping.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4);
+                listMapping.BeginUpdate();
+                try
+                {
+                    // Shrink before growing: native ListView can retain the intermediate scroll
+                    // range when a narrower first column is combined with the old later columns.
+                    foreach (ColumnHeader column in listMapping.Columns) column.Width = 0;
+                    listMapping.Columns[0].Width = width * 24 / 100;
+                    listMapping.Columns[1].Width = width * 40 / 100;
+                    listMapping.Columns[2].Width = width - listMapping.Columns[0].Width - listMapping.Columns[1].Width;
+                }
+                finally { listMapping.EndUpdate(); }
+            }
+            finally { sizingMappingColumns = false; }
+        }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
@@ -984,8 +1299,8 @@ namespace MidiToKeyApp
                     {
                         settings.Hotkey = newHotkey;
                         UpdateHotkeyUi();
-                        lblStatus.Text = $"ホットキー設定更新: {(newHotkey.Enabled ? $"{newHotkey.Modifiers}+{newHotkey.Key}" : "無効")}";
-                        lblStatus.ForeColor = Color.Blue;
+                        UpdateSettingsTitle();
+                        ShowNotification("ホットキー設定を更新しました");
                     }
                     else
                     {
@@ -1067,10 +1382,21 @@ namespace MidiToKeyApp
 
         private async void StartCapture()
         {
-            if (_isClosing || IsDisposed || _isTransitioning || inputTracker.IsListening ||
+            if (_isClosing || IsDisposed) return;
+            if (_isTransitioning)
+            {
+                lblCaptureHint.Text = "変換の開始処理中です。完了後に「鍵盤から取得」を押してください。";
+                return;
+            }
+            if (inputTracker.IsListening ||
                 _captureGeneration != 0 || (_captureCancellation != null && !_captureCancellation.IsCancellationRequested)) return;
             var ports = GetSelectedPorts();
-            if (ports.Count == 0) return;
+            if (ports.Count == 0)
+            {
+                lblCaptureHint.Text = "先に使用するMIDIポートにチェックを入れてください。\n選択後に「鍵盤から取得」を押してください。";
+                return;
+            }
+            lblCaptureHint.Text = "取得準備中: MIDIポートを開いています。\n別の入力欄に移動すると取得を終了します。";
             var cancellation = new CancellationTokenSource();
             _captureCancellation = cancellation;
             long attemptId = ++_captureAttemptId;
@@ -1081,6 +1407,7 @@ namespace MidiToKeyApp
                 if (midiLifecycle.IsBusy)
                 {
                     waitingForPreviousStop = true;
+                    lblCaptureHint.Text = "取得準備中: 前のMIDI停止処理の完了を待っています。";
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     await midiLifecycle.WaitForIdleAsync().WaitAsync(MidiStartTimeout, cancellation.Token);
@@ -1107,6 +1434,7 @@ namespace MidiToKeyApp
                         : "MIDIポートを確認してください";
                     lblStatus.Text = $"ステータス: キャプチャ開始失敗 ({reason})";
                     lblStatus.ForeColor = Color.Red;
+                    lblCaptureHint.Text = "取得を開始できませんでした。MIDIポートを確認してください。";
                     DiagnosticLogger.Log("Capture", $"すべてのMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
                 }
                 else if (startResult.IsPartialSuccess)
@@ -1114,14 +1442,19 @@ namespace MidiToKeyApp
                     string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
                     lblStatus.Text = $"ステータス: キャプチャ中 (一部ポート開始失敗: {failedNames})";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
+                    ShowCaptureReady();
                     DiagnosticLogger.Log("Capture", $"一部のMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
                 }
-                else if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal) ||
-                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始失敗", StringComparison.Ordinal) ||
-                    lblStatus.Text.StartsWith("ステータス: キャプチャ開始タイムアウト", StringComparison.Ordinal))
+                else
                 {
-                    lblStatus.Text = "ステータス: 停止中";
-                    lblStatus.ForeColor = Color.Red;
+                    ShowCaptureReady();
+                    if (lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal) ||
+                        lblStatus.Text.StartsWith("ステータス: キャプチャ開始失敗", StringComparison.Ordinal) ||
+                        lblStatus.Text.StartsWith("ステータス: キャプチャ開始タイムアウト", StringComparison.Ordinal))
+                    {
+                        lblStatus.Text = "ステータス: 停止中";
+                        lblStatus.ForeColor = SystemColors.ControlText;
+                    }
                 }
             }
             catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
@@ -1136,6 +1469,7 @@ namespace MidiToKeyApp
                     DiagnosticLogger.Log("Capture", "MIDIキャプチャ開始が時間内に完了しませんでした。");
                     if (ownsAttempt)
                     {
+                        lblCaptureHint.Text = "取得準備がタイムアウトしました。動作ステータスを確認してください。";
                         if (midiLifecycle.HasReleaseFailure)
                         {
                             lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
@@ -1153,8 +1487,10 @@ namespace MidiToKeyApp
             }
             catch (Exception ex)
             {
+                bool ownsAttempt = attemptId == _captureAttemptId && !_isClosing && !IsDisposed && txtNote.Focused;
                 if (generation != 0 && attemptId == _captureAttemptId) StopCapture(generation);
                 DiagnosticLogger.Log("Capture", $"MIDIキャプチャ開始失敗: {ex}");
+                if (ownsAttempt) lblCaptureHint.Text = "取得を開始できませんでした。MIDIポートを確認してください。";
                 if (!_isClosing && !IsDisposed && midiLifecycle.HasReleaseFailure)
                 {
                     lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
@@ -1177,6 +1513,8 @@ namespace MidiToKeyApp
             _captureCancellation?.Cancel();
             long generation = _captureGeneration;
             _captureGeneration = 0;
+            if (!_isClosing && !IsDisposed)
+                lblCaptureHint.Text = "取得を停止しました。「鍵盤から取得」で再開できます。\nノート番号 (0〜127) / pedal の直接入力もできます。";
             if (generation == 0 || inputTracker.CurrentSessionId != generation || inputTracker.IsListening)
                 return;
 
@@ -1185,7 +1523,7 @@ namespace MidiToKeyApp
                 lblStatus.Text.StartsWith("ステータス: キャプチャ中", StringComparison.Ordinal))
             {
                 lblStatus.Text = "ステータス: 停止中";
-                lblStatus.ForeColor = Color.Red;
+                lblStatus.ForeColor = SystemColors.ControlText;
             }
             ObserveMidiStop(midiLifecycle.StopAsync());
         }
@@ -1213,7 +1551,7 @@ namespace MidiToKeyApp
                     lblStatus.Text.StartsWith("ステータス: MIDI停止処理待機中", StringComparison.Ordinal))
                 {
                     lblStatus.Text = stopped ? "ステータス: 停止中" : "ステータス: 停止失敗";
-                    lblStatus.ForeColor = stopped ? Color.Red : Color.DarkGoldenrod;
+                    lblStatus.ForeColor = stopped ? SystemColors.ControlText : Color.DarkGoldenrod;
                 }
             }
         }
@@ -1230,7 +1568,9 @@ namespace MidiToKeyApp
         private async void StartConversion()
         {
             if (_isClosing || _isTransitioning || inputTracker.IsListening) return;
+            bool testModeAtStart = chkTestMode.Checked;
             _isTransitioning = true;
+            chkTestMode.Enabled = false;
             using var startCancellation = new CancellationTokenSource();
             _startCancellation = startCancellation;
             bool sessionStarted = false;
@@ -1240,6 +1580,8 @@ namespace MidiToKeyApp
                 // A hotkey can start conversion while the note field still owns a capture.
                 // Retire that generation before waiting for its native stop.
                 StopCapture();
+                if (txtNote.Focused)
+                    lblCaptureHint.Text = "変換の開始処理中です。完了するまでお待ちください。";
                 if (midiLifecycle.IsBusy)
                 {
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
@@ -1268,7 +1610,7 @@ namespace MidiToKeyApp
                     !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
                 {
                     lblStatus.Text = "ステータス: 停止中";
-                    lblStatus.ForeColor = Color.Red;
+                    lblStatus.ForeColor = SystemColors.ControlText;
                     return;
                 }
 
@@ -1342,7 +1684,7 @@ namespace MidiToKeyApp
                         !ports.SequenceEqual(GetSelectedPorts(), StringComparer.OrdinalIgnoreCase))
                     {
                         lblStatus.Text = "ステータス: 停止中";
-                        lblStatus.ForeColor = Color.Red;
+                        lblStatus.ForeColor = SystemColors.ControlText;
                         return;
                     }
                 }
@@ -1358,7 +1700,7 @@ namespace MidiToKeyApp
                     return;
                 }
 
-                long sessionId = inputTracker.StartConversionSession();
+                long sessionId = inputTracker.StartConversionSession(testModeAtStart);
                 sessionStarted = true;
                 // Start can deliver queued notes before its task completes. Apply capture
                 // first; subsequent focus changes are handled by the Enter/Leave events.
@@ -1398,7 +1740,7 @@ namespace MidiToKeyApp
                     // 一部ポート失敗時の正常ポート継続
                     string failedNames = string.Join(", ", startResult.FailedPorts.Select(f => f.PortName));
                     string openedNames = string.Join(", ", startResult.OpenedPorts.Select(o => o.DeviceName));
-                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート 監視開始成功, 失敗: {failedNames})";
+                    lblStatus.Text = $"ステータス: {SessionDisplay} ({startResult.OpenedPorts.Count}ポート 監視開始成功, 失敗: {failedNames})";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     MessageBox.Show(
                         $"一部のポートの開始に失敗しました:\n・{failedNames}\n\n次の正常なポートで監視を開始しました:\n・{openedNames}",
@@ -1408,9 +1750,10 @@ namespace MidiToKeyApp
                 }
                 else
                 {
-                    lblStatus.Text = $"ステータス: 実行中 ({startResult.OpenedPorts.Count}ポート 監視開始成功)";
+                    lblStatus.Text = $"ステータス: {SessionDisplay} ({startResult.OpenedPorts.Count}ポート 監視開始成功)";
                     lblStatus.ForeColor = Color.Green;
                 }
+                if (txtNote.Focused) ShowCaptureReady();
             }
             catch (OperationCanceledException) when (startCancellation.IsCancellationRequested)
             {
@@ -1422,7 +1765,7 @@ namespace MidiToKeyApp
                 if (!_isClosing && !IsDisposed)
                 {
                     lblStatus.Text = "ステータス: 停止中";
-                    lblStatus.ForeColor = Color.Red;
+                    lblStatus.ForeColor = SystemColors.ControlText;
                 }
             }
             catch (TimeoutException)
@@ -1459,6 +1802,9 @@ namespace MidiToKeyApp
             {
                 if (ReferenceEquals(_startCancellation, startCancellation)) _startCancellation = null;
                 _isTransitioning = false;
+                UpdateMonitor();
+                if (!_isClosing && !IsDisposed && txtNote.Focused && !inputTracker.IsListening)
+                    lblCaptureHint.Text = "取得を開始していません。動作ステータスを確認し、\n「鍵盤から取得」で再開してください。";
             }
         }
 
@@ -1534,7 +1880,7 @@ namespace MidiToKeyApp
             else
             {
                 DiagnosticLogger.Log($"[Form1] Partial device disconnected. ActivePorts={activePorts.Count}");
-                lblStatus.Text = $"ステータス: 実行中 (切断: {data.DeviceName}, 残り {activePorts.Count} ポート)";
+                lblStatus.Text = $"ステータス: {SessionDisplay} (切断: {data.DeviceName}, 残り {activePorts.Count} ポート)";
                 lblStatus.ForeColor = Color.DarkGoldenrod;
             }
         }
@@ -1712,15 +2058,30 @@ namespace MidiToKeyApp
             return ports;
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { notificationTimer.Dispose(); monitorTimer.Dispose(); }
+            base.Dispose(disposing);
+        }
+
         private void UpdateSettingsFromUI()
         {
             settings.SelectedPorts = GetSelectedPorts();
             settings.KeyboardLayout = rbUS.Checked ? "US" : "JIS";
             inputTracker.PublishResolvedMapping(settings);
+            UpdateSettingsTitle();
         }
         
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (e.CloseReason == CloseReason.UserClosing && !ConfirmPendingChanges())
+            {
+                e.Cancel = true;
+                base.OnFormClosing(e);
+                return;
+            }
+            notificationTimer.Stop();
+            monitorTimer.Stop();
             _isClosing = true;
             _startCancellation?.Cancel();
             _captureCancellation?.Cancel();
