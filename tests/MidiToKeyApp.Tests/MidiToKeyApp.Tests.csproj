@@ -32,6 +32,7 @@
     <Compile Include="..\..\MidiDeviceDiagnostics.cs" Link="MidiDeviceDiagnostics.cs" />
     <Compile Include="..\..\WinRtMidiWatcher.cs" Link="WinRtMidiWatcher.cs" />
     <Compile Include="..\..\MidiPortProbeService.cs" Link="MidiPortProbeService.cs" />
+    <Compile Include="..\..\SingleInstance.cs" Link="SingleInstance.cs" />
     <Compile Include="..\..\AppIcons.cs" Link="AppIcons.cs" />
     <EmbeddedResource Include="..\..\assets\*.ico" LogicalName="MidiToKeyApp.Assets.%(Filename)%(Extension)" />
     <Compile Include="..\..\Form1.cs" Link="Form1.cs" />

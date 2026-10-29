@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -26,10 +26,14 @@ namespace MidiToKeyApp
         private RadioButton rbJIS = null!;
         private RadioButton rbUS = null!;
         private ListView listMapping = null!;
+        private readonly ImageList mappingRowImages = new();
+        private Label lblEmptyMapping = null!;
         private TextBox txtNote = null!;
         private TextBox txtKey = null!;
-        private Button btnCaptureNote = null!;
         private Label lblCaptureHint = null!;
+        private Label lblMappingHeading = null!;
+        private Button btnDeleteMapping = null!;
+        private readonly ToolTip inputToolTip = new() { AutoPopDelay = 15000, InitialDelay = 350, ReshowDelay = 100 };
         private Label lblStatus = null!;
         private Label lblHotkeyInfo = null!;
         private Button btnHotkeyConfig = null!;
@@ -110,7 +114,7 @@ namespace MidiToKeyApp
                 _captureCancellation != null || keySimulator.HasUnreleasedKeys;
         }
 
-        private void RestoreFromTray()
+        internal void RestoreFromTray()
         {
             if (_isClosing || IsDisposed) return;
             var state = restoreWindowState;
@@ -215,6 +219,29 @@ namespace MidiToKeyApp
             if (result == DialogResult.No) return true;
             btnSave.PerformClick();
             return !HasUnsavedChanges;
+        }
+
+        private void UpdateMappingRowHeight()
+        {
+            int height = Math.Max((int)Math.Ceiling(22 * listMapping.DeviceDpi / 96.0), listMapping.Font.Height + 4);
+            mappingRowImages.ImageSize = new Size(1, Math.Clamp(height, 1, 256));
+        }
+
+        private void UpdateEmptyMappingHint()
+        {
+            if (lblEmptyMapping == null) return;
+            int top = Math.Max(24, (listMapping.ClientSize.Height - 44) / 2);
+            lblEmptyMapping.SetBounds(8, top, Math.Max(0, listMapping.ClientSize.Width - 16),
+                Math.Max(0, Math.Min(44, listMapping.ClientSize.Height - top)));
+            lblEmptyMapping.Visible = listMapping.Items.Count == 0 && listMapping.ClientSize.Height >= 48;
+        }
+
+        private void UpdateMappingSelection()
+        {
+            bool selected = listMapping.SelectedItems.Count > 0;
+            if (btnDeleteMapping != null) btnDeleteMapping.Enabled = selected;
+            string selection = selected ? $" — 選択: {listMapping.SelectedItems[0].Text}" : "";
+            lblMappingHeading.Text = $"マッピング一覧（{listMapping.Items.Count}件）{selection}";
         }
 
         private void UpdateMappingAction()
@@ -595,7 +622,7 @@ namespace MidiToKeyApp
         /// マッピング辞書の内容をリストビュー（3列グリッド）に描画します。
         /// 88鍵盤（21〜108）などのノート番号には対応する音階名（例: C4 / ド）を併記します。
         /// </summary>
-        private void RefreshMappingList()
+        private void RefreshMappingList(string? selectedKey = null)
         {
             if (listMapping == null) return;
             numTranspose.Value = settings.TransposeSemitones;
@@ -631,10 +658,20 @@ namespace MidiToKeyApp
                 }
 
                 var item = new ListViewItem(key);
+                if (!SystemInformation.HighContrast)
+                    item.BackColor = listMapping.Items.Count % 2 == 0 ? Color.White : Color.FromArgb(243, 247, 249);
                 item.SubItems.Add(typeOrNoteName);
                 item.SubItems.Add(targetKey);
                 listMapping.Items.Add(item);
+                if (key == selectedKey)
+                {
+                    item.Selected = true;
+                    item.Focused = true;
+                    item.EnsureVisible();
+                }
             }
+            UpdateMappingSelection();
+            UpdateEmptyMappingHint();
             QueueMappingColumnResize();
             UpdateMappingAction();
             UpdateSettingsTitle();
@@ -651,7 +688,7 @@ namespace MidiToKeyApp
             this.SuspendLayout();
             this.AutoScaleDimensions = new SizeF(96, 96);
             this.AutoScaleMode = AutoScaleMode.Dpi;
-            this.ClientSize = new Size(480, 680);
+            this.ClientSize = new Size(380, 650);
             baseTitle = this.Text;
             this.FormBorderStyle = FormBorderStyle.Sizable;
             this.MaximizeBox = true;
@@ -706,7 +743,7 @@ namespace MidiToKeyApp
                 UpdateMonitor();
             };
 
-            var lblList = new Label { Text = "マッピング一覧", Top = 115, Left = 10, AutoSize = true };
+            var lblList = lblMappingHeading = new Label { Text = "マッピング一覧", Top = 115, Left = 10, AutoSize = true };
             listMapping = new ListView 
             { 
                 Top = 135, 
@@ -715,11 +752,20 @@ namespace MidiToKeyApp
                 Height = 135,
                 View = View.Details,
                 FullRowSelect = true,
-                GridLines = true,
+                GridLines = false,
+                ShowItemToolTips = false,
                 MultiSelect = false,
                 HideSelection = false,
                 OwnerDraw = true
             };
+            listMapping.SmallImageList = mappingRowImages;
+            UpdateMappingRowHeight();
+            listMapping.DpiChangedAfterParent += (_, _) => UpdateMappingRowHeight();
+            listMapping.FontChanged += (_, _) => UpdateMappingRowHeight();
+            lblEmptyMapping = new Label { Text = "マッピングはまだありません。\n下の欄から追加できます。",
+                TextAlign = ContentAlignment.MiddleCenter, BackColor = SystemColors.Window,
+                ForeColor = SystemColors.GrayText, TabStop = false };
+            listMapping.Controls.Add(lblEmptyMapping);
             listMapping.Columns.Add("ノート/信号", 85, HorizontalAlignment.Center);
             listMapping.Columns.Add("音名 / 種類", 145, HorizontalAlignment.Left);
             listMapping.Columns.Add("変換キー", 135, HorizontalAlignment.Left);
@@ -727,6 +773,7 @@ namespace MidiToKeyApp
             // カラムヘッダーに上品な淡いブルーグレーの背景と境界線、濃紺の太字を設定
             listMapping.DrawColumnHeader += (s, e) => {
                 if (e.Header == null) return;
+                if (SystemInformation.HighContrast) { e.DrawDefault = true; return; }
                 using (var bgBrush = new SolidBrush(Color.FromArgb(228, 236, 246)))
                 {
                     e.Graphics.FillRectangle(bgBrush, e.Bounds);
@@ -753,6 +800,7 @@ namespace MidiToKeyApp
             listMapping.DrawSubItem += (s, e) => e.DrawDefault = true;
 
             listMapping.SelectedIndexChanged += (s, e) => {
+                UpdateMappingSelection();
                 if (listMapping.SelectedItems.Count == 0) return;
                 var item = listMapping.SelectedItems[0];
                 txtNote.Text = item.Text;
@@ -761,17 +809,11 @@ namespace MidiToKeyApp
             this.Controls.Add(lblList);
             this.Controls.Add(listMapping);
 
-            var lblNote = new Label { Text = "ノート/ペダル", Top = 280, Left = 10, AutoSize = true };
+            var lblNote = new Label { Text = "ノート/ペダル ⓘ", Top = 280, Left = 10, AutoSize = true };
             txtNote = new TextBox { Top = 300, Left = 10, Width = 75 };
             txtNote.AccessibleName = "ノート番号またはペダル";
             txtNote.AccessibleDescription = "0から127、またはpedalを入力できます。フォーカス中はMIDI鍵盤やペダルからも取得できます。";
-            btnCaptureNote = new Button { Text = "鍵盤から取得", AutoSize = true, Height = 28 };
-            btnCaptureNote.Click += (s, e) => {
-                if (!txtNote.Focused) txtNote.Focus();
-                else if (!inputTracker.IsListening) StartCapture();
-                txtNote.SelectAll();
-            };
-            lblCaptureHint = new Label { Text = "「鍵盤から取得」でノート番号・ペダルを取得します。\nノート番号 (0〜127) / pedal の直接入力もできます。", ForeColor = Color.DarkSlateGray };
+            lblCaptureHint = new Label { Text = "", ForeColor = Color.DarkSlateGray };
             
             // ノート取得モードと変換モードのライフサイクルおよびGeneration同期
             txtNote.Enter += (s, e) => {
@@ -799,17 +841,21 @@ namespace MidiToKeyApp
                     // 変換実行中: キャプチャフラグのみOFF（押下中ノートの抑止は維持）
                     inputTracker.SetCapturing(false);
                 }
-                lblCaptureHint.Text = "取得を終了しました。「鍵盤から取得」で再開できます。\nノート番号 (0〜127) / pedal の直接入力もできます。";
+                lblCaptureHint.Text = "";
             };
 
-            var lblKey = new Label { Text = "変換キー", Top = 280, Left = 95, AutoSize = true };
+            var lblKey = new Label { Text = "変換キー ⓘ", Top = 280, Left = 95, AutoSize = true };
             txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
-            // キー入力欄の「消去」ボタン
-            var btnClearKey = new Button { Text = "消去", Top = 299, Left = 215, Width = 50, Height = 25 };
-            btnClearKey.Click += (s, e) => {
-                txtKey.Text = "";
-            };
+            const string noteHelp = "「ノート/ペダル」の入力欄を選択し、MIDI鍵盤やペダルを操作すると自動取得します。\n0〜127 または pedal の直接入力もできます。取得中は変換キーを送信しません。";
+            const string keyHelp = "「変換キー」の入力欄を選択し、割り当てたいキーを押してください。\n選択すると現在の入力値は消えます。Ctrl・Shift・Altとの組み合わせも使えます。";
+            inputToolTip.SetToolTip(lblNote, noteHelp);
+            inputToolTip.SetToolTip(txtNote, noteHelp);
+            inputToolTip.SetToolTip(lblKey, keyHelp);
+            inputToolTip.SetToolTip(txtKey, keyHelp);
+            txtNote.AccessibleDescription = noteHelp;
+            txtKey.AccessibleName = "変換キー";
+            txtKey.AccessibleDescription = keyHelp;
 
             txtKey.Enter += (s, e) => {
                 txtKey.Text = "";
@@ -899,7 +945,7 @@ namespace MidiToKeyApp
                         settings.Mapping["pedal"] = keyInput;
                     }
                     inputTracker.PublishResolvedMapping(settings);
-                    RefreshMappingList();
+                    RefreshMappingList("pedal");
                     return;
                 }
 
@@ -916,7 +962,7 @@ namespace MidiToKeyApp
                         settings.Mapping[note.ToString()] = keyInput;
                     }
                     inputTracker.PublishResolvedMapping(settings);
-                    RefreshMappingList();
+                    RefreshMappingList(note.ToString());
                 }
                 else
                 {
@@ -924,7 +970,7 @@ namespace MidiToKeyApp
                 }
             };
             
-            var btnDel = new Button { Text = "削除", Top = 305, Left = 315, Width = 85, Height = 25 };
+            var btnDel = btnDeleteMapping = new Button { Text = "選択を削除", Enabled = false, Top = 305, Left = 315, Width = 85, Height = 25 };
             btnDel.Click += (s, e) => {
                 if (listMapping.SelectedItems.Count > 0)
                 {
@@ -942,7 +988,6 @@ namespace MidiToKeyApp
             this.Controls.Add(txtNote);
             this.Controls.Add(lblKey);
             this.Controls.Add(txtKey);
-            this.Controls.Add(btnClearKey);
             this.Controls.Add(btnAdd);
             this.Controls.Add(btnDel);
 
@@ -1065,10 +1110,10 @@ namespace MidiToKeyApp
             chkTestMode.CheckedChanged += (s, e) => UpdateOptionsSummary();
             lblNoteMonitor = new Label { Text = "ノート: 受信なし", AutoEllipsis = true };
             lblPedalMonitor = new Label { Text = "ペダル: 受信なし", AutoEllipsis = true };
-            var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, BackColor = Color.Green, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
             btnStart.Click += (s, e) => StartConversion();
 
-            var btnStop = new Button { Text = "変換停止", Top = 395, Left = 305, Width = 95, Height = 35, BackColor = Color.Red, ForeColor = Color.White, Font = new Font(this.Font, FontStyle.Bold) };
+            var btnStop = new Button { Text = "変換停止", Top = 395, Left = 305, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
             btnStop.Click += (s, e) => StopConversion();
 
             // トグルホットキー表示＆変更ボタン
@@ -1092,8 +1137,8 @@ namespace MidiToKeyApp
             this.Controls.Add(lblStatus);
 
             ArrangeResizableLayout(grpPorts, grpLayout, lblPortWarn, lblList, lblNote, lblKey,
-                btnClearKey, btnDel, sep, btnLoad, btnStart, btnStop);
-            this.MinimumSize = this.SizeFromClientSize(new Size(440, 650));
+                btnDel, sep, btnLoad, btnStart, btnStop);
+            this.MinimumSize = this.SizeFromClientSize(new Size(380, 650));
             this.ResumeLayout(true);
 
             // デバイス切断・変更検知のデバウンスタイマー
@@ -1207,14 +1252,14 @@ namespace MidiToKeyApp
         }
 
         private void ArrangeResizableLayout(GroupBox ports, GroupBox layout, Label portWarning,
-            Label listHeading, Label noteLabel, Label keyLabel, Button clearKey, Button delete,
+            Label listHeading, Label noteLabel, Label keyLabel, Button delete,
             Label separator, Button load, Button start, Button stop)
         {
             // Only the mapping row absorbs extra height. Every other row keeps its readable size.
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10),
                 ColumnCount = 1, RowCount = 11, TabIndex = 0 };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            foreach (int height in new[] { 100, 24, 0, 116, 10, 36, 44, 34, 52, 28, 30 })
+            foreach (int height in new[] { 100, 24, 0, 96, 10, 36, 44, 24, 32, 24, 30 })
                 root.RowStyles.Add(height == 0 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.Absolute, height));
             root.RowStyles[10].SizeType = SizeType.Absolute;
             root.RowStyles[10].Height = showOptions ? 132 : 0;
@@ -1255,7 +1300,7 @@ namespace MidiToKeyApp
             Fill(listHeading); listHeading.TextAlign = ContentAlignment.MiddleLeft;
             root.Controls.Add(listHeading, 0, 1);
             var transpose = Row(5);
-            foreach (int width in new[] { 100, 70, 60, 60, 90 })
+            foreach (int width in new[] { 85, 60, 50, 50, 75 })
                 transpose.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, width));
             Control[] transposeControls = { new Label { Text = "移調（半音）", TextAlign = ContentAlignment.MiddleLeft },
                 numTranspose, btnOctaveDown, btnOctaveUp, btnResetTranspose };
@@ -1268,60 +1313,74 @@ namespace MidiToKeyApp
             }
             Fill(listMapping); listMapping.Margin = new Padding(0, 0, 0, 8); listMapping.TabIndex = 1;
             root.Controls.Add(listMapping, 0, 2);
-            listMapping.SizeChanged += (s, e) => QueueMappingColumnResize();
+            listMapping.SizeChanged += (s, e) => { QueueMappingColumnResize(); UpdateEmptyMappingHint(); };
             listMapping.HandleCreated += (s, e) => QueueMappingColumnResize();
 
             var editor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
-                ColumnCount = 4, RowCount = 4, TabIndex = 2 };
-            foreach (var width in new[] { 90, 0, 55, 85 })
+                ColumnCount = 3, RowCount = 3, TabIndex = 2 };
+            foreach (var width in new[] { 102, 0, 85 })
                 editor.ColumnStyles.Add(width == 0 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.Absolute, width));
-            foreach (var height in new[] { 20, 28, 28, 40 }) editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            foreach (var height in new[] { 20, 28, 48 }) editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
             Fill(noteLabel); Fill(keyLabel);
             editor.Controls.Add(noteLabel, 0, 0); editor.Controls.Add(keyLabel, 1, 0);
-            editor.SetColumnSpan(keyLabel, 2);
-            Control[] inputs = { txtNote, txtKey, clearKey, btnAdd };
+            Control[] inputs = { txtNote, txtKey, btnAdd };
             for (int column = 0; column < inputs.Length; column++)
             {
-                Fill(inputs[column]); inputs[column].Margin = new Padding(0, 0, column == 3 ? 0 : 6, 3);
+                Fill(inputs[column]); inputs[column].Margin = new Padding(0, 0, column == 2 ? 0 : 6, 3);
                 inputs[column].TabIndex = column;
                 editor.Controls.Add(inputs[column], column, 1);
             }
-            btnCaptureNote.Dock = DockStyle.None; btnCaptureNote.Anchor = AnchorStyles.Left;
-            btnCaptureNote.Margin = Padding.Empty; btnCaptureNote.TabIndex = 4;
-            editor.Controls.Add(btnCaptureNote, 0, 2); editor.SetColumnSpan(btnCaptureNote, 2);
-            Fill(delete); delete.Margin = new Padding(0, 0, 0, 3); delete.TabIndex = 5;
-            editor.Controls.Add(delete, 3, 2);
+            Fill(delete); delete.Dock = DockStyle.Top; delete.Height = 25; delete.Margin = Padding.Empty; delete.TabIndex = 3;
+            editor.Controls.Add(delete, 2, 2);
             Fill(lblCaptureHint); lblCaptureHint.Padding = new Padding(0, 3, 0, 0);
-            editor.Controls.Add(lblCaptureHint, 0, 3); editor.SetColumnSpan(lblCaptureHint, 4);
+            editor.Controls.Add(lblCaptureHint, 0, 2); editor.SetColumnSpan(lblCaptureHint, 2);
             root.Controls.Add(editor, 0, 3);
+            void ResizeCaptureHintRow()
+            {
+                int height = string.IsNullOrEmpty(lblCaptureHint.Text) ? 28 : 48;
+                editor.RowStyles[2].Height = height;
+                root.RowStyles[3].Height = 48 + height;
+            }
+            lblCaptureHint.TextChanged += (_, _) => ResizeCaptureHintRow();
+            ResizeCaptureHintRow();
             Fill(separator); separator.Dock = DockStyle.Top; separator.Height = 2;
             root.Controls.Add(separator, 0, 4);
 
             var files = Row(4); files.TabIndex = 3;
             files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
             files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
-            files.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            files.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             Fill(btnSave); Fill(btnSaveAs); Fill(load);
             btnSave.Margin = btnSaveAs.Margin = new Padding(0, 0, 10, 8); load.Margin = new Padding(0, 0, 0, 8);
-            files.Controls.Add(btnSave, 0, 0); files.Controls.Add(btnSaveAs, 1, 0); files.Controls.Add(load, 3, 0);
+            files.Controls.Add(btnSave, 0, 0); files.Controls.Add(btnSaveAs, 1, 0); files.Controls.Add(load, 2, 0);
             root.Controls.Add(files, 0, 5);
             var conversion = Row(3); conversion.TabIndex = 4;
             conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
-            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
-            Fill(start); Fill(stop); start.Margin = stop.Margin = new Padding(0, 0, 0, 9);
-            conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 2, 0);
+            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            Fill(start); Fill(stop); start.Margin = new Padding(0, 0, 8, 9); stop.Margin = new Padding(0, 0, 0, 9);
+            start.TabIndex = 0; stop.TabIndex = 1;
+            Fill(btnHotkeyConfig); btnHotkeyConfig.Dock = DockStyle.Right;
+            btnHotkeyConfig.Width = 115; btnHotkeyConfig.Margin = new Padding(8, 0, 0, 9);
+            btnHotkeyConfig.TabIndex = 2;
+            inputToolTip.SetToolTip(btnHotkeyConfig, "変換の開始・停止を切り替えるショートカットキーを設定します。");
+            conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 1, 0);
+            conversion.Controls.Add(btnHotkeyConfig, 2, 0);
             root.Controls.Add(conversion, 0, 6);
-            var hotkey = Row(2); hotkey.TabIndex = 5;
-            hotkey.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            hotkey.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
             Fill(lblHotkeyInfo); lblHotkeyInfo.TextAlign = ContentAlignment.MiddleLeft;
-            Fill(btnHotkeyConfig); btnHotkeyConfig.Margin = new Padding(0, 0, 0, 8);
-            hotkey.Controls.Add(lblHotkeyInfo, 0, 0); hotkey.Controls.Add(btnHotkeyConfig, 1, 0);
-            root.Controls.Add(hotkey, 0, 7);
+            root.Controls.Add(lblHotkeyInfo, 0, 7);
             Fill(lblStatus); Fill(lblNotification);
             root.Controls.Add(lblStatus, 0, 8); root.Controls.Add(lblNotification, 0, 9);
+            // An empty transient notification must not leave a blank footer.
+            void ResizeNotificationRow()
+            {
+                bool hasNotification = !string.IsNullOrEmpty(lblNotification.Text);
+                root.RowStyles[9].Height = hasNotification ? 24 : 0;
+                lblNotification.Visible = hasNotification;
+            }
+            lblNotification.TextChanged += (_, _) => ResizeNotificationRow();
+            ResizeNotificationRow();
             var monitor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
                 ColumnCount = 1, RowCount = 3 };
             monitor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1354,7 +1413,34 @@ namespace MidiToKeyApp
             optionsLayout.Controls.Add(optionsHeader, 0, 0);
             optionsLayout.Controls.Add(optionsBody, 0, 1);
             root.Controls.Add(optionsLayout, 0, 10);
+            StyleActionButtons(root, start, stop);
             Controls.Add(root);
+        }
+
+        private static void StyleActionButtons(Control container, Button start, Button stop)
+        {
+            // Preserve Windows' contrast palette when accessibility contrast mode is active.
+            if (SystemInformation.HighContrast) return;
+            foreach (Control control in container.Controls)
+            {
+                if (control is Button button)
+                {
+                    bool primary = button == start;
+                    bool stopAction = button == stop;
+                    button.FlatStyle = FlatStyle.Flat;
+                    button.UseVisualStyleBackColor = false;
+                    button.BackColor = primary ? Color.FromArgb(28, 100, 118) : Color.White;
+                    button.ForeColor = primary ? Color.White :
+                        stopAction ? Color.FromArgb(151, 52, 63) : Color.FromArgb(40, 52, 65);
+                    button.FlatAppearance.BorderColor = primary ? Color.FromArgb(28, 100, 118) :
+                        stopAction ? Color.FromArgb(207, 166, 172) : Color.FromArgb(184, 194, 204);
+                    button.FlatAppearance.MouseOverBackColor = primary ? Color.FromArgb(23, 83, 99) :
+                        stopAction ? Color.FromArgb(252, 239, 241) : Color.FromArgb(237, 243, 247);
+                    button.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb(18, 68, 82) :
+                        stopAction ? Color.FromArgb(245, 222, 226) : Color.FromArgb(221, 232, 240);
+                }
+                else if (control.HasChildren) StyleActionButtons(control, start, stop);
+            }
         }
 
         private void ShowCaptureReady() => lblCaptureHint.Text =
@@ -1543,7 +1629,7 @@ namespace MidiToKeyApp
             if (_isClosing || IsDisposed) return;
             if (_isTransitioning)
             {
-                lblCaptureHint.Text = "変換の開始処理中です。完了後に「鍵盤から取得」を押してください。";
+                lblCaptureHint.Text = "変換の開始処理中です。完了後に入力欄を選択し直してください。";
                 return;
             }
             if (inputTracker.IsListening ||
@@ -1551,7 +1637,7 @@ namespace MidiToKeyApp
             var ports = GetSelectedPorts();
             if (ports.Count == 0)
             {
-                lblCaptureHint.Text = "先に使用するMIDIポートにチェックを入れてください。\n選択後に「鍵盤から取得」を押してください。";
+                lblCaptureHint.Text = "";
                 return;
             }
             lblCaptureHint.Text = "取得準備中: MIDIポートを開いています。\n別の入力欄に移動すると取得を終了します。";
@@ -1672,7 +1758,7 @@ namespace MidiToKeyApp
             long generation = _captureGeneration;
             _captureGeneration = 0;
             if (!_isClosing && !IsDisposed)
-                lblCaptureHint.Text = "取得を停止しました。「鍵盤から取得」で再開できます。\nノート番号 (0〜127) / pedal の直接入力もできます。";
+                lblCaptureHint.Text = "";
             if (generation == 0 || inputTracker.CurrentSessionId != generation || inputTracker.IsListening)
                 return;
 
@@ -1962,7 +2048,7 @@ namespace MidiToKeyApp
                 _isTransitioning = false;
                 UpdateMonitor();
                 if (!_isClosing && !IsDisposed && txtNote.Focused && !inputTracker.IsListening)
-                    lblCaptureHint.Text = "取得を開始していません。動作ステータスを確認し、\n「鍵盤から取得」で再開してください。";
+                    lblCaptureHint.Text = "取得を開始していません。動作ステータスを確認し、\n入力欄を選択し直して再開してください。";
             }
         }
 
@@ -2220,13 +2306,14 @@ namespace MidiToKeyApp
         {
             if (disposing)
             {
+                inputToolTip.Dispose();
                 notificationTimer.Dispose();
                 monitorTimer.Dispose();
                 trayIcon?.Dispose();
                 trayMenu?.Dispose();
             }
             base.Dispose(disposing);
-            if (disposing) { appIcons?.Dispose(); appIcons = null; }
+            if (disposing) { mappingRowImages.Dispose(); appIcons?.Dispose(); appIcons = null; }
         }
 
         private void UpdateSettingsFromUI()

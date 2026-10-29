@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Windows.Forms;
 
 namespace MidiToKeyApp
@@ -27,6 +27,13 @@ namespace MidiToKeyApp
                     Console.WriteLine(p);
                 }
                 Environment.ExitCode = 0;
+                return;
+            }
+
+            using var instance = new SingleInstance();
+            if (!instance.IsPrimary)
+            {
+                instance.RequestActivation();
                 return;
             }
 
@@ -65,7 +72,13 @@ namespace MidiToKeyApp
             {
                 bool showOptions = Array.Exists(args ?? Array.Empty<string>(), a =>
                     string.Equals(a, "--show-options", StringComparison.OrdinalIgnoreCase));
-                Application.Run(new Form1(showOptions: showOptions));
+                using var form = new Form1(showOptions: showOptions);
+                using var activationTimer = new System.Windows.Forms.Timer { Interval = 200 };
+                activationTimer.Tick += (_, _) => {
+                    if (instance.ConsumeActivation()) form.RestoreFromTray();
+                };
+                activationTimer.Start();
+                Application.Run(form);
             }
             finally
             {

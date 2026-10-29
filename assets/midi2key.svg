@@ -1,14 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
-  <rect x=".5" y=".5" width="15" height="15" rx="3" fill="#3348a8"/>
-  <rect x="1" y="1" width="14" height="2.8" rx="1.4" fill="#5275e3"/>
-  <g fill="#fff">
-    <rect x="2.5" y="5" width="2" height="8.5" rx=".35"/>
-    <rect x="5.5" y="5" width="2" height="8.5" rx=".35"/>
-    <rect x="8.5" y="5" width="2" height="8.5" rx=".35"/>
-    <rect x="11.5" y="5" width="2" height="8.5" rx=".35"/>
-  </g>
-  <g fill="#16234b">
-    <rect x="4.1" y="4.8" width="1.65" height="4.7" rx=".2"/>
-    <rect x="7.1" y="4.8" width="1.65" height="4.7" rx=".2"/>
-  </g>
+  <defs>
+    <linearGradient id="enamel" x2="0" y2="1"><stop stop-color="#258ba1"/><stop offset="1" stop-color="#152345"/></linearGradient>
+    <linearGradient id="ivory" x2="0" y2="1"><stop stop-color="#fffdf3"/><stop offset=".85" stop-color="#f4f3e9"/><stop offset="1" stop-color="#c3d4d9"/></linearGradient>
+  </defs>
+  <path d="M 3 1.2 C 6 -0.1 11.9 0.7 12.4 3.8 C 12.8 6.2 9.8 6.3 10.6 8.2 C 11 9.2 14.8 8.3 14.8 10.7 L 14.8 13.8 C 14.8 14.7 14.2 15.1 13.3 15.1 L 2.5 15.1 C 1.6 15.1 1.1 14.6 1.1 13.8 L 1.1 4 C 1.1 2.6 1.6 1.8 3 1.2 Z " fill="url(#enamel)" stroke="#91c4cf" stroke-width=".16"/>
+  <path d="M 2 9.5 L 2 4.1 C 2 2.8 2.9 2.1 4.3 1.9 C 7.2 1.4 10.7 2.2 11.1 3.8 C 11.5 5.4 8.8 6 9.5 8.1" fill="none" stroke="#79d1d9" stroke-width=".22"/>
+  <rect x="1.9" y="9.4" width="12.1" height="5" rx=".45" fill="#0b1931"/>
+  <rect x="2.200" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="3.843" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="5.486" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="7.129" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="8.771" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="10.414" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="12.057" y="9.8" width="1.483" height="4.15" rx=".16" fill="url(#ivory)"/><rect x="3.363" y="9.6" width=".8" height="2.5" rx=".12" fill="#101e34"/><rect x="5.006" y="9.6" width=".8" height="2.5" rx=".12" fill="#101e34"/><rect x="8.291" y="9.6" width=".8" height="2.5" rx=".12" fill="#101e34"/><rect x="9.934" y="9.6" width=".8" height="2.5" rx=".12" fill="#101e34"/><rect x="11.577" y="9.6" width=".8" height="2.5" rx=".12" fill="#101e34"/>
 </svg>
