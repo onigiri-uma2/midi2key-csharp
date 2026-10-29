@@ -39,6 +39,8 @@ namespace MidiToKeyApp
         private Button btnHotkeyConfig = null!;
         private Button btnSaveAs = null!;
         private Button btnSave = null!;
+        private Button btnStartConversion = null!;
+        private Button btnStopConversion = null!;
         private Button btnAdd = null!;
         private Label lblNotification = null!;
         private NumericUpDown numTranspose = null!;
@@ -112,6 +114,15 @@ namespace MidiToKeyApp
             trayStop.Text = _isTransitioning ? "開始をキャンセル" : "停止";
             trayStop.Enabled = _isTransitioning || inputTracker.IsListening || inputTracker.IsCapturing ||
                 _captureCancellation != null || keySimulator.HasUnreleasedKeys;
+            btnStartConversion.Text = chkTestMode.Checked ? "テスト開始" : "変換開始";
+            // StartConversion retires capture and waits for MIDI cleanup itself. Keep
+            // this button usable while the note field owns a capture session.
+            btnStartConversion.Enabled = !_isTransitioning && !inputTracker.IsListening &&
+                !midiLifecycle.HasReleaseFailure && !keySimulator.HasUnreleasedKeys && GetSelectedPorts().Count > 0;
+            btnStopConversion.Text = _isTransitioning ? "開始をキャンセル" :
+                inputTracker.IsListening ? (inputTracker.IsTestMode ? "テスト停止" : "変換停止") :
+                inputTracker.IsCapturing || _captureCancellation != null ? "取得停止" : "変換停止";
+            btnStopConversion.Enabled = trayStop.Enabled;
         }
 
         internal void RestoreFromTray()
@@ -190,7 +201,11 @@ namespace MidiToKeyApp
             if (!settingsReady) return;
             string activeOptions = settings.TransposeSemitones != 0 ? $" [移調 {settings.TransposeSemitones:+0;-0;0}半音]" : "";
             if (chkTestMode.Checked) activeOptions += " [テストモード]";
-            Text = $"{baseTitle} — {Path.GetFileName(currentSettingsPath)}{(HasUnsavedChanges ? " *未保存" : "")}{activeOptions}";
+            bool dirty = HasUnsavedChanges;
+            Text = $"{baseTitle} — {(dirty ? "*未保存 " : "")}{Path.GetFileName(currentSettingsPath)}{activeOptions}";
+            btnSave.Text = dirty ? "上書き保存 *" : "上書き保存";
+            btnSave.AccessibleName = dirty ? "上書き保存（未保存の変更あり）" : "上書き保存";
+            inputToolTip.SetToolTip(btnSave, $"保存先: {currentSettingsPath}\n{(dirty ? "未保存の変更があります。" : "現在の設定をこのファイルに保存します。")}");
         }
 
         private void AcceptSavedSettings()
@@ -684,7 +699,7 @@ namespace MidiToKeyApp
         {
             var version = typeof(Form1).Assembly.GetName().Version;
             string verStr = version != null ? $" v{version.Major}.{version.Minor}.{version.Build}" : " v1.2.1";
-            this.Text = $"midi2key C#{verStr}";
+            this.Text = $"midi2key{verStr}";
             this.SuspendLayout();
             this.AutoScaleDimensions = new SizeF(96, 96);
             this.AutoScaleMode = AutoScaleMode.Dpi;
@@ -706,16 +721,19 @@ namespace MidiToKeyApp
                 settings.SelectedPorts = selected;
                 UpdateSettingsTitle();
             };
-            chkPorts.SelectedIndexChanged += (s, e) => chkPorts.ClearSelected();
+            chkPorts.AccessibleName = "使用するMIDIポート";
+            chkPorts.AccessibleDescription = "矢印キーで移動し、Spaceキーで選択を切り替えます。複数選択できます。";
             grpPorts.Controls.Add(chkPorts);
 
-            var lblPortWarn = new Label { Text = "※機器の接続・切断後はmidi2keyを再起動してください", ForeColor = Color.DarkSlateGray, Top = 73, Left = 5, AutoSize = true, Font = new Font(this.Font.FontFamily, 7.5f) };
+            var lblPortWarn = new Label { Text = "※機器の接続・切断後はmidi2keyを再起動してください", ForeColor = Color.DarkSlateGray, Top = 73, Left = 5, AutoSize = true, Font = new Font(this.Font.FontFamily, 8.5f) };
             grpPorts.Controls.Add(lblPortWarn);
             this.Controls.Add(grpPorts);
 
             var grpLayout = new GroupBox { Text = "キー配列", Top = 10, Left = 295, Width = 105, Height = 95 };
-            rbJIS = new RadioButton { Text = "JIS", Top = 25, Left = 20, Width = 65 };
-            rbUS = new RadioButton { Text = "US", Top = 55, Left = 20, Width = 65 };
+            rbJIS = new RadioButton { Text = "JIS 日本語", Top = 25, Left = 10, Width = 95 };
+            rbUS = new RadioButton { Text = "US 英語", Top = 55, Left = 10, Width = 95 };
+            inputToolTip.SetToolTip(rbJIS, "日本語キーボードの配列で記号キーなどを変換します。");
+            inputToolTip.SetToolTip(rbUS, "英語キーボードの配列で記号キーなどを変換します。");
             rbUS.CheckedChanged += (s, e) => {
                 if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); }
             };
@@ -762,7 +780,7 @@ namespace MidiToKeyApp
             UpdateMappingRowHeight();
             listMapping.DpiChangedAfterParent += (_, _) => UpdateMappingRowHeight();
             listMapping.FontChanged += (_, _) => UpdateMappingRowHeight();
-            lblEmptyMapping = new Label { Text = "マッピングはまだありません。\n下の欄から追加できます。",
+            lblEmptyMapping = new Label { Text = "マッピングはまだありません。\nノート/ペダルと変換キーを指定し、「追加」を押します。",
                 TextAlign = ContentAlignment.MiddleCenter, BackColor = SystemColors.Window,
                 ForeColor = SystemColors.GrayText, TabStop = false };
             listMapping.Controls.Add(lblEmptyMapping);
@@ -848,7 +866,7 @@ namespace MidiToKeyApp
             txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
             
             const string noteHelp = "「ノート/ペダル」の入力欄を選択し、MIDI鍵盤やペダルを操作すると自動取得します。\n0〜127 または pedal の直接入力もできます。取得中は変換キーを送信しません。";
-            const string keyHelp = "「変換キー」の入力欄を選択し、割り当てたいキーを押してください。\n選択すると現在の入力値は消えます。Ctrl・Shift・Altとの組み合わせも使えます。";
+            const string keyHelp = "「変換キー」の入力欄を選択し、割り当てたいキーを押してください。\n選択すると現在の入力値は消えます。Shiftで入力する大文字・記号も登録できます。";
             inputToolTip.SetToolTip(lblNote, noteHelp);
             inputToolTip.SetToolTip(txtNote, noteHelp);
             inputToolTip.SetToolTip(lblKey, keyHelp);
@@ -1031,7 +1049,8 @@ namespace MidiToKeyApp
             };
 
             // 「別名保存」ボタン
-            btnSaveAs = new Button { Text = "別名保存", Top = 355, Left = 105, Width = 85, Height = 28 };
+            btnSaveAs = new Button { Text = "別名保存…", Top = 355, Left = 105, Width = 85, Height = 28 };
+            inputToolTip.SetToolTip(btnSaveAs, "別のファイルに保存します。以後の上書き保存先もそのファイルに変わります。");
             btnSaveAs.Click += (s, e) => {
                 UpdateSettingsFromUI();
                 using (var sfd = new SaveFileDialog())
@@ -1061,7 +1080,7 @@ namespace MidiToKeyApp
             };
             
             // 「設定読込」ボタン
-            var btnLoad = new Button { Text = "設定読込", Top = 355, Left = 305, Width = 95, Height = 28 };
+            var btnLoad = new Button { Text = "設定読込…", Top = 355, Left = 305, Width = 95, Height = 28 };
             btnLoad.Click += (s, e) => {
                 using (var ofd = new OpenFileDialog())
                 {
@@ -1110,15 +1129,15 @@ namespace MidiToKeyApp
             chkTestMode.CheckedChanged += (s, e) => UpdateOptionsSummary();
             lblNoteMonitor = new Label { Text = "ノート: 受信なし", AutoEllipsis = true };
             lblPedalMonitor = new Label { Text = "ペダル: 受信なし", AutoEllipsis = true };
-            var btnStart = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
-            btnStart.Click += (s, e) => StartConversion();
+            var btnStart = btnStartConversion = new Button { Text = "変換開始", Top = 395, Left = 10, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
+            btnStart.Click += (s, e) => { StartConversion(); UpdateTrayState(); };
 
-            var btnStop = new Button { Text = "変換停止", Top = 395, Left = 305, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
-            btnStop.Click += (s, e) => StopConversion();
+            var btnStop = btnStopConversion = new Button { Text = "変換停止", Top = 395, Left = 305, Width = 95, Height = 35, Font = new Font(this.Font, FontStyle.Bold) };
+            btnStop.Click += (s, e) => { StopConversion(); UpdateTrayState(); };
 
             // トグルホットキー表示＆変更ボタン
             lblHotkeyInfo = new Label { Top = 440, Left = 10, Width = 280, AutoSize = false, Text = "ホットキー: 有効 (Ctrl+Alt+F9)", ForeColor = Color.FromArgb(40, 40, 40) };
-            btnHotkeyConfig = new Button { Text = "ホットキー設定...", Top = 435, Left = 295, Width = 105, Height = 26 };
+            btnHotkeyConfig = new Button { Text = "ホットキー設定…", Top = 435, Left = 295, Width = 105, Height = 26 };
             btnHotkeyConfig.Click += (s, e) => OpenHotkeyConfigDialog();
 
             lblStatus = new Label { Text = "ステータス: 停止中", Top = 475, Left = 10, Width = 390, Height = 48, TextAlign = ContentAlignment.MiddleCenter, ForeColor = SystemColors.ControlText, Font = new Font(this.Font, FontStyle.Bold) };
@@ -1280,7 +1299,7 @@ namespace MidiToKeyApp
 
             var deviceRow = Row(2);
             deviceRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            deviceRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            deviceRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
             Fill(ports); ports.Margin = new Padding(0, 0, 10, 5);
             Fill(layout); layout.Margin = new Padding(0, 0, 0, 5);
             deviceRow.Controls.Add(ports, 0, 0);
@@ -1292,7 +1311,7 @@ namespace MidiToKeyApp
             portContents.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             Fill(chkPorts); chkPorts.IntegralHeight = false;
             Fill(portWarning);
-            portWarning.Text = "機器の接続・切断後は\nmidi2keyを再起動してください";
+            portWarning.Text = "機器の接続・切断後は\nアプリを再起動してください";
             portContents.Controls.Add(chkPorts, 0, 0);
             portContents.Controls.Add(portWarning, 0, 1);
             ports.Controls.Add(portContents);
@@ -1346,27 +1365,27 @@ namespace MidiToKeyApp
             Fill(separator); separator.Dock = DockStyle.Top; separator.Height = 2;
             root.Controls.Add(separator, 0, 4);
 
-            var files = Row(4); files.TabIndex = 3;
-            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
-            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 95));
-            files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
-            files.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            TableLayoutPanel ActionRow(int tabIndex)
+            {
+                var row = Row(5); row.TabIndex = tabIndex;
+                for (int column = 0; column < 5; column++)
+                    row.ColumnStyles.Add(column % 2 == 0
+                        ? new ColumnStyle(SizeType.Percent, 100f / 3)
+                        : new ColumnStyle(SizeType.Absolute, 8));
+                return row;
+            }
+            var files = ActionRow(3);
             Fill(btnSave); Fill(btnSaveAs); Fill(load);
-            btnSave.Margin = btnSaveAs.Margin = new Padding(0, 0, 10, 8); load.Margin = new Padding(0, 0, 0, 8);
-            files.Controls.Add(btnSave, 0, 0); files.Controls.Add(btnSaveAs, 1, 0); files.Controls.Add(load, 2, 0);
+            btnSave.Margin = btnSaveAs.Margin = load.Margin = new Padding(0, 0, 0, 8);
+            files.Controls.Add(btnSave, 0, 0); files.Controls.Add(btnSaveAs, 2, 0); files.Controls.Add(load, 4, 0);
             root.Controls.Add(files, 0, 5);
-            var conversion = Row(3); conversion.TabIndex = 4;
-            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
-            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
-            conversion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            Fill(start); Fill(stop); start.Margin = new Padding(0, 0, 8, 9); stop.Margin = new Padding(0, 0, 0, 9);
-            start.TabIndex = 0; stop.TabIndex = 1;
-            Fill(btnHotkeyConfig); btnHotkeyConfig.Dock = DockStyle.Right;
-            btnHotkeyConfig.Width = 115; btnHotkeyConfig.Margin = new Padding(8, 0, 0, 9);
-            btnHotkeyConfig.TabIndex = 2;
+            var conversion = ActionRow(4);
+            Fill(start); Fill(stop); Fill(btnHotkeyConfig);
+            start.Margin = stop.Margin = btnHotkeyConfig.Margin = new Padding(0, 0, 0, 9);
+            start.TabIndex = 0; stop.TabIndex = 1; btnHotkeyConfig.TabIndex = 2;
             inputToolTip.SetToolTip(btnHotkeyConfig, "変換の開始・停止を切り替えるショートカットキーを設定します。");
-            conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 1, 0);
-            conversion.Controls.Add(btnHotkeyConfig, 2, 0);
+            conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 2, 0);
+            conversion.Controls.Add(btnHotkeyConfig, 4, 0);
             root.Controls.Add(conversion, 0, 6);
             Fill(lblHotkeyInfo); lblHotkeyInfo.TextAlign = ContentAlignment.MiddleLeft;
             root.Controls.Add(lblHotkeyInfo, 0, 7);
@@ -1438,6 +1457,17 @@ namespace MidiToKeyApp
                         stopAction ? Color.FromArgb(252, 239, 241) : Color.FromArgb(237, 243, 247);
                     button.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb(18, 68, 82) :
                         stopAction ? Color.FromArgb(245, 222, 226) : Color.FromArgb(221, 232, 240);
+                    if (primary)
+                    {
+                        void UpdatePrimaryColors()
+                        {
+                            button.BackColor = button.Enabled ? Color.FromArgb(28, 100, 118) : Color.FromArgb(232, 236, 240);
+                            button.ForeColor = button.Enabled ? Color.White : SystemColors.GrayText;
+                            button.FlatAppearance.BorderColor = button.Enabled ? Color.FromArgb(28, 100, 118) : Color.FromArgb(200, 208, 216);
+                        }
+                        button.EnabledChanged += (_, _) => UpdatePrimaryColors();
+                        UpdatePrimaryColors();
+                    }
                 }
                 else if (control.HasChildren) StyleActionButtons(control, start, stop);
             }

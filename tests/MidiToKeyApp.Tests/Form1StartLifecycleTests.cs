@@ -11,6 +11,30 @@ public sealed class Form1StartLifecycleTests
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     private static extern int GetWindowStyle(IntPtr handle, int index);
 
+    [TestMethod]
+    public async Task Ports_ArrowAndSpaceKeys_SelectAndToggleDevice()
+    {
+        await RunFormAsync(async form =>
+        {
+            var ports = form.ControlForTest<CheckedListBox>("chkPorts");
+            form.TopMost = true;
+            form.Activate();
+            form.FocusPortsForTest();
+            await Task.Delay(150);
+            Assert.IsTrue(ports.Focused);
+            ports.SelectedIndex = 0;
+            Assert.AreEqual(0, ports.SelectedIndex);
+            SendKeys.SendWait("{DOWN}");
+            await WaitUntilAsync(() => ports.SelectedIndex == 1);
+            bool wasChecked = ports.GetItemChecked(1);
+            SendKeys.SendWait(" ");
+            await WaitUntilAsync(() => ports.GetItemChecked(1) != wasChecked);
+            CollectionAssert.Contains(form.SettingsForTest.SelectedPorts.ToArray(), "Port B");
+            SendKeys.SendWait(" ");
+            await WaitUntilAsync(() => ports.GetItemChecked(1) == wasChecked);
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
     [DataTestMethod]
     [DataRow(false)]
     [DataRow(true)]
@@ -29,6 +53,13 @@ public sealed class Form1StartLifecycleTests
             var ok = Field<Button>("_btnOk");
             ctrl.Checked = false; alt.Checked = false;
             Assert.IsFalse(ok.Enabled);
+            string? invalidDirectory = Environment.GetEnvironmentVariable("MIDI2KEY_UI_SNAPSHOT_DIR");
+            if (!string.IsNullOrEmpty(invalidDirectory))
+            {
+                using var bitmap = new System.Drawing.Bitmap(dialog.Width, dialog.Height);
+                dialog.DrawToBitmap(bitmap, new System.Drawing.Rectangle(System.Drawing.Point.Empty, dialog.Size));
+                bitmap.Save(Path.Combine(invalidDirectory, "hotkey-dialog-disabled.png"));
+            }
             enabled.Checked = false;
             Assert.IsFalse(key.Enabled);
             Assert.IsTrue(ok.Enabled);
@@ -96,6 +127,49 @@ public sealed class Form1StartLifecycleTests
             Assert.IsTrue(form.ShowInTaskbar);
             Assert.AreEqual(FormWindowState.Maximized, form.WindowState);
         }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
+    }
+
+    [TestMethod]
+    public async Task MainButtons_ReflectIdlePendingRunningAndStoppedStates()
+    {
+        var probe = new TaskCompletionSource<MidiPortProbeService.ProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await RunFormAsync(async form =>
+        {
+            var start = form.ControlForTest<Button>("btnStartConversion");
+            var stop = form.ControlForTest<Button>("btnStopConversion");
+            form.FocusPortsForTest();
+            form.RefreshTrayForTest();
+            Assert.IsTrue(start.Enabled);
+            Assert.IsFalse(stop.Enabled);
+            start.PerformClick();
+            Assert.IsFalse(start.Enabled);
+            Assert.IsTrue(stop.Enabled);
+            Assert.AreEqual("開始をキャンセル", stop.Text);
+            string? directory = Environment.GetEnvironmentVariable("MIDI2KEY_UI_SNAPSHOT_DIR");
+            if (!string.IsNullOrEmpty(directory))
+            {
+                using var bitmap = new System.Drawing.Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(System.Drawing.Point.Empty, form.Size));
+                bitmap.Save(Path.Combine(directory, "form-start-disabled.png"));
+            }
+            stop.PerformClick();
+            probe.SetResult(AvailablePortResult("Port A"));
+            await WaitUntilAsync(() => !form.TransitioningForTest && !form.MidiBusyForTest && start.Enabled);
+            Assert.IsFalse(form.ListeningForTest);
+            Assert.IsFalse(stop.Enabled);
+            start.PerformClick();
+            await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
+            form.RefreshTrayForTest();
+            Assert.IsFalse(start.Enabled);
+            Assert.IsTrue(stop.Enabled);
+            Assert.AreEqual("変換停止", stop.Text);
+            stop.PerformClick();
+            await WaitUntilAsync(() => !form.ListeningForTest && !form.MidiBusyForTest && start.Enabled);
+            Assert.IsFalse(stop.Enabled);
+            form.ControlForTest<CheckedListBox>("chkPorts").SetItemChecked(0, false);
+            form.RefreshTrayForTest();
+            Assert.IsFalse(start.Enabled);
+        }, new FakeMidiListener(), (_, _) => probe.Task, (_, _) => Task.CompletedTask);
     }
 
     [TestMethod]
@@ -253,6 +327,7 @@ public sealed class Form1StartLifecycleTests
             ports.TopIndex = 2;
             Assert.IsTrue(ports.GetItemRectangle(2).IntersectsWith(ports.ClientRectangle));
             ports.TopIndex = 0;
+            await CheckLayout("empty");
             for (int i = 0; i < 15; i++)
                 form.SettingsForTest.Mapping[(60 + i).ToString()] = "a";
             form.RefreshMappingForTest();
@@ -268,6 +343,7 @@ public sealed class Form1StartLifecycleTests
                 Assert.AreEqual(0, GetWindowStyle(list.Handle, -16) & 0x00100000,
                     $"The mapping list should not have a horizontal scrollbar at {snapshot}.");
                 var controls = new Control[] { list, note, key,
+                    form.ControlForTest<RadioButton>("rbJIS"), form.ControlForTest<RadioButton>("rbUS"),
                     form.ControlForTest<Button>("btnHotkeyConfig"), form.ControlForTest<Label>("lblHotkeyInfo"),
                     form.ControlForTest<CheckBox>("chkTestMode"), form.ControlForTest<NumericUpDown>("numTranspose"),
                     form.ControlForTest<Button>("btnOctaveDown"), form.ControlForTest<Button>("btnOctaveUp"),
@@ -338,6 +414,8 @@ public sealed class Form1StartLifecycleTests
             form.ControlForTest<TextBox>("txtNote").Focus();
             await WaitUntilAsync(() => form.CapturingForTest && !form.MidiBusyForTest);
             Assert.IsTrue(form.ControlForTest<TextBox>("txtNote").Focused);
+            form.RefreshTrayForTest();
+            Assert.AreEqual(!conversionRunning, form.ControlForTest<Button>("btnStartConversion").Enabled);
             await WaitUntilAsync(() => form.ControlForTest<Label>("lblCaptureHint").Text.Contains("入力待ち", StringComparison.Ordinal));
             Assert.AreEqual(initialStarts + (conversionRunning ? 0 : 1), listener.StartCount);
 
@@ -424,7 +502,13 @@ public sealed class Form1StartLifecycleTests
                 form.SetMappingInputForTest("60", "a");
                 form.ControlForTest<Button>("btnAdd").PerformClick();
                 StringAssert.Contains(form.Text, "*未保存");
-                form.ControlForTest<Button>("btnSave").PerformClick();
+                var save = form.ControlForTest<Button>("btnSave");
+                Assert.AreEqual("上書き保存 *", save.Text);
+                var tip = (ToolTip)typeof(Form1).GetField("inputToolTip", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+                StringAssert.Contains(tip.GetToolTip(save), path);
+                Assert.IsTrue(form.Text.IndexOf("*未保存", StringComparison.Ordinal) < form.Text.IndexOf(Path.GetFileName(path), StringComparison.Ordinal));
+                save.PerformClick();
+                Assert.AreEqual("上書き保存", save.Text);
 
                 Assert.AreEqual("a", SettingsManager.Load(path).Mapping["60"]);
                 Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));

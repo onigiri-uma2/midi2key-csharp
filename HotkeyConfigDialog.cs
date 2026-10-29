@@ -194,6 +194,18 @@ namespace MidiToKeyApp
                     button.ForeColor = primary ? Color.White : Color.FromArgb(40, 52, 65);
                     button.FlatAppearance.BorderColor = primary ? Color.FromArgb(28, 100, 118) : Color.FromArgb(184, 194, 204);
                     button.FlatAppearance.MouseOverBackColor = primary ? Color.FromArgb(23, 83, 99) : Color.FromArgb(237, 243, 247);
+                    button.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb(18, 68, 82) : Color.FromArgb(221, 232, 240);
+                    if (primary)
+                    {
+                        void UpdatePrimaryColors()
+                        {
+                            button.BackColor = button.Enabled ? Color.FromArgb(28, 100, 118) : Color.FromArgb(232, 236, 240);
+                            button.ForeColor = button.Enabled ? Color.White : SystemColors.GrayText;
+                            button.FlatAppearance.BorderColor = button.Enabled ? Color.FromArgb(28, 100, 118) : Color.FromArgb(200, 208, 216);
+                        }
+                        button.EnabledChanged += (_, _) => UpdatePrimaryColors();
+                        UpdatePrimaryColors();
+                    }
                 }
             }
             this.AcceptButton = _btnOk;
