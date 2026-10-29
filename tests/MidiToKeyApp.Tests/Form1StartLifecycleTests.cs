@@ -1,4 +1,4 @@
-﻿using System.Reflection;
+using System.Reflection;
 using System.Windows.Forms;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using MidiToKeyApp;
@@ -10,6 +10,9 @@ public sealed class Form1StartLifecycleTests
 {
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     private static extern int GetWindowStyle(IntPtr handle, int index);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
 
     [TestMethod]
     public async Task Ports_ArrowAndSpaceKeys_SelectAndToggleDevice()
@@ -24,13 +27,13 @@ public sealed class Form1StartLifecycleTests
             Assert.IsTrue(ports.Focused);
             ports.SelectedIndex = 0;
             Assert.AreEqual(0, ports.SelectedIndex);
-            SendKeys.SendWait("{DOWN}");
+            PostMessage(ports.Handle, 0x0100, (IntPtr)Keys.Down, (IntPtr)1);
             await WaitUntilAsync(() => ports.SelectedIndex == 1);
             bool wasChecked = ports.GetItemChecked(1);
-            SendKeys.SendWait(" ");
+            PostMessage(ports.Handle, 0x0100, (IntPtr)Keys.Space, (IntPtr)1);
             await WaitUntilAsync(() => ports.GetItemChecked(1) != wasChecked);
             CollectionAssert.Contains(form.SettingsForTest.SelectedPorts.ToArray(), "Port B");
-            SendKeys.SendWait(" ");
+            PostMessage(ports.Handle, 0x0100, (IntPtr)Keys.Space, (IntPtr)1);
             await WaitUntilAsync(() => ports.GetItemChecked(1) == wasChecked);
         }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
     }
@@ -410,6 +413,10 @@ public sealed class Form1StartLifecycleTests
                 await WaitUntilAsync(() => form.ListeningForTest && !form.TransitioningForTest);
             }
 
+            var note = form.ControlForTest<TextBox>("txtNote");
+            var originalBounds = form.RectangleToClient(note.RectangleToScreen(note.ClientRectangle));
+            void AssertInputPosition() => Assert.AreEqual(originalBounds,
+                form.RectangleToClient(note.RectangleToScreen(note.ClientRectangle)), "Capture hints must not move the input field.");
             int initialStarts = listener.StartCount;
             form.ControlForTest<TextBox>("txtNote").Focus();
             await WaitUntilAsync(() => form.CapturingForTest && !form.MidiBusyForTest);
@@ -417,17 +424,34 @@ public sealed class Form1StartLifecycleTests
             form.RefreshTrayForTest();
             Assert.AreEqual(!conversionRunning, form.ControlForTest<Button>("btnStartConversion").Enabled);
             await WaitUntilAsync(() => form.ControlForTest<Label>("lblCaptureHint").Text.Contains("入力待ち", StringComparison.Ordinal));
+            AssertInputPosition();
             Assert.AreEqual(initialStarts + (conversionRunning ? 0 : 1), listener.StartCount);
 
             var port = listener.GetActivePorts().Single();
             listener.FireNote(new MidiNoteData(port.DeviceId, port.DeviceName, 0, 60, 100, true, listener.CurrentGeneration));
             await WaitUntilAsync(() => form.NoteTextForTest == "60");
             StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "取得: 60");
+            AssertInputPosition();
+            string? directory = Environment.GetEnvironmentVariable("MIDI2KEY_UI_SNAPSHOT_DIR");
+            if (!string.IsNullOrEmpty(directory))
+            {
+                using var bitmap = new System.Drawing.Bitmap(form.Width, form.Height);
+                form.DrawToBitmap(bitmap, new System.Drawing.Rectangle(System.Drawing.Point.Empty, form.Size));
+                bitmap.Save(Path.Combine(directory, "form-capture-stable.png"));
+            }
             Assert.AreEqual(0, form.OutputForTest.KeyDownCount, "Captured notes must not emit mapped keys.");
 
+            note.Text = "61";
+            Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+            Assert.IsTrue(form.CapturingForTest);
+            AssertInputPosition();
+            listener.FireNote(new MidiNoteData(port.DeviceId, port.DeviceName, 0, 62, 100, true, listener.CurrentGeneration));
+            await WaitUntilAsync(() => form.NoteTextForTest == "62");
+            Assert.AreEqual("取得: 62", form.ControlForTest<Label>("lblCaptureHint").Text);
             form.FocusPortsForTest();
             await WaitUntilAsync(() => !form.CapturingForTest && !form.MidiBusyForTest);
             Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+            AssertInputPosition();
             Assert.AreEqual(conversionRunning, form.ListeningForTest);
             Assert.AreEqual(conversionRunning ? 0 : 1, listener.StopCount);
         }, listener, (_, _) => Task.FromResult(AvailablePortResult("Port A")), (_, _) => Task.CompletedTask);
@@ -482,6 +506,32 @@ public sealed class Form1StartLifecycleTests
     }
 
     [TestMethod]
+    public async Task SaveShortcut_SavesSettings_ExceptWhileCapturingTargetKey()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"midi2key-shortcut-{Guid.NewGuid():N}.json");
+        try
+        {
+            await RunFormAsync(form =>
+            {
+                form.SetSettingsPathForTest(path);
+                form.SetMappingInputForTest("60", "a");
+                form.ControlForTest<Button>("btnAdd").PerformClick();
+                form.ControlForTest<TextBox>("txtKey").Focus();
+                Assert.IsTrue(form.ControlForTest<TextBox>("txtKey").Focused);
+                form.SendShortcutForTest(Keys.Control | Keys.S);
+                Assert.IsFalse(File.Exists(path), "Target-key capture must not invoke the save shortcut.");
+                form.FocusPortsForTest();
+                Assert.IsTrue(form.SendShortcutForTest(Keys.Control | Keys.S));
+                Assert.AreEqual("a", SettingsManager.Load(path).Mapping["60"]);
+                Assert.IsFalse(form.Text.Contains("未保存", StringComparison.Ordinal));
+                StringAssert.Contains(form.NotificationForTest, "保存完了");
+                return Task.CompletedTask;
+            }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [TestMethod]
     public async Task SettingsTitle_TracksLayoutReversion_AndSaveClearsMappingChanges()
     {
         string path = Path.Combine(Path.GetTempPath(), $"midi2key-ui-{Guid.NewGuid():N}.json");
@@ -519,6 +569,283 @@ public sealed class Form1StartLifecycleTests
         finally { File.Delete(path); }
     }
 
+    [TestMethod]
+    public async Task TargetKeyCapture_DiscardsQueuedAndLateEventsFromPreviousFocus()
+    {
+        await RunFormAsync(async form =>
+        {
+            var key = form.ControlForTest<TextBox>("txtKey");
+            KeyEventHandler Handler() => (KeyEventHandler)typeof(Form1)
+                .GetField("keyCaptureHandler", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            key.Focus();
+            var oldHandler = Handler();
+            oldHandler(null, new KeyEventArgs(Keys.A));
+            form.FocusPortsForTest();
+            key.Focus();
+            await Task.Delay(100);
+            Assert.AreEqual("", key.Text, "An already-queued event must not overwrite the next edit.");
+            oldHandler(null, new KeyEventArgs(Keys.C));
+            await Task.Delay(100);
+            Assert.AreEqual("", key.Text, "A late callback from an old hook must be ignored.");
+            Handler()(null, new KeyEventArgs(Keys.B));
+            await WaitUntilAsync(() => key.Text == "b");
+            form.FocusPortsForTest();
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MappingRow_OpensKeyEditor_WithoutRecordingActivationKey(bool keyboard)
+    {
+        await RunFormAsync(async form =>
+        {
+            form.SetMappingInputForTest("60", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            var list = form.ControlForTest<ListView>("listMapping");
+            var key = form.ControlForTest<TextBox>("txtKey");
+            form.TopMost = true;
+            form.Activate();
+            list.Focus();
+            await Task.Delay(100);
+            Assert.IsTrue(list.Focused);
+            if (keyboard)
+            {
+                PostMessage(list.Handle, 0x0100, (IntPtr)Keys.Enter, (IntPtr)1);
+                PostMessage(list.Handle, 0x0101, (IntPtr)Keys.Enter, new IntPtr(unchecked((int)0xc0000001)));
+            }
+            else
+            {
+                var row = list.Items[0].Bounds;
+                typeof(Control).GetMethod("OnMouseDoubleClick", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(list, new object[] { new MouseEventArgs(MouseButtons.Left, 2, row.Left + 10, row.Top + row.Height / 2, 0) });
+            }
+            await WaitUntilAsync(() => key.Focused);
+            await Task.Delay(100);
+            Assert.AreEqual("", key.Text);
+            StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "キー入力待ち");
+            Assert.AreEqual("60", form.NoteTextForTest);
+            Assert.AreEqual("a", form.SettingsForTest.Mapping["60"]);
+            Assert.IsFalse(form.ControlForTest<Button>("btnAdd").Enabled);
+            key.Text = "b";
+            Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+            key.Text = "";
+            StringAssert.Contains(form.ControlForTest<Label>("lblCaptureHint").Text, "キー入力待ち");
+            list.Focus();
+            Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task ChangingNote_ClearsUnrelatedSelection_WithoutChangingMappings()
+    {
+        await RunFormAsync(form =>
+        {
+            form.SetMappingInputForTest("60", "a");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            var list = form.ControlForTest<ListView>("listMapping");
+            var delete = form.ControlForTest<Button>("btnDeleteMapping");
+            var note = form.ControlForTest<TextBox>("txtNote");
+            note.Text = "060";
+            Assert.AreEqual("60", list.SelectedItems[0].Text);
+            Assert.IsTrue(delete.Enabled);
+            form.SetMappingInputForTest("61", "b");
+            Assert.AreEqual(0, list.SelectedItems.Count);
+            Assert.IsFalse(delete.Enabled);
+            Assert.AreEqual("61", form.NoteTextForTest);
+            Assert.AreEqual("b", form.ControlForTest<TextBox>("txtKey").Text);
+            Assert.AreEqual("a", form.SettingsForTest.Mapping["60"]);
+            Assert.AreEqual(1, form.SettingsForTest.Mapping.Count);
+            list.Items[0].Selected = true;
+            Assert.AreEqual("60", form.NoteTextForTest);
+            Assert.AreEqual("a", form.ControlForTest<TextBox>("txtKey").Text);
+            Assert.IsTrue(delete.Enabled);
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task UpdateMapping_KeepsScroll_AndNewEntryBecomesVisible()
+    {
+        await RunFormAsync(form =>
+        {
+            for (int i = 40; i < 80; i++) form.SettingsForTest.Mapping[i.ToString()] = "a";
+            form.RefreshMappingForTest();
+            var list = form.ControlForTest<ListView>("listMapping");
+            list.Items[20].Selected = true;
+            list.TopItem = list.Items[15];
+            int top = list.TopItem!.Index;
+            var rowBounds = list.SelectedItems[0].Bounds;
+            form.SetMappingInputForTest("60", "b");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            Assert.AreEqual("b", form.SettingsForTest.Mapping["60"]);
+            Assert.AreEqual("60", list.SelectedItems[0].Text);
+            Assert.AreEqual(top, list.TopItem!.Index);
+            Assert.AreEqual(rowBounds, list.SelectedItems[0].Bounds);
+            form.SetMappingInputForTest("100", "c");
+            form.ControlForTest<Button>("btnAdd").PerformClick();
+            Assert.AreEqual("100", list.SelectedItems[0].Text);
+            Assert.IsTrue(list.ClientRectangle.Contains(list.SelectedItems[0].Bounds));
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task DeleteMapping_KeepsScrollAndSelectsAdjacentRow()
+    {
+        await RunFormAsync(form =>
+        {
+            for (int i = 40; i < 80; i++) form.SettingsForTest.Mapping[i.ToString()] = "a";
+            form.RefreshMappingForTest();
+            var list = form.ControlForTest<ListView>("listMapping");
+            var delete = form.ControlForTest<Button>("btnDeleteMapping");
+            list.Items[20].Selected = true;
+            list.TopItem = list.Items[15];
+            int top = list.TopItem!.Index;
+            delete.Focus();
+            Assert.IsTrue(delete.Focused);
+            delete.PerformClick();
+            Assert.IsTrue(list.Focused);
+            Assert.IsFalse(form.SettingsForTest.Mapping.ContainsKey("60"));
+            Assert.AreEqual("61", list.SelectedItems[0].Text);
+            Assert.AreEqual("61", form.NoteTextForTest);
+            Assert.AreEqual(top, list.TopItem!.Index);
+            Assert.IsTrue(delete.Enabled);
+            list.SelectedItems[0].Selected = false;
+            list.Items[^1].Selected = true;
+            list.Items[^1].EnsureVisible();
+            delete.Focus();
+            Assert.IsTrue(delete.Focused);
+            delete.PerformClick();
+            Assert.IsTrue(list.Focused);
+            Assert.IsFalse(form.SettingsForTest.Mapping.ContainsKey("79"));
+            Assert.AreEqual("78", list.SelectedItems[0].Text);
+            Assert.AreEqual("78", form.NoteTextForTest);
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [DataTestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task LoadedMapping_ClearsPreviousEditor_AndUsesNewValues(bool empty)
+    {
+        await RunFormAsync(form =>
+        {
+            form.SetMappingInputForTest("60", "a");
+            var action = form.ControlForTest<Button>("btnAdd");
+            action.PerformClick();
+            form.SetMappingInputForTest("60", "noname");
+            Assert.AreNotEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+
+            var loaded = CreateSettings();
+            loaded.Mapping.Clear();
+            if (!empty) loaded.Mapping["60"] = "b";
+            form.ReplaceSettingsForTest(loaded);
+            form.RefreshMappingForTest(resetEditor: true);
+
+            var list = form.ControlForTest<ListView>("listMapping");
+            Assert.AreEqual("", form.NoteTextForTest);
+            Assert.AreEqual("", form.ControlForTest<TextBox>("txtKey").Text);
+            Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+            Assert.AreEqual(0, list.SelectedItems.Count);
+            Assert.IsFalse(action.Enabled);
+            Assert.IsFalse(form.ControlForTest<Button>("btnDeleteMapping").Enabled);
+            Assert.AreEqual(empty ? 0 : 1, list.Items.Count);
+            Assert.AreEqual(empty, form.ControlForTest<Label>("lblEmptyMapping").Visible);
+            if (!empty)
+            {
+                list.Items[0].Selected = true;
+                Assert.AreEqual("60", form.NoteTextForTest);
+                Assert.AreEqual("b", form.ControlForTest<TextBox>("txtKey").Text);
+                Assert.AreEqual("更新", action.Text);
+                Assert.IsFalse(action.Enabled);
+                Assert.AreEqual("b", loaded.Mapping["60"]);
+            }
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [TestMethod]
+    public async Task MappingInput_HotkeyConflict_IsShownAndClearsWhenHotkeyIsDisabled()
+    {
+        await RunFormAsync(form =>
+        {
+            form.SettingsForTest.Hotkey = new HotkeySettings { Enabled = true, Modifiers = "Ctrl+Alt", Key = "F9" };
+            var action = form.ControlForTest<Button>("btnAdd");
+            var hint = form.ControlForTest<Label>("lblCaptureHint");
+            form.SetMappingInputForTest("60", "f9");
+            Assert.IsFalse(action.Enabled);
+            StringAssert.Contains(hint.Text, "ホットキー");
+            form.SetMappingInputForTest("60", "f8");
+            Assert.IsTrue(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("ホットキー"));
+            form.SetMappingInputForTest("60", "f9");
+            form.SettingsForTest.Hotkey.Enabled = false;
+            typeof(Form1).GetMethod("UpdateHotkeyUi", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(form, null);
+            Assert.IsTrue(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("ホットキー"));
+            action.PerformClick();
+            Assert.AreEqual("f9", form.SettingsForTest.Mapping["60"]);
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [DataTestMethod]
+    [DataRow("noname")]
+    [DataRow("ctrl+a")]
+    public async Task MappingInput_UnsupportedKey_ShowsInlineHintUntilCorrected(string unsupportedKey)
+    {
+        await RunFormAsync(form =>
+        {
+            var action = form.ControlForTest<Button>("btnAdd");
+            var hint = form.ControlForTest<Label>("lblCaptureHint");
+            form.SetMappingInputForTest("60", unsupportedKey);
+            Assert.IsFalse(action.Enabled);
+            StringAssert.Contains(hint.Text, "未対応");
+            form.ControlForTest<RadioButton>("rbJIS").Checked = true;
+            Assert.IsFalse(action.Enabled);
+            form.FocusPortsForTest();
+            StringAssert.Contains(hint.Text, "未対応");
+            Assert.AreEqual(0, form.SettingsForTest.Mapping.Count);
+            form.SetMappingInputForTest("60", "a");
+            Assert.IsTrue(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("未対応"));
+            form.SetMappingInputForTest("60", "");
+            Assert.IsFalse(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("未対応"));
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
+    [DataTestMethod]
+    [DataRow("128")]
+    [DataRow("-1")]
+    [DataRow("abc")]
+    public async Task MappingInput_InvalidNote_ShowsInlineHintUntilCorrected(string invalidNote)
+    {
+        await RunFormAsync(form =>
+        {
+            var action = form.ControlForTest<Button>("btnAdd");
+            var hint = form.ControlForTest<Label>("lblCaptureHint");
+            form.SetMappingInputForTest(invalidNote, "a");
+            Assert.IsFalse(action.Enabled);
+            StringAssert.Contains(hint.Text, "0〜127");
+            form.ControlForTest<TextBox>("txtNote").Focus();
+            form.FocusPortsForTest();
+            StringAssert.Contains(hint.Text, "0〜127");
+            form.SetMappingInputForTest("60", "a");
+            Assert.IsTrue(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("0〜127"));
+            form.SetMappingInputForTest("pedal", "a");
+            Assert.IsTrue(action.Enabled);
+            form.SetMappingInputForTest("", "a");
+            Assert.IsFalse(action.Enabled);
+            Assert.IsFalse(hint.Text.Contains("0〜127"));
+            return Task.CompletedTask;
+        }, new FakeMidiListener(), (_, _) => Task.FromResult(AvailablePortResult("Port A")));
+    }
+
     [DataTestMethod]
     [DataRow("060", "60")]
     [DataRow("PeDaL", "pedal")]
@@ -531,14 +858,28 @@ public sealed class Form1StartLifecycleTests
             var list = form.ControlForTest<ListView>("listMapping");
             Assert.IsFalse(delete.Enabled);
             Assert.IsTrue(form.ControlForTest<Label>("lblEmptyMapping").Visible);
+            Assert.IsFalse(action.Enabled);
+            form.SetMappingInputForTest(input, "");
+            Assert.IsFalse(action.Enabled);
+            form.SetMappingInputForTest("", "a");
+            Assert.IsFalse(action.Enabled);
             form.SetMappingInputForTest(input, "a");
+            Assert.IsTrue(action.Enabled);
             Assert.AreEqual("追加", action.Text);
+            action.Focus();
             action.PerformClick();
+            Assert.IsTrue(list.Focused);
             Assert.AreEqual("更新", action.Text);
             Assert.AreEqual("a", form.SettingsForTest.Mapping[storedNote]);
+            Assert.IsFalse(action.Enabled);
+            form.SetMappingInputForTest(input, "a");
+            Assert.IsFalse(action.Enabled);
 
             form.SetMappingInputForTest(input, "b");
+            Assert.IsTrue(action.Enabled);
+            action.Focus();
             action.PerformClick();
+            Assert.IsTrue(list.Focused);
             Assert.AreEqual(1, form.SettingsForTest.Mapping.Count);
             Assert.AreEqual("b", form.SettingsForTest.Mapping[storedNote]);
             Assert.AreEqual("更新", action.Text);
@@ -551,6 +892,14 @@ public sealed class Form1StartLifecycleTests
             Assert.AreEqual(0, list.SelectedItems.Count);
             Assert.IsFalse(delete.Enabled);
             StringAssert.Contains(form.ControlForTest<Label>("lblMappingHeading").Text, "0件");
+            Assert.AreEqual("", form.NoteTextForTest);
+            Assert.AreEqual("", form.ControlForTest<TextBox>("txtKey").Text);
+            Assert.AreEqual("", form.ControlForTest<Label>("lblCaptureHint").Text);
+            Assert.AreEqual("追加", action.Text);
+            Assert.IsFalse(action.Enabled);
+            Assert.IsTrue(list.Focused);
+            action.PerformClick();
+            Assert.AreEqual(0, form.SettingsForTest.Mapping.Count);
 
             form.SetMappingInputForTest("61", "b");
             Assert.AreEqual("追加", action.Text);
@@ -577,15 +926,25 @@ public sealed class Form1StartLifecycleTests
                 var status = form.ControlForTest<Label>("lblStatus");
                 string runningText = status.Text;
                 var runningColor = status.ForeColor;
+                var note = form.ControlForTest<TextBox>("txtNote");
+                var originalBounds = form.RectangleToClient(note.RectangleToScreen(note.ClientRectangle));
+                var hotkeyInfo = form.ControlForTest<Label>("lblHotkeyInfo");
+                Assert.IsTrue(hotkeyInfo.Visible);
 
                 form.ControlForTest<Button>("btnSave").PerformClick();
                 StringAssert.Contains(form.NotificationForTest, "保存完了");
+                Assert.IsFalse(hotkeyInfo.Visible);
+                Assert.IsTrue(form.ControlForTest<Label>("lblNotification").Visible);
+                Assert.AreEqual(originalBounds, form.RectangleToClient(note.RectangleToScreen(note.ClientRectangle)));
                 Assert.AreEqual(runningText, status.Text);
                 Assert.AreEqual(runningColor, status.ForeColor);
                 Assert.IsTrue(form.ListeningForTest);
 
                 form.ExpireNotificationForTest();
                 Assert.AreEqual("", form.NotificationForTest);
+                Assert.IsTrue(hotkeyInfo.Visible);
+                Assert.IsFalse(form.ControlForTest<Label>("lblNotification").Visible);
+                Assert.AreEqual(originalBounds, form.RectangleToClient(note.RectangleToScreen(note.ClientRectangle)));
                 Assert.AreEqual(runningText, status.Text);
                 Assert.AreEqual(runningColor, status.ForeColor);
                 Assert.IsTrue(form.ListeningForTest);
@@ -1547,6 +1906,12 @@ public sealed class Form1StartLifecycleTests
             key.Focus();
         }
 
+        public bool SendShortcutForTest(Keys keys)
+        {
+            var message = Message.Create(Handle, 0x0100, (IntPtr)(keys & Keys.KeyCode), IntPtr.Zero);
+            return base.ProcessCmdKey(ref message, keys);
+        }
+
         public void SendHotkeyForTest()
         {
             var message = Message.Create(Handle, 0x0312, (IntPtr)HotkeyManager.DEFAULT_HOTKEY_ID, IntPtr.Zero);
@@ -1556,8 +1921,8 @@ public sealed class Form1StartLifecycleTests
         public void ReplaceSettingsForTest(AppSettings settings) =>
             typeof(Form1).GetField("settings", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(this, settings);
 
-        public void RefreshMappingForTest() =>
-            typeof(Form1).GetMethod("RefreshMappingList", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, new object?[] { null });
+        public void RefreshMappingForTest(bool resetEditor = false) =>
+            typeof(Form1).GetMethod("RefreshMappingList", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(this, new object?[] { null, resetEditor });
 
         public void ReplaceMappingSnapshotForTest()
         {

@@ -31,6 +31,7 @@ namespace MidiToKeyApp
         private TextBox txtNote = null!;
         private TextBox txtKey = null!;
         private Label lblCaptureHint = null!;
+        private string captureHintMessage = "";
         private Label lblMappingHeading = null!;
         private Button btnDeleteMapping = null!;
         private readonly ToolTip inputToolTip = new() { AutoPopDelay = 15000, InitialDelay = 350, ReshowDelay = 100 };
@@ -205,7 +206,7 @@ namespace MidiToKeyApp
             Text = $"{baseTitle} — {(dirty ? "*未保存 " : "")}{Path.GetFileName(currentSettingsPath)}{activeOptions}";
             btnSave.Text = dirty ? "上書き保存 *" : "上書き保存";
             btnSave.AccessibleName = dirty ? "上書き保存（未保存の変更あり）" : "上書き保存";
-            inputToolTip.SetToolTip(btnSave, $"保存先: {currentSettingsPath}\n{(dirty ? "未保存の変更があります。" : "現在の設定をこのファイルに保存します。")}");
+            inputToolTip.SetToolTip(btnSave, $"保存先: {currentSettingsPath}\nCtrl+Sでも上書き保存できます。\n{(dirty ? "未保存の変更があります。" : "現在の設定をこのファイルに保存します。")}");
         }
 
         private void AcceptSavedSettings()
@@ -259,16 +260,64 @@ namespace MidiToKeyApp
             lblMappingHeading.Text = $"マッピング一覧（{listMapping.Items.Count}件）{selection}";
         }
 
+        private static bool IsValidMappingNote(string note) =>
+            note.Equals("pedal", StringComparison.OrdinalIgnoreCase) ||
+            (int.TryParse(note, out int number) && number >= 0 && number <= 127);
+
+        private void SetCaptureHint(string message)
+        {
+            captureHintMessage = message;
+            UpdateInputHint();
+        }
+
+        private bool IsHotkeyMappingConflict(string key)
+        {
+            if (settings?.Hotkey?.Enabled != true) return false;
+            var hotkey = KeyResolver.Resolve(settings.Hotkey.Key, settings.KeyboardLayout);
+            var target = KeyResolver.Resolve(key, settings.KeyboardLayout);
+            return hotkey.IsValid && target.IsValid && hotkey.VkCode == target.VkCode;
+        }
+
+        private void UpdateInputHint()
+        {
+            string note = txtNote.Text.Trim();
+            bool invalidNote = note.Length > 0 && !IsValidMappingNote(note);
+            string key = txtKey.Text.Trim();
+            bool invalidKey = key.Length > 0 && !KeyResolver.IsValidTargetKey(key, settings?.KeyboardLayout ?? "US");
+            bool conflict = key.Length > 0 && IsHotkeyMappingConflict(key);
+            bool invalid = invalidNote || invalidKey || conflict;
+            lblCaptureHint.Text = invalidNote ? "ノートは0〜127、または pedal を入力" :
+                invalidKey ? "この変換キーは未対応です。別のキーを指定" :
+                conflict ? "ホットキーと同じキーは登録できません" :
+                globalHook != null && key.Length == 0 ? "キー入力待ち: 割り当てるキーを押してください" : captureHintMessage;
+            lblCaptureHint.ForeColor = SystemInformation.HighContrast ? SystemColors.ControlText :
+                invalid ? Color.FromArgb(151, 52, 63) : Color.DarkSlateGray;
+        }
+
         private void UpdateMappingAction()
         {
             if (settings == null || btnAdd == null) return;
             string note = txtNote.Text.Trim();
             if (int.TryParse(note, out int number)) note = number.ToString();
             if (note.Equals("pedal", StringComparison.OrdinalIgnoreCase)) note = "pedal";
-            btnAdd.Text = settings.Mapping.ContainsKey(note) ? "更新" : "追加";
+            if (listMapping.SelectedItems.Count > 0 &&
+                !string.Equals(listMapping.SelectedItems[0].Text, note, StringComparison.Ordinal))
+                listMapping.SelectedItems[0].Selected = false;
+            string key = txtKey.Text.Trim();
+            lock (settings.MappingLock)
+            {
+                bool exists = settings.Mapping.TryGetValue(note, out string? currentKey);
+                btnAdd.Text = exists ? "更新" : "追加";
+                btnAdd.Enabled = IsValidMappingNote(note) && KeyResolver.IsValidTargetKey(key, settings.KeyboardLayout) &&
+                    !IsHotkeyMappingConflict(key) &&
+                    (!exists || !string.Equals(currentKey, key, StringComparison.Ordinal));
+            }
+            UpdateInputHint();
         }
         
         private IKeyboardMouseEvents? globalHook;
+        private KeyEventHandler? keyCaptureHandler;
+        private int keyCaptureGeneration;
         private IMidiListener midiListener = null!;
         private MidiListenerLifecycle midiLifecycle = null!;
         private KeySimulator keySimulator = null!;
@@ -361,7 +410,7 @@ namespace MidiToKeyApp
                             {
                                 txtNote.Text = capturedText;
                                 if (txtNote.Focused && inputTracker.IsCapturing)
-                                    lblCaptureHint.Text = $"取得: {capturedText}。次に変換キーを入力してください。\n別の鍵盤・ペダルを押すと取り直せます。";
+                                    SetCaptureHint($"取得: {capturedText}");
                             }
                         }));
                     }
@@ -637,9 +686,12 @@ namespace MidiToKeyApp
         /// マッピング辞書の内容をリストビュー（3列グリッド）に描画します。
         /// 88鍵盤（21〜108）などのノート番号には対応する音階名（例: C4 / ド）を併記します。
         /// </summary>
-        private void RefreshMappingList(string? selectedKey = null)
+        private void RefreshMappingList(string? selectedKey = null, bool resetEditor = false)
         {
             if (listMapping == null) return;
+            int? previousTopIndex = selectedKey != null &&
+                listMapping.Items.Cast<ListViewItem>().Any(item => item.Text == selectedKey)
+                ? listMapping.TopItem?.Index : null;
             numTranspose.Value = settings.TransposeSemitones;
             KeyValuePair<string, string>[] mappingSnapshot;
             lock (settings.MappingLock)
@@ -682,14 +734,24 @@ namespace MidiToKeyApp
                 {
                     item.Selected = true;
                     item.Focused = true;
-                    item.EnsureVisible();
                 }
             }
+            if (previousTopIndex.HasValue && listMapping.Items.Count > 0)
+                listMapping.TopItem = listMapping.Items[Math.Min(previousTopIndex.Value, listMapping.Items.Count - 1)];
+            if (listMapping.SelectedItems.Count > 0) listMapping.SelectedItems[0].EnsureVisible();
             UpdateMappingSelection();
             UpdateEmptyMappingHint();
             QueueMappingColumnResize();
+            if (resetEditor) ResetMappingEditor();
             UpdateMappingAction();
             UpdateSettingsTitle();
+        }
+
+        private void ResetMappingEditor()
+        {
+            txtNote.Clear();
+            txtKey.Clear();
+            SetCaptureHint("");
         }
 
         /// <summary>
@@ -735,10 +797,10 @@ namespace MidiToKeyApp
             inputToolTip.SetToolTip(rbJIS, "日本語キーボードの配列で記号キーなどを変換します。");
             inputToolTip.SetToolTip(rbUS, "英語キーボードの配列で記号キーなどを変換します。");
             rbUS.CheckedChanged += (s, e) => {
-                if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); }
+                if (settings != null && rbUS.Checked) { settings.KeyboardLayout = "US"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); UpdateMappingAction(); }
             };
             rbJIS.CheckedChanged += (s, e) => {
-                if (settings != null && rbJIS.Checked) { settings.KeyboardLayout = "JIS"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); }
+                if (settings != null && rbJIS.Checked) { settings.KeyboardLayout = "JIS"; inputTracker.PublishResolvedMapping(settings); UpdateSettingsTitle(); UpdateMappingAction(); }
             };
             grpLayout.Controls.Add(rbJIS);
             grpLayout.Controls.Add(rbUS);
@@ -814,6 +876,24 @@ namespace MidiToKeyApp
                     TextRenderer.DrawText(e.Graphics, e.Header.Text, headerFont, e.Bounds, Color.FromArgb(35, 55, 85), flags);
                 }
             };
+            listMapping.AccessibleName = "マッピング一覧";
+            listMapping.AccessibleDescription = "行を選択し、Enterまたはダブルクリックで変換キーを編集できます。";
+            listMapping.MouseDoubleClick += (_, e) => {
+                if (e.Button == MouseButtons.Left && listMapping.HitTest(e.Location).Item != null)
+                    txtKey.Focus();
+            };
+            listMapping.PreviewKeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) e.IsInputKey = true; };
+            listMapping.KeyDown += (_, e) => {
+                if (e.KeyCode == Keys.Enter && listMapping.SelectedItems.Count > 0)
+                    e.Handled = true;
+            };
+            listMapping.KeyUp += (_, e) => {
+                if (e.KeyCode != Keys.Enter || listMapping.SelectedItems.Count == 0) return;
+                // Start capturing only after Enter is released, so it is not recorded
+                // as the replacement key (including when Enter auto-repeats).
+                e.Handled = true;
+                txtKey.Focus();
+            };
             listMapping.DrawItem += (s, e) => e.DrawDefault = true;
             listMapping.DrawSubItem += (s, e) => e.DrawDefault = true;
 
@@ -828,7 +908,7 @@ namespace MidiToKeyApp
             this.Controls.Add(listMapping);
 
             var lblNote = new Label { Text = "ノート/ペダル ⓘ", Top = 280, Left = 10, AutoSize = true };
-            txtNote = new TextBox { Top = 300, Left = 10, Width = 75 };
+            txtNote = new TextBox { Top = 300, Left = 10, Width = 75, PlaceholderText = "0〜127 / pedal" };
             txtNote.AccessibleName = "ノート番号またはペダル";
             txtNote.AccessibleDescription = "0から127、またはpedalを入力できます。フォーカス中はMIDI鍵盤やペダルからも取得できます。";
             lblCaptureHint = new Label { Text = "", ForeColor = Color.DarkSlateGray };
@@ -844,7 +924,7 @@ namespace MidiToKeyApp
                     // 変換実行中: リスナーは再起動せずキャプチャフラグのみON
                     inputTracker.SetCapturing(true);
                     if (_isTransitioning)
-                        lblCaptureHint.Text = "変換の開始処理中です。完了するまでお待ちください。";
+                        SetCaptureHint("変換の開始処理中です…");
                     else ShowCaptureReady();
                 }
             };
@@ -859,11 +939,11 @@ namespace MidiToKeyApp
                     // 変換実行中: キャプチャフラグのみOFF（押下中ノートの抑止は維持）
                     inputTracker.SetCapturing(false);
                 }
-                lblCaptureHint.Text = "";
+                SetCaptureHint("");
             };
 
             var lblKey = new Label { Text = "変換キー ⓘ", Top = 280, Left = 95, AutoSize = true };
-            txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window };
+            txtKey = new TextBox { Top = 300, Left = 95, Width = 115, ReadOnly = true, BackColor = SystemColors.Window, PlaceholderText = "選択してキーを入力" };
             
             const string noteHelp = "「ノート/ペダル」の入力欄を選択し、MIDI鍵盤やペダルを操作すると自動取得します。\n0〜127 または pedal の直接入力もできます。取得中は変換キーを送信しません。";
             const string keyHelp = "「変換キー」の入力欄を選択し、割り当てたいキーを押してください。\n選択すると現在の入力値は消えます。Shiftで入力する大文字・記号も登録できます。";
@@ -877,43 +957,24 @@ namespace MidiToKeyApp
 
             txtKey.Enter += (s, e) => {
                 txtKey.Text = "";
-                if (globalHook == null)
-                {
-                    try {
-                        globalHook = Hook.GlobalEvents();
-                        globalHook.KeyDown += GlobalHook_KeyDown;
-                    } catch { }
-                }
+                StartTargetKeyCapture();
+                UpdateInputHint();
             };
-            txtKey.Leave += (s, e) => {
-                if (globalHook != null)
-                {
-                    globalHook.KeyDown -= GlobalHook_KeyDown;
-                    globalHook.Dispose();
-                    globalHook = null;
-                }
-            };
-            this.Deactivate += (s, e) => {
-                if (globalHook != null)
-                {
-                    globalHook.KeyDown -= GlobalHook_KeyDown;
-                    globalHook.Dispose();
-                    globalHook = null;
-                }
-            };
+            txtKey.Leave += (s, e) => { StopTargetKeyCapture(); UpdateInputHint(); };
+            this.Deactivate += (s, e) => { StopTargetKeyCapture(); UpdateInputHint(); };
             this.Activated += (s, e) => {
-                if (txtKey.Focused && globalHook == null)
-                {
-                    try {
-                        globalHook = Hook.GlobalEvents();
-                        globalHook.KeyDown += GlobalHook_KeyDown;
-                    } catch { }
-                }
+                if (txtKey.Focused) StartTargetKeyCapture();
+                UpdateInputHint();
             };
 
             // ノート番号バリデーション（0〜127）、pedal の登録、およびキー厳格検証
-            btnAdd = new Button { Text = "追加", Top = 275, Left = 315, Width = 85, Height = 25 };
-            txtNote.TextChanged += (s, e) => UpdateMappingAction();
+            btnAdd = new Button { Text = "追加", Enabled = false, Top = 275, Left = 315, Width = 85, Height = 25 };
+            txtNote.TextChanged += (s, e) => {
+                // A changed value must not retain the result of an earlier MIDI capture.
+                captureHintMessage = "";
+                UpdateMappingAction();
+            };
+            txtKey.TextChanged += (s, e) => UpdateMappingAction();
             btnAdd.Click += (s, e) => {
                 string noteInput = txtNote.Text.Trim();
                 string keyInput = txtKey.Text.Trim();
@@ -940,20 +1001,11 @@ namespace MidiToKeyApp
                     return;
                 }
 
-                // ホットキーとの衝突検証
-                if (settings.Hotkey.Enabled)
+                // Keep the same guard for programmatic invocations of the action.
+                if (IsHotkeyMappingConflict(keyInput))
                 {
-                    var hotkeyResolved = KeyResolver.Resolve(settings.Hotkey.Key, settings.KeyboardLayout);
-                    var keyResolved = KeyResolver.Resolve(keyInput, settings.KeyboardLayout);
-                    if (hotkeyResolved.IsValid && keyResolved.IsValid && hotkeyResolved.VkCode == keyResolved.VkCode)
-                    {
-                        MessageBox.Show(
-                            $"キー '{keyInput}' は現在のトグルホットキー ({settings.Hotkey.Key}) と同一のため割り当てられません。\n誤発動を防ぐため別のキーを指定するか、ホットキー設定を変更してください。",
-                            "キー衝突エラー",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Warning);
-                        return;
-                    }
+                    UpdateMappingAction();
+                    return;
                 }
 
                 if (noteInput.Equals("pedal", StringComparison.OrdinalIgnoreCase))
@@ -964,6 +1016,7 @@ namespace MidiToKeyApp
                     }
                     inputTracker.PublishResolvedMapping(settings);
                     RefreshMappingList("pedal");
+                    listMapping.Focus();
                     return;
                 }
 
@@ -981,6 +1034,7 @@ namespace MidiToKeyApp
                     }
                     inputTracker.PublishResolvedMapping(settings);
                     RefreshMappingList(note.ToString());
+                    listMapping.Focus();
                 }
                 else
                 {
@@ -992,13 +1046,22 @@ namespace MidiToKeyApp
             btnDel.Click += (s, e) => {
                 if (listMapping.SelectedItems.Count > 0)
                 {
-                    var keyToRemove = listMapping.SelectedItems[0].Text;
+                    var selected = listMapping.SelectedItems[0];
+                    var keyToRemove = selected.Text;
+                    string? nextKey = selected.Index + 1 < listMapping.Items.Count
+                        ? listMapping.Items[selected.Index + 1].Text
+                        : selected.Index > 0 ? listMapping.Items[selected.Index - 1].Text : null;
                     lock (settings.MappingLock)
                     {
                         settings.Mapping.Remove(keyToRemove);
                     }
                     inputTracker.PublishResolvedMapping(settings);
-                    RefreshMappingList();
+                    RefreshMappingList(nextKey);
+                    if (nextKey == null)
+                    {
+                        ResetMappingEditor();
+                    }
+                    listMapping.Focus();
                 }
             };
 
@@ -1111,7 +1174,7 @@ namespace MidiToKeyApp
 
                             RefreshPorts(true);
                             if (settings.KeyboardLayout == "US") rbUS.Checked = true; else rbJIS.Checked = true;
-                            RefreshMappingList();
+                            RefreshMappingList(resetEditor: true);
                             inputTracker.PublishResolvedMapping(settings);
                             UpdateHotkeyRegistration();
                             AcceptSavedSettings();
@@ -1276,12 +1339,12 @@ namespace MidiToKeyApp
         {
             // Only the mapping row absorbs extra height. Every other row keeps its readable size.
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10),
-                ColumnCount = 1, RowCount = 11, TabIndex = 0 };
+                ColumnCount = 1, RowCount = 10, TabIndex = 0 };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            foreach (int height in new[] { 100, 24, 0, 96, 10, 36, 44, 24, 32, 24, 30 })
+            foreach (int height in new[] { 100, 24, 0, 76, 10, 36, 44, 24, 32, 30 })
                 root.RowStyles.Add(height == 0 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.Absolute, height));
-            root.RowStyles[10].SizeType = SizeType.Absolute;
-            root.RowStyles[10].Height = showOptions ? 132 : 0;
+            root.RowStyles[9].SizeType = SizeType.Absolute;
+            root.RowStyles[9].Height = showOptions ? 132 : 0;
 
             static void Fill(Control control)
             {
@@ -1339,7 +1402,7 @@ namespace MidiToKeyApp
                 ColumnCount = 3, RowCount = 3, TabIndex = 2 };
             foreach (var width in new[] { 102, 0, 85 })
                 editor.ColumnStyles.Add(width == 0 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.Absolute, width));
-            foreach (var height in new[] { 20, 28, 48 }) editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            foreach (var height in new[] { 20, 28, 28 }) editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
             Fill(noteLabel); Fill(keyLabel);
             editor.Controls.Add(noteLabel, 0, 0); editor.Controls.Add(keyLabel, 1, 0);
             Control[] inputs = { txtNote, txtKey, btnAdd };
@@ -1351,17 +1414,9 @@ namespace MidiToKeyApp
             }
             Fill(delete); delete.Dock = DockStyle.Top; delete.Height = 25; delete.Margin = Padding.Empty; delete.TabIndex = 3;
             editor.Controls.Add(delete, 2, 2);
-            Fill(lblCaptureHint); lblCaptureHint.Padding = new Padding(0, 3, 0, 0);
+            Fill(lblCaptureHint); lblCaptureHint.AutoEllipsis = true; lblCaptureHint.Padding = new Padding(0, 3, 0, 0);
             editor.Controls.Add(lblCaptureHint, 0, 2); editor.SetColumnSpan(lblCaptureHint, 2);
             root.Controls.Add(editor, 0, 3);
-            void ResizeCaptureHintRow()
-            {
-                int height = string.IsNullOrEmpty(lblCaptureHint.Text) ? 28 : 48;
-                editor.RowStyles[2].Height = height;
-                root.RowStyles[3].Height = 48 + height;
-            }
-            lblCaptureHint.TextChanged += (_, _) => ResizeCaptureHintRow();
-            ResizeCaptureHintRow();
             Fill(separator); separator.Dock = DockStyle.Top; separator.Height = 2;
             root.Controls.Add(separator, 0, 4);
 
@@ -1387,19 +1442,24 @@ namespace MidiToKeyApp
             conversion.Controls.Add(start, 0, 0); conversion.Controls.Add(stop, 2, 0);
             conversion.Controls.Add(btnHotkeyConfig, 4, 0);
             root.Controls.Add(conversion, 0, 6);
-            Fill(lblHotkeyInfo); lblHotkeyInfo.TextAlign = ContentAlignment.MiddleLeft;
-            root.Controls.Add(lblHotkeyInfo, 0, 7);
-            Fill(lblStatus); Fill(lblNotification);
-            root.Controls.Add(lblStatus, 0, 8); root.Controls.Add(lblNotification, 0, 9);
-            // An empty transient notification must not leave a blank footer.
-            void ResizeNotificationRow()
+            // Reuse the hotkey information line for brief notifications, keeping
+            // the mapping list, input fields and conversion status at fixed positions.
+            var feedback = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
+            Fill(lblHotkeyInfo); Fill(lblNotification);
+            lblHotkeyInfo.TextAlign = lblNotification.TextAlign = ContentAlignment.MiddleLeft;
+            feedback.Controls.Add(lblHotkeyInfo); feedback.Controls.Add(lblNotification);
+            root.Controls.Add(feedback, 0, 7);
+            Fill(lblStatus);
+            root.Controls.Add(lblStatus, 0, 8);
+            void UpdateNotificationVisibility()
             {
                 bool hasNotification = !string.IsNullOrEmpty(lblNotification.Text);
-                root.RowStyles[9].Height = hasNotification ? 24 : 0;
+                lblHotkeyInfo.Visible = !hasNotification;
                 lblNotification.Visible = hasNotification;
+                if (hasNotification) lblNotification.BringToFront();
             }
-            lblNotification.TextChanged += (_, _) => ResizeNotificationRow();
-            ResizeNotificationRow();
+            lblNotification.TextChanged += (_, _) => UpdateNotificationVisibility();
+            UpdateNotificationVisibility();
             var monitor = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty,
                 ColumnCount = 1, RowCount = 3 };
             monitor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1431,7 +1491,7 @@ namespace MidiToKeyApp
             optionsBody.Controls.Add(chkTestMode, 0, 1);
             optionsLayout.Controls.Add(optionsHeader, 0, 0);
             optionsLayout.Controls.Add(optionsBody, 0, 1);
-            root.Controls.Add(optionsLayout, 0, 10);
+            root.Controls.Add(optionsLayout, 0, 9);
             StyleActionButtons(root, start, stop);
             Controls.Add(root);
         }
@@ -1473,8 +1533,7 @@ namespace MidiToKeyApp
             }
         }
 
-        private void ShowCaptureReady() => lblCaptureHint.Text =
-            "入力待ち: 鍵盤を弾くか、ペダルを踏んでください。\n取得中のMIDI入力は変換キーとして送信されません。";
+        private void ShowCaptureReady() => SetCaptureHint("入力待ち: 鍵盤・ペダルを操作してください");
 
         private void QueueMappingColumnResize()
         {
@@ -1631,6 +1690,7 @@ namespace MidiToKeyApp
                 lblHotkeyInfo.Text = "ホットキー: 無効";
                 lblHotkeyInfo.ForeColor = Color.Gray;
             }
+            UpdateMappingAction();
         }
 
         /// <summary>
@@ -1659,7 +1719,7 @@ namespace MidiToKeyApp
             if (_isClosing || IsDisposed) return;
             if (_isTransitioning)
             {
-                lblCaptureHint.Text = "変換の開始処理中です。完了後に入力欄を選択し直してください。";
+                SetCaptureHint("変換の開始処理中です…");
                 return;
             }
             if (inputTracker.IsListening ||
@@ -1667,10 +1727,10 @@ namespace MidiToKeyApp
             var ports = GetSelectedPorts();
             if (ports.Count == 0)
             {
-                lblCaptureHint.Text = "";
+                SetCaptureHint("");
                 return;
             }
-            lblCaptureHint.Text = "取得準備中: MIDIポートを開いています。\n別の入力欄に移動すると取得を終了します。";
+            SetCaptureHint("取得準備中: MIDIポートを開いています…");
             var cancellation = new CancellationTokenSource();
             _captureCancellation = cancellation;
             long attemptId = ++_captureAttemptId;
@@ -1681,7 +1741,7 @@ namespace MidiToKeyApp
                 if (midiLifecycle.IsBusy)
                 {
                     waitingForPreviousStop = true;
-                    lblCaptureHint.Text = "取得準備中: 前のMIDI停止処理の完了を待っています。";
+                    SetCaptureHint("取得準備中: MIDIの停止を待っています…");
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
                     lblStatus.ForeColor = Color.DarkGoldenrod;
                     await midiLifecycle.WaitForIdleAsync().WaitAsync(MidiStartTimeout, cancellation.Token);
@@ -1708,7 +1768,7 @@ namespace MidiToKeyApp
                         : "MIDIポートを確認してください";
                     lblStatus.Text = $"ステータス: キャプチャ開始失敗 ({reason})";
                     lblStatus.ForeColor = Color.Red;
-                    lblCaptureHint.Text = "取得を開始できませんでした。MIDIポートを確認してください。";
+                    SetCaptureHint("取得失敗: MIDIポートを確認してください");
                     DiagnosticLogger.Log("Capture", $"すべてのMIDIポートの開始に失敗: {string.Join("; ", startResult.FailedPorts.Select(f => $"{f.PortName}: {f.Reason}"))}");
                 }
                 else if (startResult.IsPartialSuccess)
@@ -1743,7 +1803,7 @@ namespace MidiToKeyApp
                     DiagnosticLogger.Log("Capture", "MIDIキャプチャ開始が時間内に完了しませんでした。");
                     if (ownsAttempt)
                     {
-                        lblCaptureHint.Text = "取得準備がタイムアウトしました。動作ステータスを確認してください。";
+                        SetCaptureHint("取得タイムアウト: ステータスを確認");
                         if (midiLifecycle.HasReleaseFailure)
                         {
                             lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
@@ -1764,7 +1824,7 @@ namespace MidiToKeyApp
                 bool ownsAttempt = attemptId == _captureAttemptId && !_isClosing && !IsDisposed && txtNote.Focused;
                 if (generation != 0 && attemptId == _captureAttemptId) StopCapture(generation);
                 DiagnosticLogger.Log("Capture", $"MIDIキャプチャ開始失敗: {ex}");
-                if (ownsAttempt) lblCaptureHint.Text = "取得を開始できませんでした。MIDIポートを確認してください。";
+                if (ownsAttempt) SetCaptureHint("取得失敗: MIDIポートを確認してください");
                 if (!_isClosing && !IsDisposed && midiLifecycle.HasReleaseFailure)
                 {
                     lblStatus.Text = "ステータス: MIDIポート解放失敗 (アプリを再起動してください)";
@@ -1788,7 +1848,7 @@ namespace MidiToKeyApp
             long generation = _captureGeneration;
             _captureGeneration = 0;
             if (!_isClosing && !IsDisposed)
-                lblCaptureHint.Text = "";
+                SetCaptureHint("");
             if (generation == 0 || inputTracker.CurrentSessionId != generation || inputTracker.IsListening)
                 return;
 
@@ -1855,7 +1915,7 @@ namespace MidiToKeyApp
                 // Retire that generation before waiting for its native stop.
                 StopCapture();
                 if (txtNote.Focused)
-                    lblCaptureHint.Text = "変換の開始処理中です。完了するまでお待ちください。";
+                    SetCaptureHint("変換の開始処理中です…");
                 if (midiLifecycle.IsBusy)
                 {
                     lblStatus.Text = "ステータス: MIDI停止処理待機中 (応答しない場合は再起動してください)";
@@ -2078,7 +2138,7 @@ namespace MidiToKeyApp
                 _isTransitioning = false;
                 UpdateMonitor();
                 if (!_isClosing && !IsDisposed && txtNote.Focused && !inputTracker.IsListening)
-                    lblCaptureHint.Text = "取得を開始していません。動作ステータスを確認し、\n入力欄を選択し直して再開してください。";
+                    SetCaptureHint("取得未開始: ステータスを確認");
             }
         }
 
@@ -2194,6 +2254,16 @@ namespace MidiToKeyApp
             }
         }
 
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.S) && !txtKey.Focused && !_isClosing)
+            {
+                btnSave.PerformClick();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
         protected override void WndProc(ref Message m)
         {
             const int WM_HOTKEY = 0x0312;
@@ -2231,14 +2301,40 @@ namespace MidiToKeyApp
             base.WndProc(ref m);
         }
 
-        private void GlobalHook_KeyDown(object? sender, KeyEventArgs e)
+        private void StartTargetKeyCapture()
+        {
+            if (globalHook != null || _isClosing) return;
+            int generation = Interlocked.Increment(ref keyCaptureGeneration);
+            try
+            {
+                globalHook = Hook.GlobalEvents();
+                keyCaptureHandler = (sender, e) => GlobalHook_KeyDown(sender, e, generation);
+                globalHook.KeyDown += keyCaptureHandler;
+            }
+            catch { StopTargetKeyCapture(); }
+        }
+
+        private void StopTargetKeyCapture()
+        {
+            Interlocked.Increment(ref keyCaptureGeneration);
+            var hook = globalHook;
+            var handler = keyCaptureHandler;
+            globalHook = null;
+            keyCaptureHandler = null;
+            if (hook == null) return;
+            if (handler != null) hook.KeyDown -= handler;
+            hook.Dispose();
+        }
+
+        private void GlobalHook_KeyDown(object? sender, KeyEventArgs e, int generation)
         {
             bool isUS = false;
             
             if (IsHandleCreated && !IsDisposed) {
                 try {
                     BeginInvoke(new Action(() => {
-                        if (IsDisposed) return;
+                        if (IsDisposed || _isClosing || globalHook == null || !txtKey.Focused ||
+                            generation != Volatile.Read(ref keyCaptureGeneration)) return;
                         isUS = rbUS.Checked;
                         string keyName = FormatKey(e, isUS);
                         
@@ -2377,11 +2473,7 @@ namespace MidiToKeyApp
             StopConversion();
             keySimulator.RetryReleasePendingKeys();
             ObserveMidiCleanup(midiLifecycle.DisposeAsync());
-            if (globalHook != null)
-            {
-                globalHook.KeyDown -= GlobalHook_KeyDown;
-                globalHook.Dispose();
-            }
+            StopTargetKeyCapture();
             base.OnFormClosing(e);
         }
     }
